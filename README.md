@@ -1,4 +1,4 @@
-# Party Game Hub — v1
+# Party Game Hub — v1.1
 
 A free, simple online party-game hub for 1–8 players (humans + bots),
 built for Matthew and his cousins. Simple 2D, text and coloured shapes
@@ -34,12 +34,19 @@ and UNO — the server is structured for that (see `server.py`,
   start: that round counts as a fail** (no time recorded). Bots react
   at Easy 380–600 ms, Medium 250–380 ms, Hard 180–280 ms, with
   occasional false starts on Easy. Fastest average wins.
-- **Speed Math:** difficulty Easy (+/− up to 20), Medium (+/−/× up
-  to 50), Hard (+/−/×/÷ up to 100); 5 / 10 / 15 questions (default
-  10); 10 / 15 / 20 s per question (default 15 s). Same question to
-  everyone; faster correct answers score more (500–1000 pts).
-  Bots: Easy ~55% correct, Medium ~75%, Hard ~92%, with
-  difficulty-based delays.
+- **Speed Math:** 5 / 10 / 15 questions (default 10); 10 / 15 / 20 s
+  per question (default 15 s). Same question to everyone; faster
+  correct answers score more (500–1000 pts). Bots: Easy ~55% correct,
+  Medium ~75%, Hard ~92%, with difficulty-based delays.
+  - Easy: addition and subtraction only, operands and results
+    between -30 and 30 (negative numbers included).
+  - Medium: addition, subtraction, multiplication up to 12×12, and
+    division with exact integer results.
+  - Hard: high-school level — basic functions f(x), solving for x,
+    max/min of a quadratic, advanced BEDMAS with brackets, and
+    adding/subtracting fractions. Fraction answers must be given as a
+    decimal to 2 places (the question says so), and are accepted
+    within 0.01.
 - **Speed Trivia:** categories General / Science / Geography /
   History / Mixed; Easy / Medium / Hard; 5 / 10 / 15 questions;
   10 / 15 / 20 s per question. 72 questions embedded in
@@ -47,8 +54,27 @@ and UNO — the server is structured for that (see `server.py`,
   as Speed Math.
 - **After a game:** results screen with rankings, then **Play Again**
   (back to lobby, same players) or **Change Game**.
-- **Disconnects:** a player who disconnects mid-game has their score
-  frozen and the game continues; in the lobby they are removed.
+- **NEXT QUESTION vote (v1.1, Speed Math / Speed Trivia only):** after
+  each question (except the last) the scoreboard stays up with a
+  **NEXT QUESTION** button. The game advances when at least half of
+  the players in the room have voted NEXT, or after 60 seconds,
+  whichever comes first. The live vote count is shown (e.g. "2/3
+  voted NEXT"). Bots auto-vote after 2–4 s, so a solo player with
+  bots is never stuck. Reaction Test keeps its 1.5 s pause between
+  rounds and has no vote.
+- **Edit your profile in the lobby (v1.1):** every human player can
+  change their *own* nickname and colour in the lobby (and between
+  games, on the results screen), with the same 10-colour palette.
+  Nicknames must stay unique in the room. Bots are still host-only.
+- **Disconnects (v1.1 hardened):** a player who disconnects mid-game
+  has their score frozen, and the round is held for the full timer
+  (it no longer ends early just because the remaining connected
+  players have answered), so a reconnecting player can still answer
+  or click. The frontend auto-reconnects (up to 20 attempts, 5 s
+  heartbeat, visible "Reconnecting…" banner) and reclaims the exact
+  same seat — same player id, nickname, colour, host status and
+  score — and is re-sent the current question / reaction state on
+  rejoining mid-game. In the lobby a seat is held for 30 s.
 
 ## Run locally
 
@@ -74,6 +100,15 @@ It starts the server on port 8001, creates a room, joins 2 simulated
 humans + 2 bots, checks the lobby, then plays a full round of each of
 the 3 games and checks scores/results are produced. It also checks
 the trivia bank has ≥ 60 questions.
+
+**v1.1 additions (77 checks total):** a round does not advance after
+only one player answers; a disconnect mid-question holds the round
+and a rejoin reclaims the same seat and is re-sent the question;
+the NEXT vote advances at half the players and at the timeout;
+lobby profile editing works and taken nicknames are rejected;
+20 generated questions per Math difficulty verify independently
+(including all five Hard types), and Hard fraction answers are
+accepted within 0.01.
 
 ## Deploy later (Replit / Render)
 

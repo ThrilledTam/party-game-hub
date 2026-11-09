@@ -1,5 +1,5 @@
 """
-Party Game Hub — v1
+Party Game Hub — v1.1
 ====================
 A free, simple, online party-game hub for 1-8 players (humans + bots).
 
@@ -27,8 +27,27 @@ Protocol (JSON over one WebSocket per player, endpoint /ws):
     remove_bot  {bot_id}
     start_game  {}
     reaction_click {}
-    answer      {answer}            # math: number as string, trivia: option index
+    answer      {answer, index?}  # math: number as string, trivia: option index;
+                                  # index = question number; a stale/late answer
+                                  # for an earlier question is ignored
+    ping        {}                # keep-alive; server replies {"type": "pong"}
     play_again  {}                  # back to lobby, same players
+    update_profile {nickname?, colour?}  # own nickname/colour, lobby/results only
+    vote_next   {index?}          # vote to advance after a question (quiz games)
+  Server -> client (broadcast to the whole room unless noted):
+    joined      {code, player_id, room}   # reply to this player only
+    lobby       {room}                    # full room state
+    error       {message}
+    game_started {game, settings, mode}  # mode: "solo" | "competition"
+    reaction_wait {round, total}
+    reaction_go   {round, total}
+    reaction_round_result {round, total, results:[{player_id,nickname,colour,is_bot,ms,false_start}]}
+    question    {game, index, total, text, options, time_limit}
+    question_result {index, total, correct_answer, points:[{player_id,points}], scores:[...]}
+    vote_break  {index, total, scores, votes, votes_needed, timeout}
+    vote_update {index, votes, votes_needed, voters:[player_id]}
+    results     {game, rankings:[{player_id,nickname,colour,is_bot,score,avg_ms,best_ms}]}
+    game_cancelled {reason}
   Server -> client (broadcast to the whole room unless noted):
     joined      {code, player_id, room}   # reply to this player only
     lobby       {room}                    # full room state
@@ -55,10 +74,12 @@ That round counts as a fail for that player (no time recorded, shown as
 import asyncio
 import json
 import random
+import re
 import secrets
 import string
 import time
 import uuid
+from fractions import Fraction
 from dataclasses import dataclass, field
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -101,6 +122,10 @@ BOT_QUIZ = {
     "Hard":   {"delay": (1.0, 3.0), "accuracy": 0.92},
 }
 
+VOTE_TIMEOUT_DEFAULT = 60  # seconds to wait for NEXT votes after a question
+RECONNECT_GRACE = 30.0     # seconds a disconnected seat is held
+HEARTBEAT_SECONDS = 5      # frontend ping interval (v1.1, was 15s)
+
 GAMES = {
     "reaction": {"name": "Reaction Test", "min_players": 1},
     "math":     {"name": "Speed Math",    "min_players": 1},
@@ -129,6 +154,7 @@ class Player:
     is_host: bool = False
     ws: WebSocket | None = None            # humans only; None when disconnected
     connected: bool = True
+    disconnected_at: float | None = None   # monotonic time of last disconnect
     score: int = 0
     reaction_times: list = field(default_factory=list)  # ms, successful rounds only
     false_starts: int = 0
@@ -273,43 +299,131 @@ def cancel_game_task(room: Room):
     room.game_task = None
 
 
+async def remove_lobby_player_after_grace(room: Room, player: Player,
+                                          delay: float = 30.0):
+    """Remove a player who dropped out of the lobby, after a grace period.
+
+    A transient drop (e.g. Render/proxy closing an idle WebSocket) used to
+    remove the player instantly, forcing a manual refresh + rejoin. Now the
+    seat is held for `delay` seconds so a quick reconnect can reclaim it
+    (see join_room rejoin logic); only then is the player removed and,
+    if they were host, the next human promoted.
+    """
+    await asyncio.sleep(delay)
+    if player.connected or player not in room.players:
+        return
+    if room.phase != "lobby":
+        return
+    was_host = player.is_host
+    room.players = [p for p in room.players if p is not player]
+    if was_host:
+        for p in room.players:
+            if not p.is_bot:
+                p.is_host = True
+                break
+    if not room.humans():
+        ROOMS.pop(room.code, None)
+        return
+    await broadcast_lobby(room)
+
+
 # ---------------------------------------------------------------------------
 # Question generation
 # ---------------------------------------------------------------------------
 
+def _fmt_num(n: int) -> str:
+    """Format an integer for display, parenthesised when negative so
+    e.g. '8 - -7' is shown as '8 - (-7)'."""
+    return f"({n})" if n < 0 else str(n)
+
+
 def make_math_question(difficulty: str):
-    """Return (text, correct_answer:int)."""
+    """Return (text, correct_answer) — int, except Hard fraction
+    questions, whose answer is a float (decimal to 2 places).
+
+    Easy:   addition / subtraction only, operands and results in -30..30.
+    Medium: addition / subtraction (wider), multiplication up to 12x12,
+            division with exact integer results.
+    Hard:   high-school level — basic functions f(x), solving for x,
+            max/min of a quadratic (vertex form), advanced BEDMAS with
+            brackets, and adding/subtracting fractions (answer as a
+            decimal to 2 places, stated in the question).
+    """
     if difficulty == "Easy":
         op = random.choice(["+", "-"])
-        a, b = random.randint(0, 20), random.randint(0, 20)
-        if op == "-" and b > a:
-            a, b = b, a
-    elif difficulty == "Medium":
-        op = random.choice(["+", "-", "x"])
-        if op == "x":
-            a, b = random.randint(2, 12), random.randint(2, 12)
-        else:
-            a, b = random.randint(0, 50), random.randint(0, 50)
-            if op == "-" and b > a:
-                a, b = b, a
-    else:  # Hard
+        while True:
+            a = random.randint(-30, 30)
+            b = random.randint(-30, 30)
+            ans = a + b if op == "+" else a - b
+            if -30 <= ans <= 30:
+                break
+        if op == "+":
+            return f"{_fmt_num(a)} + {_fmt_num(b)} = ?", ans
+        return f"{_fmt_num(a)} − {_fmt_num(b)} = ?", ans
+    if difficulty == "Medium":
         op = random.choice(["+", "-", "x", "÷"])
         if op == "x":
-            a, b = random.randint(3, 15), random.randint(3, 15)
-        elif op == "÷":
+            a, b = random.randint(2, 12), random.randint(2, 12)
+            return f"{a} × {b} = ?", a * b
+        if op == "÷":
             b = random.randint(2, 12)
             ans = random.randint(2, 12)
-            a = b * ans
-            return f"{a} ÷ {b} = ?", ans
+            return f"{b * ans} ÷ {b} = ?", ans
+        a, b = random.randint(-50, 50), random.randint(-50, 50)
+        if op == "+":
+            return f"{_fmt_num(a)} + {_fmt_num(b)} = ?", a + b
+        return f"{_fmt_num(a)} − {_fmt_num(b)} = ?", a - b
+    # Hard — pick one of five high-school types.
+    kind = random.choice(["function", "solve", "vertex", "bedmas", "fraction"])
+    if kind == "function":
+        a = random.randint(2, 5)
+        b = random.randint(-5, 10)
+        x = random.randint(2, 9)
+        b_txt = f" + {b}" if b >= 0 else f" - {-b}"
+        return f"f(x) = {a}x{b_txt}. Find f({x}) = ?", a * x + b
+    if kind == "solve":
+        a = random.randint(2, 6)
+        x = random.randint(2, 12)
+        b = random.randint(-10, 10)
+        c = a * x + b
+        b_txt = f" + {b}" if b >= 0 else f" - {-b}"
+        return f"Solve for x: {a}x{b_txt} = {c}, x = ?", x
+    if kind == "vertex":
+        # Vertex form f(x) = a(x-h)^2 + k; max/min value is k.
+        a = random.choice([-2, -1, 1, 2])
+        h = random.randint(-3, 3)
+        k = random.randint(-5, 10)
+        h_txt = f" - {h}" if h >= 0 else f" + {-h}"
+        k_txt = f" + {k}" if k >= 0 else f" - {-k}"
+        if a == 1:
+            coef = ""
+        elif a == -1:
+            coef = "-"
         else:
-            a, b = random.randint(0, 100), random.randint(0, 100)
-            if op == "-" and b > a:
-                a, b = b, a
-    if op == "+":
-        return f"{a} + {b} = ?", a + b
-    if op == "-":
-        return f"{a} − {b} = ?", a - b
-    return f"{a} × {b} = ?", a * b
+            coef = str(a)
+        word = "maximum" if a < 0 else "minimum"
+        return (f"Find the {word} value of f(x) = {coef}(x{h_txt})^2{k_txt}",
+                k)
+    if kind == "bedmas":
+        form = random.choice(["paren_add", "paren_mul", "mul_add"])
+        if form == "paren_add":
+            a, b, c, d = (random.randint(2, 9) for _ in range(4))
+            return f"({_fmt_num(a)} + {b}) × {c} - {d} = ?", (a + b) * c - d
+        if form == "paren_mul":
+            a, b, c, d = (random.randint(2, 9) for _ in range(4))
+            return f"{a} × ({b} + {c}) - {d} = ?", a * (b + c) - d
+        a, b, c, d = (random.randint(2, 12) for _ in range(4))
+        return f"{a} + {b} × {c} - {d} = ?", a + b * c - d
+    # fraction — answer as a decimal to 2 places (stated in the text).
+    n1 = random.randint(1, 5)
+    d1 = random.choice([2, 3, 4, 5, 6, 8])
+    n2 = random.randint(1, 5)
+    d2 = random.choice([2, 3, 4, 5, 6, 8])
+    op = random.choice(["+", "-"])
+    val = Fraction(n1, d1) + Fraction(n2, d2) if op == "+" else Fraction(n1, d1) - Fraction(n2, d2)
+    ans = round(float(val), 2)
+    return (f"{n1}/{d1} {op} {n2}/{d2} = ? "
+            f"Give your answer as a decimal to 2 decimal places", ans)
 
 
 def pick_trivia_questions(category: str, difficulty: str, count: int):
@@ -376,9 +490,17 @@ async def run_reaction_game(room: Room):
                 if p.is_bot and not bot_plans[p.id]["false"]:
                     asyncio.create_task(bot_click(p, bot_plans[p.id]["ms"]))
             # Wait until everyone has clicked or 5s pass.
+            # v1.1: a disconnected player does NOT end the round early —
+            # if anyone is disconnected (within the reconnect grace),
+            # hold the round for the full window so they can rejoin
+            # and click. Only break early when every *connected*
+            # player has clicked and nobody is disconnected.
             deadline = time.monotonic() + 5.0
             while time.monotonic() < deadline:
                 clicked = {pid for pid in room.round_state["clicks"]}
+                if any(not p.connected for p in room.players):
+                    await asyncio.sleep(0.1)
+                    continue
                 remaining = [p for p in room.players
                              if p.id not in clicked and p.connected]
                 if not remaining:
@@ -415,6 +537,52 @@ def record_reaction(room: Room, player: Player, ms, false_start=False):
         player.reaction_times.append(ms)
 
 
+async def _vote_phase(room: Room, game: str, idx: int, total: int):
+    """NEXT QUESTION vote break after a quiz question (v1.1).
+
+    Advances when at least half of the players currently in the room
+    have voted NEXT, or after the vote timeout (default 60s).
+    Bots auto-vote after 2-4s so a solo player with bots is never stuck.
+    Returns when the break is over.
+    """
+    settings = room.game_settings[game]
+    timeout = int(settings.get("vote_timeout", VOTE_TIMEOUT_DEFAULT))
+    room.round_state["votes"] = set()
+    room.round_state["vote_index"] = idx
+    scores = [{"player_id": pl.id, "nickname": pl.nickname,
+               "colour": pl.colour, "is_bot": pl.is_bot, "score": pl.score}
+              for pl in room.players]
+
+    def votes_needed():
+        connected = [pl for pl in room.players if pl.connected]
+        return max(1, (len(connected) + 1) // 2)
+
+    async def bot_vote(bot, delay):
+        await asyncio.sleep(delay)
+        st = room.round_state
+        if (room.phase != "playing" or st.get("vote_index") != idx
+                or bot.id in st.get("votes", set())):
+            return
+        st["votes"].add(bot.id)
+        await broadcast(room, {"type": "vote_update", "index": idx,
+                               "votes": len(st["votes"]),
+                               "votes_needed": votes_needed(),
+                               "voters": sorted(st["votes"])})
+    for pl in room.players:
+        if pl.is_bot:
+            asyncio.create_task(bot_vote(pl, random.uniform(2.0, 4.0)))
+    await broadcast(room, {"type": "vote_break", "index": idx, "total": total,
+                           "scores": scores, "votes": 0,
+                           "votes_needed": votes_needed(), "timeout": timeout})
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if len(room.round_state.get("votes", set())) >= votes_needed():
+            break
+        await asyncio.sleep(0.1)
+    room.round_state.pop("votes", None)
+    room.round_state.pop("vote_index", None)
+
+
 async def run_quiz_game(room: Room, game: str):
     """Shared loop for Speed Math and Speed Trivia."""
     settings = room.game_settings[game]
@@ -436,7 +604,10 @@ async def run_quiz_game(room: Room, game: str):
         for idx, q in enumerate(questions, start=1):
             room.round_state = {"index": idx, "answers": {},
                                 "start": time.monotonic(),
-                                "correct": q["answer"]}
+                                "correct": q["answer"],
+                                "question": {"text": q["text"],
+                                             "options": q["options"],
+                                             "time_limit": time_limit}}
             await broadcast(room, {"type": "question", "game": game,
                                    "index": idx, "total": total,
                                    "text": q["text"], "options": q["options"],
@@ -452,6 +623,8 @@ async def run_quiz_game(room: Room, game: str):
                 if game == "math":
                     if correct:
                         ans = q["answer"]
+                    elif isinstance(q["answer"], float):
+                        ans = round(float(q["answer"]) + random.choice([-0.3, -0.2, -0.1, 0.1, 0.2, 0.3]), 2)
                     else:
                         ans = q["answer"] + random.choice([-3, -2, -1, 1, 2, 3, 10])
                     record_answer(room, bot, str(ans))
@@ -470,11 +643,20 @@ async def run_quiz_game(room: Room, game: str):
                     asyncio.create_task(bot_answer(
                         p, random.random() < cfg["accuracy"], max(0.5, delay)))
             # Wait for the timer, or until every connected player answered.
+            # v1.1: a disconnected player does NOT end the round early.
+            # If anyone is disconnected (within the reconnect grace),
+            # hold the round for the full timer so they can rejoin and
+            # answer. This was the real cause of the "ENTER ends the
+            # round" report: with Max disconnected, Matthew answering
+            # alone made "everyone answered" true immediately.
             deadline = time.monotonic() + time_limit
             while time.monotonic() < deadline:
+                if any(not pl.connected for pl in room.players):
+                    await asyncio.sleep(0.1)
+                    continue
                 answered = set(room.round_state["answers"])
-                remaining = [p for p in room.players
-                             if p.id not in answered and p.connected]
+                remaining = [pl for pl in room.players
+                             if pl.id not in answered and pl.connected]
                 if not remaining:
                     break
                 await asyncio.sleep(0.1)
@@ -488,13 +670,17 @@ async def run_quiz_game(room: Room, game: str):
                                    "index": idx, "total": total,
                                    "correct_answer": correct,
                                    "points": points,
-                                   "scores": [{"player_id": p.id,
-                                               "nickname": p.nickname,
-                                               "colour": p.colour,
-                                               "is_bot": p.is_bot,
-                                               "score": p.score}
-                                              for p in room.players]})
-            await asyncio.sleep(1.2)
+                                   "scores": [{"player_id": pl.id,
+                                               "nickname": pl.nickname,
+                                               "colour": pl.colour,
+                                               "is_bot": pl.is_bot,
+                                               "score": pl.score}
+                                              for pl in room.players]})
+            if idx < total:
+                # v1.1 NEXT QUESTION vote break (not after the last question).
+                await _vote_phase(room, game, idx, total)
+            else:
+                await asyncio.sleep(1.2)
         room.phase = "results"
         await broadcast(room, {"type": "results", "game": game,
                                "rankings": rankings(room)})
@@ -503,9 +689,21 @@ async def run_quiz_game(room: Room, game: str):
         pass
 
 
-def record_answer(room: Room, player: Player, answer):
-    """Score one quiz answer. Faster correct answers earn more points."""
+def record_answer(room: Room, player: Player, answer, index=None):
+    """Score one quiz answer. Faster correct answers earn more points.
+
+    A late answer must never leak into the next question: an answer whose
+    question index does not match the current question, or which arrives
+    after the question's time limit, is ignored (not recorded). Before
+    this guard, a slow answer arriving during the 1.2s reveal / next
+    question was recorded against the *next* question, and the player's
+    real answer to that next question was then dropped as a duplicate.
+    """
     st = room.round_state
+    if not st or room.phase != "playing":
+        return
+    if index is not None and st.get("index") != index:
+        return  # stale answer for an earlier question
     if player.id in st.get("answers", {}):
         return  # first answer only
     correct = st["correct"]
@@ -515,10 +713,18 @@ def record_answer(room: Room, player: Player, answer):
     game = room.current_game
     if game:
         time_limit = int(room.game_settings[game].get("time_per_question", 15))
+    if elapsed > time_limit:
+        return  # arrived after the timer; do not record it
     is_correct = False
     if game == "math":
         try:
-            is_correct = int(str(answer).strip()) == int(correct)
+            # Hard fraction questions have a float answer (decimal to
+            # 2 places): accept within 0.01. All other math answers
+            # are exact integers.
+            if isinstance(correct, float):
+                is_correct = abs(float(str(answer).strip()) - float(correct)) <= 0.01
+            else:
+                is_correct = int(str(answer).strip()) == int(correct)
         except (ValueError, TypeError):
             is_correct = False
     else:
@@ -666,7 +872,66 @@ async def handle_message(room: Room, player: Player, msg: dict):
     elif mtype == "answer":
         if room.phase != "playing" or room.current_game not in ("math", "trivia"):
             return
-        record_answer(room, player, msg.get("answer"))
+        try:
+            idx = int(msg.get("index")) if msg.get("index") is not None else None
+        except (ValueError, TypeError):
+            idx = None
+        record_answer(room, player, msg.get("answer"), index=idx)
+
+    elif mtype == "update_profile":
+        # v1.1: every human can change their OWN nickname/colour in the
+        # lobby (and between games, in the results phase) — not other
+        # players', not bots (bots stay host-only via update_bot).
+        # Not allowed mid-game.
+        if room.phase not in ("lobby", "results"):
+            await send(player, {"type": "error",
+                                "message": "You can only change your nickname or colour in the lobby."})
+            return
+        changed = False
+        if isinstance(msg.get("nickname"), str) and msg["nickname"].strip():
+            nick = msg["nickname"].strip()[:20]
+            taken = {p.nickname for p in room.players if p is not player}
+            if nick != player.nickname and nick in taken:
+                await send(player, {"type": "error",
+                                    "message": f"Nickname '{nick}' is already taken in this room."})
+                return
+            if nick != player.nickname:
+                player.nickname = nick
+                changed = True
+        if isinstance(msg.get("colour"), str) and msg["colour"] in PALETTE:
+            if msg["colour"] != player.colour:
+                player.colour = msg["colour"]
+                changed = True
+        if changed:
+            await broadcast_lobby(room)
+
+    elif mtype == "vote_next":
+        # v1.1 NEXT QUESTION vote. Only counts during a vote break,
+        # only once per player per question, humans only (bots auto-vote).
+        if room.phase != "playing":
+            return
+        st = room.round_state
+        if "votes" not in st or player.is_bot:
+            return
+        if msg.get("index") is not None:
+            try:
+                if int(msg["index"]) != st.get("vote_index"):
+                    return
+            except (ValueError, TypeError):
+                return
+        if player.id in st["votes"]:
+            return
+        st["votes"].add(player.id)
+        connected = [p for p in room.players if p.connected]
+        needed = max(1, (len(connected) + 1) // 2)
+        await broadcast(room, {"type": "vote_update",
+                               "index": st.get("vote_index"),
+                               "votes": len(st["votes"]),
+                               "votes_needed": needed,
+                               "voters": sorted(st["votes"])})
+
+    elif mtype == "ping":
+        await send(player, {"type": "pong"})
 
     elif mtype == "play_again":
         # Back to the lobby with the same players; drop disconnected humans.
@@ -716,20 +981,54 @@ async def ws_endpoint(ws: WebSocket):
                     {"type": "error", "message": f"No room with code {code}."}))
                 await ws.close()
                 return
-            if len(room.players) >= room.max_players:
+            # Rejoin: a human who dropped out is held for a 30s grace
+            # period (see remove_lobby_player_after_grace). Reclaim their
+            # old seat — same player id, host status and score — instead
+            # of creating a duplicate entry. Check this before the
+            # room-full check, since their seat still counts.
+            # v1.1: match by player_id first (the frontend sends its
+            # id on reconnect), then by nickname — so a player who
+            # changed their nickname in the lobby still reclaims
+            # their seat, score and colour.
+            rejoined = None
+            pid = first.get("player_id")
+            if pid:
+                rejoined = next(
+                    (p for p in room.players
+                     if not p.is_bot and not p.connected and p.id == pid),
+                    None)
+            if rejoined is None:
+                rejoined = next(
+                    (p for p in room.players
+                     if not p.is_bot and not p.connected
+                     and p.nickname == nickname), None)
+            if rejoined is None and len(room.players) >= room.max_players:
                 await ws.send_text(json.dumps(
                     {"type": "error", "message": "That room is full."}))
                 await ws.close()
                 return
-            if nickname in {p.nickname for p in room.players}:
-                await ws.send_text(json.dumps(
-                    {"type": "error",
-                     "message": f"Nickname '{nickname}' is already taken in this room. Pick another."}))
-                await ws.close()
-                return
-            player = Player(id=uuid.uuid4().hex[:8], nickname=nickname,
-                            colour=free_colour(room, colour), ws=ws)
-            room.players.append(player)
+            if rejoined is not None:
+                player = rejoined
+                player.ws = ws
+                player.connected = True
+                player.disconnected_at = None
+                # Keep their chosen colour if it is still free; only
+                # reassign if someone else took it while they were away.
+                if player.colour != colour and colour in {
+                        p.colour for p in room.players if p is not player}:
+                    pass  # keep existing colour
+                elif colour:
+                    player.colour = colour
+            else:
+                if nickname in {p.nickname for p in room.players}:
+                    await ws.send_text(json.dumps(
+                        {"type": "error",
+                         "message": f"Nickname '{nickname}' is already taken in this room. Pick another."}))
+                    await ws.close()
+                    return
+                player = Player(id=uuid.uuid4().hex[:8], nickname=nickname,
+                                colour=free_colour(room, colour), ws=ws)
+                room.players.append(player)
         else:
             await ws.send_text(json.dumps(
                 {"type": "error", "message": "First message must be create_room or join_room."}))
@@ -739,6 +1038,36 @@ async def ws_endpoint(ws: WebSocket):
         await send(player, {"type": "joined", "code": room.code,
                             "player_id": player.id, "room": room.public()})
         await broadcast_lobby(room)
+        # v1.1 resync: a player rejoining mid-game was previously sent
+        # to the lobby view with no way back to the current question.
+        # Resend the current game state so they land back in the game.
+        if room.phase == "playing" and room.current_game:
+            await send(player, {"type": "game_started",
+                                "game": room.current_game,
+                                "settings": room.game_settings[room.current_game],
+                                "mode": "solo" if len(room.players) == 1 else "competition"})
+            st = room.round_state
+            if room.current_game == "reaction":
+                if st.get("go_at") is None:
+                    await send(player, {"type": "reaction_wait",
+                                        "round": st.get("round", 1),
+                                        "total": int(room.game_settings["reaction"].get("rounds", 5))})
+                else:
+                    await send(player, {"type": "reaction_go",
+                                        "round": st.get("round", 1),
+                                        "total": int(room.game_settings["reaction"].get("rounds", 5))})
+            elif st.get("question"):
+                remaining = 1
+                if st.get("start") is not None:
+                    tl = int(room.game_settings[room.current_game].get("time_per_question", 15))
+                    remaining = max(1, tl - int(time.monotonic() - st["start"]))
+                await send(player, {"type": "question",
+                                    "game": room.current_game,
+                                    "index": st.get("index", 1),
+                                    "total": int(room.game_settings[room.current_game].get("questions", 10)),
+                                    "text": st["question"]["text"],
+                                    "options": st["question"]["options"],
+                                    "time_limit": remaining})
 
         while True:
             msg = json.loads(await ws.receive_text())
@@ -750,21 +1079,22 @@ async def ws_endpoint(ws: WebSocket):
     finally:
         # Graceful disconnect handling.
         if room is not None and player is not None:
-            cancel_needed = False
+            player.disconnected_at = time.monotonic()
             if room.phase == "lobby":
-                # Remove from the lobby; promote the next human to host.
-                was_host = player.is_host
-                room.players = [p for p in room.players if p is not player]
-                if was_host:
-                    for p in room.players:
-                        if not p.is_bot:
-                            p.is_host = True
-                            break
-                if not room.humans():
-                    ROOMS.pop(room.code, None)
-                    return
+                # Hold the seat for 30s so a transient drop can rejoin
+                # and reclaim it (see remove_lobby_player_after_grace).
+                # The room stays alive during the grace period even if
+                # this was the last human, so a sole host can rejoin;
+                # the grace task deletes the room if nobody comes back.
+                player.connected = False
+                player.ws = None
+                asyncio.create_task(
+                    remove_lobby_player_after_grace(room, player))
             else:
-                # Mid-game: freeze their score, game continues.
+                # Mid-game: freeze their score, game continues — but
+                # v1.1: the round is held for the full timer (see the
+                # wait loops in run_quiz_game / run_reaction_game),
+                # so a reconnecting player can still answer/click.
                 player.connected = False
                 player.ws = None
                 if player.is_host:
