@@ -27,6 +27,7 @@ from questions import QUESTIONS  # noqa: E402
 from server import make_math_question, record_answer, Room, Player, team_standings  # noqa: E402
 from server import (GAMES, ELIM_POOL, SECRET_WORDS, VAGUE_CLUES, secret_tally,  # noqa: E402
                     build_president_deck, president_legal_play,  # noqa: E402
+                    president_illegal_reason,  # noqa: E402
                     president_lowest_legal, president_scores_for,  # noqa: E402
                     pres_rank,  # noqa: E402
                     build_uno_deck, uno_match, uno_bot_choice,  # noqa: E402
@@ -919,6 +920,27 @@ async def main():
               not president_legal_play(_hand, ["3♣"], {"size": 2, "rank": 3}))
         check("v2 president: a card not in hand is illegal",
               not president_legal_play(_hand, ["4♣"], None))
+        # --- v2.1: specific illegal-play reasons (not a generic error) ---
+        _r = president_illegal_reason(_hand, [], None)
+        check("v2.1 president: empty selection names the problem",
+              _r is not None and "haven't selected" in _r, str(_r))
+        _r = president_illegal_reason(_hand, ["3♣"], {"size": 2, "rank": 3})
+        check("v2.1 president: wrong size names the trick size",
+              _r is not None and "2 card" in _r and "pair" in _r, str(_r))
+        _r = president_illegal_reason(_hand, ["3♣", "3♦"],
+                                      {"size": 2, "rank": 8})
+        check("v2.1 president: lower rank names the higher-rank rule",
+              _r is not None and "higher rank" in _r, str(_r))
+        _r = president_illegal_reason(_hand, ["3♣", "5♥"], None)
+        check("v2.1 president: mixed ranks names the same-rank rule",
+              _r is not None and "same rank" in _r, str(_r))
+        _r = president_illegal_reason(_hand, ["4♣"], None)
+        check("v2.1 president: card not in hand names the problem",
+              _r is not None and "isn't in your hand" in _r, str(_r))
+        check("v2.1 president: a legal pair gets no reason (None)",
+              president_illegal_reason(_hand, ["3♣", "3♦"], None) is None
+              and president_illegal_reason(
+                  _hand, ["2♦"], {"size": 1, "rank": 13}) is None)
         check("v2 president: lowest legal set when leading is a single 3",
               president_lowest_legal(_hand, None) == ["3♣"])
         check("v2 president: no pair can beat a pair of 4s here",
@@ -949,15 +971,47 @@ async def main():
               uno_value("Gdraw2") == "draw2" and uno_value("Wwild") == "wild")
 
         # --- Unit: Memory bot recall (seeded, statistical with wide margins) ---
+        # v2.1 retune: per-digit error grows with length, so bots
+        # survive the early rounds and fail gradually. At 4 digits
+        # Easy ~83%, Medium ~94%, Hard ~98% correct.
         import random as _random
         _state = _random.getstate()  # restore after: the seed must not
         _random.seed(1234)           # leak into later game draws
         _easy = sum(memory_bot_correct("Easy", 4) for _ in range(200))
+        _med = sum(memory_bot_correct("Medium", 4) for _ in range(200))
         _hard = sum(memory_bot_correct("Hard", 4) for _ in range(200))
         _random.setstate(_state)
-        check("v2 memory: Hard bots recall better than Easy bots at 4 digits",
-              _hard > _easy and 100 < _easy < 160 and _hard > 160,
-              f"easy={_easy}/200 hard={_hard}/200")
+        check("v2.1 memory: Hard bots recall better than Easy bots at 4 digits",
+              _hard > _med > _easy and 140 < _easy < 185 and _hard > 180,
+              f"easy={_easy}/200 medium={_med}/200 hard={_hard}/200")
+
+        # --- v2.1: Memory bot survival simulation (seeded) ---
+        # 200 simulated bots per difficulty play rounds of 4..12
+        # digits; the mean last digit survived should land in the
+        # target band for each difficulty (Easy 4-5, Medium 6-7,
+        # Hard 8+), and Hard must clearly outlast Easy.
+        def _sim_survival(diff):
+            _s = _random.getstate()
+            _random.seed(1234)
+            total = 0
+            for _ in range(200):
+                digits, survived = 4, 0
+                while digits <= 12:
+                    if memory_bot_correct(diff, digits):
+                        survived += 1
+                        digits += 1
+                    else:
+                        break
+                total += 3 + survived  # last digit survived (3 = none)
+            _random.setstate(_s)
+            return total / 200
+        _surv = {d: _sim_survival(d) for d in ("Easy", "Medium", "Hard")}
+        check("v2.1 memory: bot survival bands (Easy 4-5, Medium 6-7, Hard 8+)",
+              4.0 <= _surv["Easy"] <= 5.5
+              and 5.5 <= _surv["Medium"] <= 7.5
+              and 7.5 <= _surv["Hard"] <= 10.0
+              and _surv["Hard"] > _surv["Medium"] > _surv["Easy"],
+              str({k: round(v, 2) for k, v in _surv.items()}))
 
         # --- Unit: Elimination pool filter ---
         check("v2 elimination: pool is the four quick games at 4+ players",
@@ -1070,6 +1124,163 @@ async def main():
               and pres_res["rankings"][-1]["score"] == 0,
               str([(r["nickname"], r["score"]) for r in pres_res["rankings"]]))
         await hp.close(); await rp.close()
+
+        # --- v2.1: President illegal plays + timeout auto-play notice ---
+        # Fresh 4-player game, short 4s turns. The host probes the
+        # error paths on its own turns, then idles so a timeout fires.
+        hq = Client("pres2-host"); await hq.connect()
+        await hq.send({"type": "create_room", "nickname": "Pres2Host", "colour": "#e74c3c"})
+        jq = await hq.wait_for("joined"); codeq = jq["code"]; hq_id = jq["player_id"]
+        rq = Client("pres2-p2"); await rq.connect()
+        await rq.send({"type": "join_room", "code": codeq, "nickname": "Pres2P2", "colour": "#3498db"})
+        jr = await rq.wait_for("joined"); rq_id = jr["player_id"]
+        await hq.send({"type": "add_bot"}); await hq.wait_lobby_count(3)
+        await hq.send({"type": "add_bot"}); await hq.wait_lobby_count(4)
+        await hq.send({"type": "update_settings", "game": "president",
+                       "game_settings": {"president": {"turn_seconds": 4}}})
+        await hq.wait_lobby()
+        await hq.send({"type": "start_game"})
+        started = await hq.wait_for("game_started", timeout=5)
+        check("v2.1 President (probe game) starts", started["game"] == "president")
+        probe = {"empty": False, "size": False, "notice": ""}
+
+        async def pres_auto_driver(client, my_id):
+            # Play legally forever (used for the second human).
+            while True:
+                msg = await wait_any(client, ("president_state", "results",
+                                              "president_notice"), timeout=90)
+                if msg["type"] == "results":
+                    return msg
+                if msg["type"] == "president_notice":
+                    continue
+                if msg["turn_id"] != my_id:
+                    continue
+                hand, trick = msg["hand"], msg["trick"]
+                if trick is None:
+                    by_rank = {}
+                    for c in hand:
+                        by_rank.setdefault(pres_rank(c), []).append(c)
+                    play = by_rank[min(by_rank)]
+                else:
+                    play = president_lowest_legal(
+                        hand, {"size": trick["size"], "rank": trick["rank"]})
+                if play:
+                    await client.send({"type": "president_play", "cards": play})
+                else:
+                    await client.send({"type": "president_pass"})
+
+        async def pres_probe_driver(client, my_id):
+            idle = False  # once set, stop acting so a timeout fires
+            while True:
+                msg = await wait_any(client, ("president_state", "results",
+                                              "president_notice", "error"),
+                                     timeout=90)
+                if msg["type"] == "results":
+                    return msg
+                if msg["type"] == "president_notice":
+                    probe["notice"] = msg.get("message", "")
+                    continue
+                if msg["type"] == "error":
+                    continue  # errors are asserted inline below
+                if msg["turn_id"] != my_id:
+                    continue
+                if idle:
+                    continue  # let the turn time out
+                hand, trick = msg["hand"], msg["trick"]
+                if not probe["empty"]:
+                    # Probe 1: Play with NOTHING selected.
+                    await client.send({"type": "president_play", "cards": []})
+                    err = await wait_any(client, ("error",), timeout=5)
+                    check("v2.1 President: empty play gets a specific error",
+                          "haven't selected" in err.get("message", ""),
+                          str(err))
+                    probe["empty"] = True
+                    # Turn is still ours and nothing was played: play
+                    # a legal set now and the hand must shrink by
+                    # exactly those cards.
+                    if trick is None:
+                        by_rank = {}
+                        for c in hand:
+                            by_rank.setdefault(pres_rank(c), []).append(c)
+                        play = by_rank[min(by_rank)]
+                    else:
+                        play = president_lowest_legal(
+                            hand, {"size": trick["size"],
+                                   "rank": trick["rank"]})
+                    if play:
+                        await client.send({"type": "president_play",
+                                           "cards": play})
+                        nxt = await wait_any(client, ("president_state",),
+                                             timeout=10)
+                        check("v2.1 President: after an empty play the turn "
+                              "is still ours and the legal play lands",
+                              sorted(nxt["hand"]) == sorted(
+                                  set(hand) - set(play)),
+                              f"hand={hand} play={play} next={nxt['hand']}")
+                    else:
+                        await client.send({"type": "president_pass"})
+                    continue
+                if (not probe["size"] and trick is not None
+                        and trick["size"] >= 2):
+                    # Probe 2: one higher card against a multi-card
+                    # trick (pair or bigger). If we have no higher
+                    # single card, pass and wait for the next
+                    # multi-card trick instead of spending the hand.
+                    higher = [c for c in hand
+                              if pres_rank(c) > trick["rank"]]
+                    if higher:
+                        await client.send({"type": "president_play",
+                                           "cards": [higher[0]]})
+                        err = await wait_any(client, ("error",), timeout=5)
+                        check("v2.1 President: single vs multi-card trick "
+                              "gets a specific size error",
+                              ("play %d card" % trick["size"])
+                              in err.get("message", "")
+                              and "not 1" in err.get("message", ""),
+                              str(err))
+                        probe["size"] = True
+                        # Now play legally (or pass) and stop probing.
+                        play = president_lowest_legal(
+                            hand, {"size": trick["size"],
+                                   "rank": trick["rank"]})
+                        if play:
+                            await client.send({"type": "president_play",
+                                               "cards": play})
+                        else:
+                            await client.send({"type": "president_pass"})
+                        # Both probes done: idle from now on so the
+                        # next turn times out and the notice fires.
+                        idle = True
+                        continue
+                    await client.send({"type": "president_pass"})
+                    continue
+                if trick is None:
+                    by_rank = {}
+                    for c in hand:
+                        by_rank.setdefault(pres_rank(c), []).append(c)
+                    play = by_rank[min(by_rank)]
+                else:
+                    play = president_lowest_legal(
+                        hand, {"size": trick["size"], "rank": trick["rank"]})
+                if play:
+                    await client.send({"type": "president_play", "cards": play})
+                else:
+                    await client.send({"type": "president_pass"})
+
+        pq1 = asyncio.create_task(pres_probe_driver(hq, hq_id))
+        pq2 = asyncio.create_task(pres_auto_driver(rq, rq_id))
+        pres2_res = await asyncio.wait_for(asyncio.gather(pq1, pq2),
+                                           timeout=300)
+        check("v2.1 President: empty-selection probe fired",
+              probe["empty"])
+        check("v2.1 President: wrong-size probe fired (single vs multi-card trick)",
+              probe["size"])
+        check("v2.1 President: timeout auto-play broadcasts a notice",
+              "ran out of time" in probe["notice"], probe["notice"])
+        check("v2.1 President: probe game still produces results",
+              pres2_res[0]["game"] == "president"
+              and len(pres2_res[0]["rankings"]) == 4)
+        await hq.close(); await rq.close()
 
         # --- v2: UNO full game (2 humans + 1 bot) ---
         hu = Client("uno-host"); await hu.connect()
@@ -1226,10 +1437,13 @@ async def main():
         jr = await re_.wait_for("joined"); re_id = jr["player_id"]
         await he.send({"type": "add_bot"}); await he.wait_lobby_count(3)
         await he.send({"type": "add_bot"}); await he.wait_lobby_count(4)
-        await he.send({"type": "update_settings", "game": "elimination"})
+        # v2.1: short 3s vote-break timeout so the pacing breaks
+        # (and the no-vote timeout path below) stay fast in the test.
+        await he.send({"type": "update_settings", "game": "elimination",
+                       "game_settings": {"elimination": {"vote_timeout": 3}}})
         await he.wait_lobby()
         elim_state = {"results": [], "eliminated": [], "challenges": [],
-                      "lobby": False}
+                      "lobby": False, "breaks": [], "events": []}
 
         async def elim_driver(client, my_id):
             number = None
@@ -1239,9 +1453,28 @@ async def main():
                     "question", "reaction_wait", "reaction_go",
                     "memory_show", "memory_recall",
                     "elimination_challenge", "elimination_eliminated",
-                    "results", "elimination_end_vote", "lobby"), timeout=90)
+                    "vote_break",
+                    "results", "elimination_end_vote", "lobby"), timeout=120)
                 t = msg["type"]
-                if t == "question":
+                elim_state["events"].append(
+                    (t, msg.get("game") or msg.get("game_name")))
+                if t == "vote_break":
+                    # v2.1 pacing break between challenges. Vote NEXT
+                    # in the FIRST series only; in the second series
+                    # (after the first end vote) don't vote, so the
+                    # break must advance at the 3s timeout instead.
+                    if msg.get("elim_break"):
+                        elim_state["breaks"].append(
+                            (msg["index"], msg.get("eliminated"),
+                             msg.get("remaining"), msg["votes_needed"],
+                             msg["timeout"]))
+                        if my_end_votes == 0:
+                            await client.send({"type": "vote_next",
+                                               "index": msg["index"]})
+                    elif my_end_votes == 0:
+                        await client.send({"type": "vote_next",
+                                           "index": msg["index"]})
+                elif t == "question":
                     if msg.get("options"):
                         await client.send({"type": "answer", "answer": 0,
                                            "index": msg["index"]})
@@ -1278,7 +1511,7 @@ async def main():
         ed1 = asyncio.create_task(elim_driver(he, he_id))
         ed2 = asyncio.create_task(elim_driver(re_, re_id))
         await he.send({"type": "start_game"})
-        deadline = time.monotonic() + 300
+        deadline = time.monotonic() + 420
         while time.monotonic() < deadline and not elim_state["lobby"]:
             await asyncio.sleep(1)
         check("v2 Elimination: two series ran (Play Again, then Lobby)",
@@ -1306,6 +1539,35 @@ async def main():
               str([(r["nickname"], r["score"]) for r in first["finishing_order"]]))
         check("v2 Elimination: series ends back in the lobby",
               elim_state["lobby"])
+        # --- v2.1: pacing breaks + intros ---
+        # At least one break per challenge in each series (regular
+        # challenges + finale), each naming who was eliminated and
+        # how many remain, with the 3s test timeout.
+        check("v2.1 Elimination: a NEXT vote break follows every challenge",
+              len(elim_state["breaks"]) >= len(elim_state["challenges"]),
+              f"breaks={elim_state['breaks']} challenges={elim_state['challenges']}")
+        check("v2.1 Elimination: breaks name the eliminated player and "
+              "the players remaining, with the short test timeout",
+              all(b[1] and isinstance(b[2], int) and b[2] >= 1
+                  and b[4] == 3 for b in elim_state["breaks"]),
+              str(elim_state["breaks"]))
+        # Every challenge was announced (intro) by name BEFORE any
+        # of its questions / reaction rounds started.
+        _evs = elim_state["events"]
+        _intro_ok = True
+        for i, (t, g) in enumerate(_evs):
+            if t == "elimination_challenge":
+                if g not in GAMES:
+                    _intro_ok = False
+                # the next game-play event must come after this intro
+                _rest = [x for x, _ in _evs[i + 1:]]
+                if not any(x in ("question", "reaction_wait", "memory_show",
+                                 "results", "elimination_end_vote")
+                           for x in _rest):
+                    _intro_ok = False
+        check("v2.1 Elimination: every challenge intro names its game",
+              _intro_ok and len(elim_state["challenges"]) >= 2,
+              str(elim_state["challenges"]))
         await asyncio.wait_for(asyncio.gather(ed1, ed2), timeout=30)
         await he.close(); await re_.close()
 
