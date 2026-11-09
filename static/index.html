@@ -55,6 +55,18 @@
   .timer { font-size: 1.4rem; font-weight: 800; text-align: center; }
   #connStatus { background: #e67e22; color: #fff; font-weight: 700; text-align: center; border-radius: 8px; padding: 8px; margin-bottom: 12px; }
   #voteBox { background: #1e1e2e; border-radius: 8px; padding: 12px; margin-top: 12px; text-align: center; }
+  /* v2: card games — clickable playing cards */
+  .hand { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .pcard { width: auto; min-width: 44px; padding: 10px 8px; background: #fff; color: #111; border-radius: 8px; font-weight: 800; font-size: 1.05rem; border: 2px solid #888; }
+  .pcard.red { color: #c0392b; }
+  .pcard.sel { border-color: #f1c40f; background: #fef9e7; transform: translateY(-4px); }
+  .pcard:disabled { opacity: .6; }
+  .uno-card { width: 52px; height: 72px; border-radius: 8px; font-weight: 800; font-size: 1.1rem; color: #fff; border: 2px solid #fff3; padding: 0; }
+  .uno-card.sel { border-color: #f1c40f; transform: translateY(-4px); }
+  .uno-card.wild { background: #333; }
+  #memoryNumber { font-size: 3rem; font-weight: 800; letter-spacing: .3em; text-align: center; padding: 20px 0; }
+  #elimBanner { background: #6c3483; border-radius: 8px; padding: 10px; margin-bottom: 12px; text-align: center; font-weight: 700; }
+  .elim-out { opacity: .45; text-decoration: line-through; }
 </style>
 </head>
 <body>
@@ -120,6 +132,11 @@
           <option value="reaction">Reaction Test</option>
           <option value="math">Speed Math</option>
           <option value="trivia">Speed Trivia</option>
+          <option value="secret">Secret Word / Impostor</option>
+          <option value="president">President</option>
+          <option value="uno">UNO</option>
+          <option value="memory">Memory</option>
+          <option value="elimination">Elimination (series of challenges)</option>
           <option value="random">🎲 Random game</option>
         </select>
         <label>Mode</label>
@@ -156,6 +173,23 @@
           <label>Time per question</label>
           <select id="setTriviaTime"><option>10</option><option selected>15</option><option>20</option></select>
         </div>
+        <div id="setSecret" class="hidden">
+          <p class="muted">Secret Word: 1 impostor (4–5 players) or 2 (6–8). Everyone else sees the same secret word; the impostor must blend in. One clue each, then vote out the impostor — catch one and the word team wins.</p>
+        </div>
+        <div id="setPresident" class="hidden">
+          <p class="muted">President: shed all your cards first to become President. Play a set of the same rank that beats the trick, or pass. The 3 of clubs leads. Last player left is the Asshole.</p>
+        </div>
+        <div id="setUno" class="hidden">
+          <p class="muted">UNO: match the top card by colour, number or symbol. Wilds let you pick the next colour. First to empty your hand wins.</p>
+        </div>
+        <div id="setMemory" class="hidden">
+          <label>Memorize time (seconds)</label>
+          <select id="setMemoryTime"><option>5</option><option selected>10</option><option>15</option><option>20</option><option>30</option></select>
+          <p class="muted">Memory: memorize a 4-digit number, then type it back. Wrong and you're out! Survive and the number grows: 5 digits, 6, 7, 8… until one player remains. Recall time is 15 seconds.</p>
+        </div>
+        <div id="setElimination" class="hidden">
+          <p class="muted">Elimination: a series of quick challenges (Reaction, Speed Math, Speed Trivia, Memory). Last place in each challenge is eliminated, until 3 remain — then a finale crowns the victor. At the end, everyone votes Play Again or Return to Lobby.</p>
+        </div>
         <button id="addBotBtn">+ Add BOT</button>
       </div>
       <p id="settingsReadOnly" class="muted hidden">Only the host can change settings. Waiting for the host to start…</p>
@@ -169,6 +203,7 @@
   <div id="game" class="card hidden">
     <h2 id="gameTitle"></h2>
     <p id="gameInfo" class="muted"></p>
+    <div id="elimBanner" class="hidden"></div>
     <div id="reactionBox" class="hidden">
       <div id="reactionArea" class="wait">Wait…</div>
       <p class="muted">Click / tap the box as soon as it turns green. Clicking early is a false start — that round counts as a fail.</p>
@@ -183,13 +218,62 @@
       </div>
       <p id="quizFeedback"></p>
       <div id="scoreboard"></div>
-      <div id="voteBox" class="hidden">
-        <h3>Take a breather — scores above ☝️</h3>
-        <div id="voteTeams"></div>
-        <p id="voteCount" class="muted">0/0 voted NEXT</p>
-        <button id="nextBtn" class="green">NEXT QUESTION →</button>
-        <button id="hostSkipBtn" class="hostskip hidden">HOST: Skip to next question →</button>
+    </div>
+    <!-- v2: NEXT vote break — shared by quiz games AND Reaction Test -->
+    <div id="voteBox" class="hidden">
+      <h3>Take a breather — scores above ☝️</h3>
+      <div id="voteTeams"></div>
+      <p id="voteCount" class="muted">0/0 voted NEXT</p>
+      <button id="nextBtn" class="green">NEXT QUESTION →</button>
+      <button id="hostSkipBtn" class="hostskip hidden">HOST: Skip to next question →</button>
+    </div>
+    <div id="secretBox" class="hidden">
+      <p id="secretPrivate" style="font-size:1.2rem;font-weight:800;text-align:center"></p>
+      <p id="secretStatus" class="muted"></p>
+      <div id="secretClueArea" class="hidden">
+        <label>Your clue (one word — don't give the word away!)</label>
+        <div class="row"><input id="secretClueInput" maxlength="20" placeholder="e.g. furry"><button id="secretClueBtn">Send clue</button></div>
       </div>
+      <div id="secretClues"></div>
+      <div id="secretVoteArea" class="hidden">
+        <h3>Who is the impostor?</h3>
+        <div id="secretVoteBtns"></div>
+      </div>
+      <div id="secretReveal"></div>
+    </div>
+    <div id="presidentBox" class="hidden">
+      <p id="presTurn" style="font-weight:800"></p>
+      <p id="presTrick" class="muted"></p>
+      <div id="presHand" class="hand"></div>
+      <div class="row"><button id="presPlayBtn" class="green">Play Selected</button><button id="presPassBtn" class="secondary">Pass</button></div>
+      <div id="presCounts" class="muted"></div>
+      <div id="presFinished"></div>
+    </div>
+    <div id="unoBox" class="hidden">
+      <p id="unoTurn" style="font-weight:800"></p>
+      <p>Top card: <b id="unoTop"></b> · Colour in play: <b id="unoColour"></b> <span id="unoDir" class="muted"></span></p>
+      <div id="unoHand" class="hand"></div>
+      <div class="row"><button id="unoDrawBtn">Draw a card</button><button id="unoEndTurnBtn" class="secondary hidden">Keep drawn card — end turn</button></div>
+      <div id="unoColourPick" class="hidden">
+        <label>Pick a colour for the Wild card</label>
+        <div class="row">
+          <button data-colour="R" style="background:#e74c3c">Red</button>
+          <button data-colour="G" style="background:#27ae60">Green</button>
+          <button data-colour="B" style="background:#3498db">Blue</button>
+          <button data-colour="Y" style="background:#b7950b">Yellow</button>
+        </div>
+      </div>
+      <div id="unoCounts" class="muted"></div>
+    </div>
+    <div id="memoryBox" class="hidden">
+      <p id="memoryStatus" style="font-weight:800;text-align:center"></p>
+      <p class="timer" id="memoryTimer"></p>
+      <div id="memoryNumber"></div>
+      <div id="memoryRecallBox" class="hidden">
+        <label>Type the number back from memory</label>
+        <div class="row"><input id="memoryAns" inputmode="numeric" placeholder="e.g. 4827"><button id="memorySubmit" class="green">Submit</button></div>
+      </div>
+      <div id="memoryElim"></div>
     </div>
   </div>
 
@@ -198,6 +282,15 @@
     <h2>🏆 Results</h2>
     <div id="teamResults"></div>
     <div id="resultsTable"></div>
+    <div id="elimEndVote" class="hidden" style="background:#1e1e2e;border-radius:8px;padding:12px;margin-top:12px;text-align:center">
+      <h3>What next?</h3>
+      <p id="elimVoteCount" class="muted">0/0 voted</p>
+      <div class="row">
+        <button id="elimAgainBtn" class="green">🔁 Play Again</button>
+        <button id="elimLobbyBtn" class="secondary">🚪 Return to Lobby</button>
+      </div>
+      <p class="muted">At least half the players must agree. If nobody decides in 60s, we go back to the lobby.</p>
+    </div>
     <div class="card compact" style="background:#1e1e2e">
       <h3>Edit my nickname / colour</h3>
       <label>Nickname</label><input id="myNick2" maxlength="20">
@@ -212,14 +305,20 @@
 
 <script>
 const PALETTE = ["#e74c3c","#e67e22","#f1c40f","#2ecc71","#3498db","#9b59b6","#fd79a8","#1abc9c","#95a5a6","#34495e"];
-const GAME_NAMES = {reaction:"Reaction Test", math:"Speed Math", trivia:"Speed Trivia", random:"Random"};
+const GAME_NAMES = {reaction:"Reaction Test", math:"Speed Math", trivia:"Speed Trivia", secret:"Secret Word", president:"President", uno:"UNO", memory:"Memory", elimination:"Elimination", random:"Random"};
+const MIN_PLAYERS = {reaction:1, math:1, trivia:1, secret:4, president:4, uno:2, memory:2, elimination:4, random:1};
 const TEAM_NAMES = ["Team 1","Team 2","Team 3","Team 4"];
 const TEAM_COLOURS = ["#e74c3c","#3498db","#2ecc71","#f1c40f"];
+const UNO_COLOUR_HEX = {R:"#e74c3c", G:"#27ae60", B:"#3498db", Y:"#f1c40f"};
+const UNO_COLOUR_NAMES = {R:"Red", G:"Green", B:"Blue", Y:"Yellow"};
 let ws=null, myId=null, room=null, myColour=PALETTE[4], editingBot=null, botColour=PALETTE[0];
 let quizTimerInt=null, reactionClicked=false, quizAnswered=false, currentQIndex=null;
 let myProfileColour=PALETTE[4], votedNext=false, voteIndex=null;
 let heartbeatInt=null, reconnectAttempts=0, lastJoinMsg=null;
 let homeTakenColours = new Set(); // colours already used in the room being joined
+// v2 game state
+let presSelected=new Set(), unoSelected=null, unoPendingWild=null, memoryAnswered=false;
+let elimVoted=false, memoryTimerInt=null;
 
 function $(id){return document.getElementById(id);}
 function show(id){["home","lobby","game","results"].forEach(s=>$(s).classList.toggle("hidden", s!==id));}
@@ -252,6 +351,14 @@ function teamStandingsHtml(teams){
   return "<h3>Team standings (average score)</h3><table>"+
     teams.map(t=>"<tr><td><span class='team-badge' style='background:"+t.colour+"'>"+t.name+"</span></td><td>"+t.average+" pts</td><td class='muted'>"+
       t.members.map(m=>m.nickname).join(", ")+"</td></tr>").join("")+"</table>";
+}
+// v2: display label for an UNO card string like "R5", "Gskip", "Wwild".
+function unoLabel(card){
+  if(!card) return "—";
+  if(card.startsWith("W")) return card==="Wwild" ? "🌈 Wild" : "🌈 Wild +4";
+  const v = card.slice(1);
+  const names = {skip:"Skip", reverse:"Reverse", draw2:"+2"};
+  return (names[v]||v);
 }
 // v1.2: when a join code is entered, look up the room and grey out
 // colours that are already taken in it.
@@ -348,8 +455,18 @@ function handle(msg){
     $("gameInfo").textContent = (msg.mode==="solo" ? "Just you — have fun, no pressure!" : "Fastest correct answers score the most points.") +
       (msg.party_mode==="teams" ? " · Teams mode — team score is the average of its members." : "");
     $("reactionResults").innerHTML=""; $("quizFeedback").textContent=""; $("scoreboard").innerHTML="";
+    $("secretClues").innerHTML=""; $("secretReveal").innerHTML=""; $("secretPrivate").textContent=""; $("secretStatus").textContent="";
+    $("secretClueArea").classList.add("hidden"); $("secretVoteArea").classList.add("hidden");
+    $("presHand").innerHTML=""; $("presCounts").innerHTML=""; $("presFinished").innerHTML=""; presSelected=new Set();
+    $("unoHand").innerHTML=""; $("unoCounts").innerHTML=""; unoSelected=null; unoPendingWild=null; $("unoColourPick").classList.add("hidden");
+    $("memoryNumber").textContent=""; $("memoryElim").innerHTML=""; memoryAnswered=false; clearInterval(memoryTimerInt);
+    $("voteBox").classList.add("hidden");
     $("reactionBox").classList.toggle("hidden", msg.game!=="reaction");
-    $("quizBox").classList.toggle("hidden", msg.game==="reaction");
+    $("quizBox").classList.toggle("hidden", !(msg.game==="math"||msg.game==="trivia"));
+    $("secretBox").classList.toggle("hidden", msg.game!=="secret");
+    $("presidentBox").classList.toggle("hidden", msg.game!=="president");
+    $("unoBox").classList.toggle("hidden", msg.game!=="uno");
+    $("memoryBox").classList.toggle("hidden", msg.game!=="memory");
     show("game"); return; }
   if(msg.type==="reaction_wait"){ reactionClicked=false; const a=$("reactionArea"); a.className="wait"; a.textContent="Wait…"; return; }
   if(msg.type==="reaction_go"){ const a=$("reactionArea"); a.className="go"; a.textContent="CLICK NOW!"; return; }
@@ -390,13 +507,158 @@ function handle(msg){
       .map(s=>"<tr><td><span class='chip' style='display:inline-block;background:"+s.colour+"'></span> "+s.nickname+(s.is_bot?" 🤖":"")+teamBadge(s)+"</td><td>"+s.score+"</td></tr>").join("")+"</table>" +
       (msg.teams ? teamStandingsHtml(msg.teams) : "");
     return; }
+  // ---- v2: Secret Word ----
+  if(msg.type==="secret_word"){
+    $("secretPrivate").textContent = msg.is_impostor
+      ? "🕵️ You are the IMPOSTOR — figure out the word from the clues, and don't get caught!"
+      : "🤫 The secret word is: "+msg.word;
+    $("secretStatus").textContent = msg.is_impostor
+      ? "There "+(msg.impostor_count>1?"are "+msg.impostor_count+" impostors":"is 1 impostor")+" among you. Give a vague clue that fits in."
+      : "Give a one-word clue that helps the others guess the word — but don't just say the word itself!";
+    return; }
+  if(msg.type==="secret_clue_turn"){
+    $("secretStatus").textContent = msg.player_id===myId ? "Your turn — give a one-word clue!" : "Waiting for "+msg.nickname+" to give a clue…";
+    $("secretClueArea").classList.toggle("hidden", msg.player_id!==myId);
+    if(msg.player_id===myId){ $("secretClueInput").value=""; $("secretClueInput").focus(); }
+    return; }
+  if(msg.type==="secret_clue_shown"){
+    const d=document.createElement("div");
+    d.innerHTML="<b>"+msg.nickname+":</b> "+msg.clue;
+    $("secretClues").appendChild(d);
+    return; }
+  if(msg.type==="secret_vote_start"){
+    $("secretVoteArea").classList.remove("hidden");
+    $("secretStatus").textContent="Vote for who you think the impostor is!";
+    const box=$("secretVoteBtns"); box.innerHTML="";
+    msg.players.filter(p=>p.player_id!==myId).forEach(p=>{
+      const b=document.createElement("button"); b.className="opt"; b.textContent=p.nickname+(p.is_bot?" 🤖":"");
+      b.onclick=()=>{ [...box.children].forEach(x=>x.disabled=true); send({type:"secret_vote", player_id:p.player_id}); $("secretStatus").textContent="You voted for "+p.nickname+" — waiting for the others…"; };
+      box.appendChild(b); });
+    return; }
+  if(msg.type==="secret_result"){
+    const meIsImp = msg.impostors.includes(myId);
+    const iWon = msg.winners.includes(myId);
+    $("secretReveal").innerHTML="<h3>Reveal!</h3><p>The secret word was <b>"+msg.word+"</b>.</p><p>Impostor"+(msg.impostors.length>1?"s":"")+": <b>"+
+      msg.impostors.map(id=>{const p=room.players.find(q=>q.id===id); return p?p.nickname:id;}).join(", ")+"</b></p><p>"+
+      (msg.eliminated ? "Voted out: <b>"+(room.players.find(q=>q.id===msg.eliminated)||{}).nickname+"</b>. " : "Nobody was voted out (tie). ") +
+      (msg.word_team_won ? "The word team caught an impostor!" : "The impostors survived!") +
+      "</p><p>"+(iWon ? "🎉 You win! +"+(meIsImp?1500:1000)+" points." : "You lose this one.")+"</p>";
+    return; }
+  // ---- v2: President ----
+  if(msg.type==="president_state"){
+    const me = msg.turn_id===myId;
+    $("presTurn").textContent = me ? "👉 Your turn!" : "Waiting for "+(room.players.find(p=>p.id===msg.turn_id)||{}).nickname+"…";
+    $("presTrick").textContent = msg.trick
+      ? "Current trick: "+msg.trick.cards.join(" ") + " ("+msg.trick.size+" × "+msg.trick.cards[0].slice(0,-1)+") — play the same size, higher rank, or pass."
+      : "New trick — lead with any set of the same rank (1–4 cards).";
+    $("presPassBtn").disabled = !me || !msg.can_pass;
+    $("presPlayBtn").disabled = !me;
+    const hand=$("presHand"); hand.innerHTML="";
+    msg.hand.forEach(c=>{
+      const b=document.createElement("button"); b.className="pcard"+(("♥♦".includes(c.slice(-1)))?" red":"");
+      b.textContent=c;
+      if(presSelected.has(c)) b.classList.add("sel");
+      b.onclick=()=>{ if(!me) return; if(presSelected.has(c)) presSelected.delete(c); else presSelected.add(c); b.classList.toggle("sel"); };
+      hand.appendChild(b); });
+    $("presCounts").innerHTML = "Cards left: " + Object.entries(msg.counts)
+      .map(([pid,n])=>{const p=room.players.find(q=>q.id===pid); return (p?p.nickname:pid)+" "+n;}).join(" · ");
+    $("presFinished").innerHTML = msg.finished.length ? "<p>Finished: "+msg.finished.map((pid,i)=>{
+      const p=room.players.find(q=>q.id===pid); const titles=["President","Vice-President","","","","","","Vice-Asshole","Asshole"];
+      return (i+1)+". "+(p?p.nickname:pid);}).join(" · ")+"</p>" : "";
+    return; }
+  // ---- v2: UNO ----
+  if(msg.type==="uno_state"){
+    const me = msg.turn_id===myId;
+    $("unoTurn").textContent = me ? "👉 Your turn!" : "Waiting for "+(room.players.find(p=>p.id===msg.turn_id)||{}).nickname+"…";
+    $("unoTop").textContent = unoLabel(msg.top);
+    $("unoTop").style.color = msg.top && msg.top.startsWith("W") ? "#fff" : (UNO_COLOUR_HEX[msg.top?msg.top[0]:"R"]||"#fff");
+    $("unoColour").textContent = UNO_COLOUR_NAMES[msg.current_colour]||msg.current_colour;
+    $("unoDir").textContent = "· Direction: "+(msg.direction===1?"→ clockwise":"← counter-clockwise");
+    $("unoDrawBtn").disabled = !me;
+    $("unoEndTurnBtn").classList.toggle("hidden", !(me && msg.drawn));
+    const hand=$("unoHand"); hand.innerHTML="";
+    msg.hand.forEach(c=>{
+      const b=document.createElement("button"); b.className="uno-card"+(c.startsWith("W")?" wild":"");
+      if(!c.startsWith("W")) b.style.background=UNO_COLOUR_HEX[c[0]];
+      b.textContent=unoLabel(c);
+      if(unoSelected===c) b.classList.add("sel");
+      b.onclick=()=>{
+        if(!me) return;
+        if(c.startsWith("W")){ unoSelected=c; unoPendingWild=c; $("unoColourPick").classList.remove("hidden"); [...hand.children].forEach(x=>x.classList.remove("sel")); b.classList.add("sel"); }
+        else { unoSelected=c; unoPendingWild=null; $("unoColourPick").classList.add("hidden"); [...hand.children].forEach(x=>x.classList.remove("sel")); b.classList.add("sel");
+          send({type:"uno_play", card:c}); unoSelected=null; }
+      };
+      hand.appendChild(b); });
+    $("unoCounts").innerHTML = "Cards left: " + Object.entries(msg.counts)
+      .map(([pid,n])=>{const p=room.players.find(q=>q.id===pid); return (p?p.nickname:pid)+" "+n;}).join(" · ") +
+      (msg.drawn ? " · You drew <b>"+unoLabel(msg.drawn)+"</b> — tap it to play it, or keep it and end your turn." : "");
+    return; }
+  // ---- v2: Memory ----
+  if(msg.type==="memory_round_start"){
+    $("memoryStatus").textContent="Round "+msg.round+" — "+msg.digits+" digits. Memorize your number!";
+    $("memoryRecallBox").classList.add("hidden");
+    return; }
+  if(msg.type==="memory_show"){
+    memoryAnswered=false;
+    $("memoryStatus").textContent="Round "+msg.round+" — memorize this "+msg.digits+"-digit number!";
+    $("memoryNumber").textContent=msg.number;
+    $("memoryRecallBox").classList.add("hidden");
+    let left=msg.seconds; $("memoryTimer").textContent=left+"s to memorize";
+    clearInterval(memoryTimerInt);
+    memoryTimerInt=setInterval(()=>{ left--; if(left<=0){ clearInterval(memoryTimerInt); $("memoryNumber").textContent="•".repeat(msg.digits); $("memoryTimer").textContent="Number hidden — get ready…"; } else $("memoryTimer").textContent=left+"s to memorize"; },1000);
+    return; }
+  if(msg.type==="memory_recall"){
+    $("memoryStatus").textContent="Round "+msg.round+" — type the "+msg.digits+"-digit number from memory!";
+    $("memoryNumber").textContent="•".repeat(msg.digits);
+    $("memoryRecallBox").classList.remove("hidden");
+    $("memoryAns").value=""; $("memoryAns").disabled=false; $("memorySubmit").disabled=false; memoryAnswered=false; $("memoryAns").focus();
+    let left=msg.time_limit; $("memoryTimer").textContent=left+"s to answer";
+    clearInterval(memoryTimerInt);
+    memoryTimerInt=setInterval(()=>{ left--; if(left<=0){ clearInterval(memoryTimerInt); $("memoryTimer").textContent="Time's up!"; } else $("memoryTimer").textContent=left+"s to answer"; },1000);
+    return; }
+  if(msg.type==="memory_round_result"){
+    clearInterval(memoryTimerInt);
+    const names = ids => ids.map(id=>{const p=room.players.find(q=>q.id===id); return p?p.nickname:id;}).join(", ");
+    $("memoryElim").innerHTML="<p>Round "+msg.round+" ("+msg.digits+" digits): "+
+      (msg.survivors.length===1 && msg.survivors[0]===myId ? "🎉 You survived — you win!" :
+       msg.eliminated.includes(myId) ? "❌ Wrong number — you're out! (The number was "+msg.numbers[myId]+")" :
+       msg.survivors.length ? "Survivors: "+names(msg.survivors) + (msg.eliminated.length ? " · Out: "+names(msg.eliminated) : "") :
+       "Everyone was out — tie! Same round, new numbers…")+"</p>";
+    if(msg.eliminated.includes(myId)){ $("memoryRecallBox").classList.add("hidden"); }
+    return; }
+  // ---- v2: Elimination ----
+  if(msg.type==="elimination_challenge"){
+    $("elimBanner").classList.remove("hidden");
+    $("elimBanner").textContent = (msg.finale?"🏁 FINALE — ":"⚔️ Elimination — Challenge "+msg.challenge+" — ") +
+      msg.game_name+" · "+msg.remaining+" players remain: "+msg.alive.join(", ");
+    return; }
+  if(msg.type==="elimination_eliminated"){
+    $("elimBanner").classList.remove("hidden");
+    $("elimBanner").textContent = "💀 "+msg.nickname+" is eliminated! "+msg.remaining+" players remain.";
+    return; }
+  if(msg.type==="elimination_end_vote" || msg.type==="elimination_end_vote_update"){
+    $("elimEndVote").classList.remove("hidden");
+    $("elimVoteCount").textContent = msg.votes_again+"/"+msg.votes_needed+" voted Play Again · "+msg.votes_lobby+"/"+msg.votes_needed+" voted Return to Lobby";
+    return; }
   if(msg.type==="results"){
     clearInterval(quizTimerInt);
     const unit = msg.game==="reaction" ? " ms" : " pts";
     $("teamResults").innerHTML = msg.teams ? teamStandingsHtml(msg.teams) : "";
-    $("resultsTable").innerHTML="<h3>Individual scores</h3><table><tr><th>#</th><th>Player</th><th>"+(msg.game==="reaction"?"Avg reaction":"Score")+"</th></tr>"+
+    // v2 Elimination: show the finishing order first, then individuals.
+    let finishHtml = "";
+    if(msg.finishing_order){
+      finishHtml = "<h3>Finishing order</h3><table><tr><th>#</th><th>Player</th><th>Score</th></tr>"+
+        msg.finishing_order.map((r,i)=>"<tr><td>"+(i+1)+"</td><td>"+(i===0?"👑 ":"")+"<span class='chip' style='display:inline-block;background:"+r.colour+"'></span> "+r.nickname+(r.is_bot?" 🤖 BOT":"")+"</td><td>"+r.score+" pts</td></tr>").join("")+"</table>";
+    }
+    $("resultsTable").innerHTML = finishHtml +
+      "<h3>Individual scores</h3><table><tr><th>#</th><th>Player</th><th>"+(msg.game==="reaction"?"Avg reaction":"Score")+"</th></tr>"+
       msg.rankings.map((r,i)=>"<tr><td>"+(i+1)+"</td><td><span class='chip' style='display:inline-block;background:"+r.colour+"'></span> "+r.nickname+(r.is_bot?" 🤖 BOT":"")+teamBadge(r)+"</td><td>"+
-        (msg.game==="reaction" ? (r.avg_ms==null?"— (all false starts)":r.avg_ms+unit+" (best "+r.best_ms+")") : r.score+unit)+"</td></tr>").join("")+"</table>";
+        (msg.game==="reaction" ? (r.avg_ms==null?"— (all false starts)":r.avg_ms+unit+" (best "+r.best_ms+")") : r.score+unit) +
+        (r.cards_left!==undefined ? " · "+r.cards_left+" cards left" : "") + "</td></tr>").join("")+"</table>";
+    // v2: the Elimination end vote is shown by its own messages; hide
+    // it for every other game.
+    if(msg.game!=="elimination"){ $("elimEndVote").classList.add("hidden"); }
+    elimVoted=false;
     show("results"); return; }
 }
 
@@ -413,9 +675,15 @@ function renderLobby(){
   $("setReaction").classList.toggle("hidden", room.game!=="reaction");
   $("setMath").classList.toggle("hidden", room.game!=="math");
   $("setTrivia").classList.toggle("hidden", room.game!=="trivia");
+  $("setSecret").classList.toggle("hidden", room.game!=="secret");
+  $("setPresident").classList.toggle("hidden", room.game!=="president");
+  $("setUno").classList.toggle("hidden", room.game!=="uno");
+  $("setMemory").classList.toggle("hidden", room.game!=="memory");
+  $("setElimination").classList.toggle("hidden", room.game!=="elimination");
   $("setReactionRounds").value=String(room.game_settings.reaction.rounds);
   $("setMathDiff").value=room.game_settings.math.difficulty; $("setMathQ").value=String(room.game_settings.math.questions); $("setMathTime").value=String(room.game_settings.math.time_per_question);
   $("setTriviaCat").value=room.game_settings.trivia.category; $("setTriviaDiff").value=room.game_settings.trivia.difficulty; $("setTriviaQ").value=String(room.game_settings.trivia.questions); $("setTriviaTime").value=String(room.game_settings.trivia.time_per_question);
+  $("setMemoryTime").value=String(room.game_settings.memory ? room.game_settings.memory.memorize_seconds : 10);
   $("setMode").value=room.mode||"ffa";
   $("teamSettings").classList.toggle("hidden", room.mode!=="teams");
   $("setTeamCount").value=String(room.team_count||2);
@@ -450,7 +718,7 @@ function renderLobby(){
     }
     list.appendChild(d);
   });
-  const min = room.game==="random"?1:({reaction:1,math:1,trivia:1}[room.game]||1);
+  const min = MIN_PLAYERS[room.game] || 1;
   const need = Math.max(0, min - room.players.length);
   const teamsOk = teamsValid();
   $("startBtn").disabled = !host || need>0 || !teamsOk;
@@ -483,9 +751,10 @@ function pushSettings(){
     game:$("setGame").value, mode:$("setMode").value, team_count:parseInt($("setTeamCount").value),
     game_settings:{ reaction:{rounds:parseInt($("setReactionRounds").value)},
       math:{difficulty:$("setMathDiff").value, questions:parseInt($("setMathQ").value), time_per_question:parseInt($("setMathTime").value)},
-      trivia:{category:$("setTriviaCat").value, difficulty:$("setTriviaDiff").value, questions:parseInt($("setTriviaQ").value), time_per_question:parseInt($("setTriviaTime").value)} }});
+      trivia:{category:$("setTriviaCat").value, difficulty:$("setTriviaDiff").value, questions:parseInt($("setTriviaQ").value), time_per_question:parseInt($("setTriviaTime").value)},
+      memory:{memorize_seconds:parseInt($("setMemoryTime").value)} }});
 }
-["setRoomName","setMaxPlayers","setGame","setReactionRounds","setMathDiff","setMathQ","setMathTime","setTriviaCat","setTriviaDiff","setTriviaQ","setTriviaTime","setMode","setTeamCount"]
+["setRoomName","setMaxPlayers","setGame","setReactionRounds","setMathDiff","setMathQ","setMathTime","setTriviaCat","setTriviaDiff","setTriviaQ","setTriviaTime","setMemoryTime","setMode","setTeamCount"]
   .forEach(id=>$(id).addEventListener("change", pushSettings));
 $("randomTeamsBtn").onclick=()=>send({type:"randomize_teams"});
 $("hostSkipBtn").onclick=()=>{ $("hostSkipBtn").disabled=true; send({type:"host_skip"}); };
@@ -503,6 +772,20 @@ $("mathAns").addEventListener("keydown", e=>{ if(e.key==="Enter"){ e.preventDefa
 $("againBtn").onclick=()=>{ send({type:"play_again"}); show("lobby"); };
 $("changeBtn").onclick=()=>{ send({type:"play_again"}); show("lobby"); };
 $("nextBtn").onclick=()=>{ if(votedNext) return; votedNext=true; $("nextBtn").disabled=true; send({type:"vote_next", index:voteIndex}); };
+// ---- v2: new-game buttons ----
+function submitSecretClue(){ const v=$("secretClueInput").value.trim(); if(!v) return; send({type:"secret_clue", clue:v}); $("secretClueArea").classList.add("hidden"); $("secretStatus").textContent="Clue sent — waiting for the others…"; }
+$("secretClueBtn").onclick=submitSecretClue;
+$("secretClueInput").addEventListener("keydown", e=>{ if(e.key==="Enter"){ e.preventDefault(); submitSecretClue(); } });
+$("presPlayBtn").onclick=()=>{ if(!presSelected.size) return; send({type:"president_play", cards:[...presSelected]}); presSelected=new Set(); };
+$("presPassBtn").onclick=()=>send({type:"president_pass"});
+$("unoDrawBtn").onclick=()=>send({type:"uno_draw"});
+$("unoEndTurnBtn").onclick=()=>send({type:"uno_end_turn"});
+document.querySelectorAll("#unoColourPick button").forEach(b=>{ b.onclick=()=>{ if(!unoPendingWild) return; send({type:"uno_play", card:unoPendingWild, colour:b.dataset.colour}); unoPendingWild=null; unoSelected=null; $("unoColourPick").classList.add("hidden"); }; });
+function submitMemory(){ if(memoryAnswered) return; const v=$("memoryAns").value.trim(); if(!v) return; memoryAnswered=true; $("memoryAns").disabled=true; $("memorySubmit").disabled=true; send({type:"memory_answer", answer:v}); $("memoryStatus").textContent="Answer sent — waiting for the others…"; }
+$("memorySubmit").onclick=submitMemory;
+$("memoryAns").addEventListener("keydown", e=>{ if(e.key==="Enter"){ e.preventDefault(); submitMemory(); } });
+$("elimAgainBtn").onclick=()=>{ if(elimVoted) return; elimVoted=true; send({type:"elimination_vote", choice:"again"}); };
+$("elimLobbyBtn").onclick=()=>{ if(elimVoted) return; elimVoted=true; send({type:"elimination_vote", choice:"lobby"}); };
 function saveProfile(nickEl, msgEl){
   const nick=nickEl.value.trim(); if(!nick){ msgEl.textContent="Pick a nickname first."; return; }
   send({type:"update_profile", nickname:nick, colour:myProfileColour});
