@@ -8,8 +8,8 @@ No accounts, no sign-in. All game logic lives server-side in this file so
 every player in a room sees the same state at the same time.
 
 V1 games: Reaction Test, Speed Math, Speed Trivia.
-Later phases (add new functions in the GAME HANDLERS section, and a new
-entry in GAMES): Secret Word / Impostor, President / Ditchdiggers, UNO.
+V2 games: Secret Word / Impostor, President / Ditchdiggers, UNO,
+Memory, plus Elimination mode (a series of quick challenges).
 
 Run locally:
     python -m venv .venv
@@ -34,6 +34,15 @@ Protocol (JSON over one WebSocket per player, endpoint /ws):
     answer      {answer, index?}  # math: number as string, trivia: option index;
                                   # index = question number; a stale/late answer
                                   # for an earlier question is ignored
+    secret_clue {clue}            # v2 Secret Word: your one-word clue
+    secret_vote {player_id}       # v2 Secret Word: who you think is the impostor
+    president_play {cards}        # v2 President: play a set of cards
+    president_pass {}             # v2 President: pass your turn
+    uno_play    {card, colour?}   # v2 UNO: play a card (colour for Wilds)
+    uno_draw    {}                # v2 UNO: draw a card
+    uno_end_turn {}               # v2 UNO: keep a drawn card, end turn
+    memory_answer {answer}        # v2 Memory: type the number back
+    elimination_vote {choice}     # v2 Elimination end vote: "again" | "lobby"
     ping        {}                # keep-alive; server replies {"type": "pong"}
     play_again  {}                  # back to lobby, same players
     update_profile {nickname?, colour?}  # own nickname/colour, lobby/results only
@@ -149,10 +158,18 @@ TEAM_NAMES = ["Team 1", "Team 2", "Team 3", "Team 4"]
 TEAM_COLOURS = ["#e74c3c", "#3498db", "#2ecc71", "#f1c40f"]
 
 GAMES = {
-    "reaction": {"name": "Reaction Test", "min_players": 1},
-    "math":     {"name": "Speed Math",    "min_players": 1},
-    "trivia":   {"name": "Speed Trivia",  "min_players": 1},
+    "reaction":    {"name": "Reaction Test",        "min_players": 1},
+    "math":        {"name": "Speed Math",           "min_players": 1},
+    "trivia":      {"name": "Speed Trivia",         "min_players": 1},
+    "secret":      {"name": "Secret Word",          "min_players": 4},
+    "president":   {"name": "President",            "min_players": 4},
+    "uno":         {"name": "UNO",                  "min_players": 2},
+    "memory":      {"name": "Memory",               "min_players": 2},
+    "elimination": {"name": "Elimination",          "min_players": 4},
 }
+# Games the 🎲 Random picker may choose (Elimination is a series, not
+# a single game, so it is never picked at random).
+RANDOM_GAMES = [g for g in GAMES if g != "elimination"]
 GAME_CHOICES = list(GAMES) + ["random"]
 
 DEFAULT_SETTINGS = {
@@ -160,6 +177,81 @@ DEFAULT_SETTINGS = {
     "math":     {"difficulty": "Medium", "questions": 10, "time_per_question": 15},
     "trivia":   {"category": "Mixed", "difficulty": "Medium",
                  "questions": 10, "time_per_question": 15},
+    "secret":   {},
+    "president": {"turn_seconds": 30},
+    "uno":      {"turn_seconds": 30},
+    "memory":   {"memorize_seconds": 10, "recall_seconds": 15},
+    "elimination": {},
+}
+
+# ---------------------------------------------------------------------------
+# Secret Word / Impostor — word bank (v2)
+# ---------------------------------------------------------------------------
+# word -> 3-4 plausible one-word clues a bot (who knows the word) can give.
+# Impostor bots instead give vague generic words from VAGUE_CLUES.
+SECRET_WORDS = {
+    # Animals (16)
+    "dog": ["pet", "bark", "loyal", "furry"], "cat": ["pet", "meow", "whiskers", "furry"],
+    "elephant": ["big", "trunk", "Africa", "ivory"], "lion": ["mane", "roar", "Africa", "king"],
+    "tiger": ["stripes", "orange", "jungle", "roar"], "penguin": ["bird", "ice", "waddle", "Antarctica"],
+    "snake": ["hiss", "scales", "venom", "slither"], "bear": ["forest", "honey", "claws", "hibernate"],
+    "rabbit": ["carrots", "hop", "ears", "fluffy"], "shark": ["teeth", "ocean", "fin", "predator"],
+    "eagle": ["bird", "talons", "soar", "America"], "dolphin": ["ocean", "smart", "flipper", "clicks"],
+    "horse": ["gallop", "saddle", "mane", "stable"], "monkey": ["banana", "swing", "tail", "jungle"],
+    "frog": ["croak", "pond", "green", "jump"], "owl": ["night", "hoot", "wise", "feathers"],
+    # Food (16)
+    "pizza": ["cheese", "Italy", "pepperoni", "slice"], "banana": ["yellow", "peel", "monkey", "potassium"],
+    "chocolate": ["sweet", "cocoa", "brown", "bar"], "bread": ["wheat", "oven", "loaf", "toast"],
+    "apple": ["red", "fruit", "orchard", "crunchy"], "cheese": ["milk", "dairy", "cheddar", "melt"],
+    "ice cream": ["cold", "sweet", "cone", "scoop"], "spaghetti": ["pasta", "Italy", "sauce", "noodles"],
+    "hamburger": ["bun", "beef", "fast-food", "grill"], "popcorn": ["movie", "kernel", "butter", "salty"],
+    "sushi": ["rice", "Japan", "fish", "seaweed"], "cake": ["birthday", "sweet", "frosting", "candles"],
+    "coffee": ["bean", "caffeine", "morning", "hot"], "egg": ["breakfast", "scramble", "shell", "omelette"],
+    "strawberry": ["red", "berry", "sweet", "seeds"], "potato": ["fries", "mash", "vegetable", "spud"],
+    # Places (16)
+    "beach": ["sand", "ocean", "sun", "towel"], "school": ["teacher", "books", "students", "classroom"],
+    "library": ["books", "quiet", "reading", "shelves"], "hospital": ["doctor", "nurse", "patients", "medicine"],
+    "airport": ["planes", "travel", "runway", "luggage"], "park": ["trees", "bench", "playground", "grass"],
+    "museum": ["art", "history", "exhibits", "tour"], "cinema": ["movie", "popcorn", "screen", "seats"],
+    "mountain": ["peak", "climb", "snow", "hiking"], "desert": ["sand", "hot", "cactus", "dry"],
+    "island": ["ocean", "palm", "isolated", "tropical"], "castle": ["king", "stone", "tower", "moat"],
+    "farm": ["barn", "animals", "crops", "tractor"], "zoo": ["animals", "cages", "visitors", "exhibits"],
+    "gym": ["weights", "exercise", "fitness", "treadmill"], "forest": ["trees", "wild", "green", "trail"],
+    # Objects (16)
+    "phone": ["call", "screen", "apps", "battery"], "bicycle": ["wheels", "pedal", "helmet", "ride"],
+    "guitar": ["strings", "music", "rock", "frets"], "book": ["pages", "read", "story", "author"],
+    "clock": ["time", "hands", "tick", "alarm"], "umbrella": ["rain", "wet", "cover", "handle"],
+    "candle": ["wax", "flame", "light", "birthday"], "mirror": ["reflection", "glass", "look", "shiny"],
+    "chair": ["sit", "legs", "wood", "cushion"], "car": ["wheels", "drive", "engine", "road"],
+    "train": ["rail", "tracks", "station", "fast"], "kite": ["wind", "string", "sky", "fly"],
+    "camera": ["photo", "lens", "flash", "picture"], "key": ["door", "lock", "metal", "unlock"],
+    "scissors": ["cut", "paper", "sharp", "blades"], "pillow": ["sleep", "soft", "bed", "dream"],
+    # Jobs (8)
+    "teacher": ["school", "students", "lesson", "chalk"], "doctor": ["hospital", "patients", "stethoscope", "medicine"],
+    "chef": ["kitchen", "cook", "recipe", "apron"], "pilot": ["plane", "fly", "uniform", "cockpit"],
+    "farmer": ["crops", "animals", "tractor", "fields"], "firefighter": ["hose", "fire", "truck", "rescue"],
+    "singer": ["music", "voice", "stage", "microphone"], "artist": ["paint", "canvas", "brush", "studio"],
+}
+VAGUE_CLUES = ["thing", "big", "useful", "common", "nice", "interesting",
+               "everyday", "special"]
+
+# Memory game (v2): per-digit recall error chance for bots — longer
+# numbers are harder because every digit must be right.
+# P(correct) = (1 - p) ** digits: Easy ~60% at 4 digits, Medium ~80%,
+# Hard ~95%, all falling as the number gets longer.
+BOT_MEMORY_ERROR = {"Easy": 0.12, "Medium": 0.06, "Hard": 0.02}
+
+# Elimination mode (v2): challenges are picked at random from the
+# quick games that produce a clear per-challenge ranking. Secret Word,
+# President and UNO are NOT in the pool: they don't produce a
+# last-place ranking per challenge and take too long for a challenge
+# round. Challenges are kept short (3 rounds / 3 questions).
+ELIM_POOL = ["reaction", "math", "trivia", "memory"]
+ELIM_CHALLENGE = {
+    "reaction": {"rounds": 3},
+    "math": {"questions": 3, "time_per_question": 10},
+    "trivia": {"questions": 3, "time_per_question": 10},
+    "memory": {"memorize_seconds": 3, "recall_seconds": 8},
 }
 
 # ---------------------------------------------------------------------------
@@ -581,22 +673,212 @@ def pick_trivia_questions(category: str, difficulty: str, count: int):
 
 
 # ---------------------------------------------------------------------------
+# President — deck helpers (v2)
+# ---------------------------------------------------------------------------
+
+PRES_SUITS = ["♣", "♦", "♥", "♠"]
+PRES_RANKS = ["3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A", "2"]
+PRES_RANK_VALUE = {r: i + 3 for i, r in enumerate(PRES_RANKS)}  # 3 -> 3, ..., 2 -> 15
+
+
+def pres_rank(card: str) -> int:
+    """Rank value of a President card like '10♦' or 'J♥' (3 low .. 2 high)."""
+    return PRES_RANK_VALUE[card[:-1]]
+
+
+def pres_rank_label(card: str) -> str:
+    return card[:-1]
+
+
+def build_president_deck():
+    deck = [r + s for r in PRES_RANKS for s in PRES_SUITS]
+    random.shuffle(deck)
+    return deck
+
+
+def president_legal_play(hand, cards, trick):
+    """Is `cards` (a list of card strings) a legal President play?
+
+    `trick` is None when leading a new trick, else {"size": n, "rank": v}.
+    Legal = every card is in the hand, all the same rank, and either
+    leading (any set of 1-4) or matching the trick size with a higher rank.
+    """
+    if not cards or len(cards) > 4:
+        return False
+    if any(c not in hand for c in cards):
+        return False
+    if len({pres_rank(c) for c in cards}) != 1:
+        return False  # a set must be all the same rank
+    if trick is None:
+        return True
+    return (len(cards) == trick["size"]
+            and pres_rank(cards[0]) > trick["rank"])
+
+
+def president_lowest_legal(hand, trick):
+    """The bot's strategy: the lowest set that beats the trick, or the
+    lowest set in hand when leading. Returns a list of cards, or []."""
+    by_rank = {}
+    for c in hand:
+        by_rank.setdefault(pres_rank(c), []).append(c)
+    for rank in sorted(by_rank):
+        group = by_rank[rank]
+        if trick is None:
+            return group[:1]
+        if len(group) >= trick["size"] and rank > trick["rank"]:
+            return group[:trick["size"]]
+    return []
+
+
+def president_scores_for(n: int):
+    """Points by finish order (President first ... Asshole last).
+
+    Linear scale from 1000 down to 0 in equal steps, so with 5 players
+    it is exactly 1000 / 750 / 500 / 250 / 0, and with 4 it is
+    1000 / 667 / 333 / 0.
+    """
+    if n <= 1:
+        return [1000]
+    return [round(1000 * (n - 1 - i) / (n - 1)) for i in range(n)]
+
+
+# ---------------------------------------------------------------------------
+# UNO — deck helpers (v2)
+# ---------------------------------------------------------------------------
+
+UNO_COLOURS = ["R", "G", "B", "Y"]
+UNO_COLOUR_NAMES = {"R": "Red", "G": "Green", "B": "Blue", "Y": "Yellow"}
+
+
+def build_uno_deck():
+    """A standard 108-card UNO deck. Cards are strings like 'R5',
+    'Gskip', 'Bdraw2', 'Wwild', 'Wdraw4'."""
+    deck = []
+    for colour in UNO_COLOURS:
+        deck.append(colour + "0")
+        for n in range(1, 10):
+            deck.extend([colour + str(n)] * 2)
+        for action in ("skip", "reverse", "draw2"):
+            deck.extend([colour + action] * 2)
+    deck.extend(["Wwild"] * 4)
+    deck.extend(["Wdraw4"] * 4)
+    random.shuffle(deck)
+    return deck
+
+
+def uno_value(card: str) -> str:
+    """The matchable value of an UNO card: '0'-'9', 'skip', 'reverse',
+    'draw2', 'wild', 'draw4'."""
+    if card.startswith("W"):
+        return card[1:]
+    return card[1:]
+
+
+def uno_colour(card: str) -> str | None:
+    return None if card.startswith("W") else card[0]
+
+
+def uno_match(card: str, top: str, current_colour: str) -> bool:
+    """Can `card` be played on `top`? Wilds are always playable; a card
+    matches by colour (the colour in play, which a Wild may have set)
+    or by value."""
+    if card.startswith("W"):
+        return True
+    if uno_colour(card) == current_colour:
+        return True
+    return uno_value(card) == uno_value(top)
+
+
+def uno_bot_choice(hand, top, current_colour):
+    """The bot's UNO strategy: play a matching card if it has one,
+    preferring number cards and saving Wilds for last. Returns the
+    card string, or None to draw."""
+    matching = [c for c in hand if uno_match(c, top, current_colour)]
+    if not matching:
+        return None
+    numbers = [c for c in matching if uno_value(c).isdigit()]
+    actions = [c for c in matching if not uno_value(c).isdigit()
+               and not c.startswith("W")]
+    wilds = [c for c in matching if c.startswith("W")]
+    for pool in (numbers, actions, wilds):
+        if pool:
+            return pool[0]
+    return None
+
+
+def uno_best_colour(hand):
+    """The colour a bot picks after playing a Wild: its most common
+    colour in hand (random if it has none)."""
+    counts = {}
+    for c in hand:
+        col = uno_colour(c)
+        if col:
+            counts[col] = counts.get(col, 0) + 1
+    if not counts:
+        return random.choice(UNO_COLOURS)
+    return max(counts, key=lambda k: counts[k])
+
+
+def secret_tally(votes, impostor_ids):
+    """Pure helper for Secret Word voting. `votes` maps voter_id ->
+    suspect_id. Returns (eliminated_id or None, word_team_won).
+
+    Most votes wins; a tie means nobody is eliminated and the
+    impostors win. Catching any impostor means the word team wins.
+    """
+    if not votes:
+        return None, False
+    counts = {}
+    for suspect in votes.values():
+        counts[suspect] = counts.get(suspect, 0) + 1
+    top = max(counts.values())
+    leaders = [pid for pid, n in counts.items() if n == top]
+    if len(leaders) != 1:
+        return None, False  # tie: no elimination, impostors win
+    eliminated = leaders[0]
+    return eliminated, eliminated in impostor_ids
+
+
+def memory_bot_correct(difficulty: str, digits: int) -> bool:
+    """Does a bot of this difficulty recall a `digits`-digit number?
+    Per-digit error chance, so longer numbers are harder."""
+    p = BOT_MEMORY_ERROR.get(difficulty or "Medium", 0.06)
+    return all(random.random() >= p for _ in range(digits))
+
+
+# ---------------------------------------------------------------------------
 # Game handlers — one coroutine per game. Add new games here in later phases.
 # ---------------------------------------------------------------------------
 
-async def run_reaction_game(room: Room):
-    """Reaction Test. Server controls the wait/go timing for everyone."""
+async def run_reaction_game(room: Room, participants=None, challenge=False):
+    """Reaction Test. Server controls the wait/go timing for everyone.
+
+    v2: `participants` limits the game to a subset of players (used by
+    Elimination challenges); `challenge=True` skips the NEXT vote
+    between rounds (challenges auto-advance) and, instead of
+    broadcasting the final results, returns the ranking (best average
+    first) so the caller can use it. In a normal game the behaviour
+    is unchanged, except rounds now end with the same NEXT vote break
+    as Math/Trivia (v2): after each round except the last, humans vote
+    NEXT, advancing at half of connected humans or the 60s timeout,
+    with the host's Skip override. Bots do not vote.
+    """
     settings = room.game_settings["reaction"]
     total = int(settings.get("rounds", 5))
-    room.round_state = {"round": 0, "go_at": None, "clicks": {}}
+    if challenge:
+        total = int(ELIM_CHALLENGE["reaction"].get("rounds", 3))
+    active = participants if participants is not None else list(room.players)
+    room.round_state = {"round": 0, "go_at": None, "clicks": {},
+                        "participants": {p.id for p in active}}
     try:
         for rnd in range(1, total + 1):
-            room.round_state = {"round": rnd, "go_at": None, "clicks": {}}
+            room.round_state = {"round": rnd, "go_at": None, "clicks": {},
+                                "participants": {p.id for p in active}}
             await broadcast(room, {"type": "reaction_wait",
                                    "round": rnd, "total": total})
             # Decide each bot's plan for this round up front.
             bot_plans = {}
-            for p in room.players:
+            for p in active:
                 if p.is_bot:
                     cfg = BOT_REACTION[p.difficulty or "Medium"]
                     false = random.random() < cfg["false_start"]
@@ -610,13 +892,13 @@ async def run_reaction_game(room: Room):
                 await asyncio.sleep(when)
                 if room.phase == "playing" and room.round_state.get("round") == rnd:
                     record_reaction(room, bot, None, false_start=True)
-            for p in room.players:
+            for p in active:
                 if p.is_bot and bot_plans[p.id]["false"]:
                     asyncio.create_task(bot_false_start(
                         p, delay * random.uniform(0.3, 0.9)))
             await asyncio.sleep(delay)
             if room.phase != "playing":
-                return
+                return None
             room.round_state["go_at"] = time.monotonic()
             await broadcast(room, {"type": "reaction_go",
                                    "round": rnd, "total": total})
@@ -625,7 +907,7 @@ async def run_reaction_game(room: Room):
                 await asyncio.sleep(ms / 1000.0)
                 if room.phase == "playing" and room.round_state.get("round") == rnd:
                     record_reaction(room, bot, ms)
-            for p in room.players:
+            for p in active:
                 if p.is_bot and not bot_plans[p.id]["false"]:
                     asyncio.create_task(bot_click(p, bot_plans[p.id]["ms"]))
             # Wait until everyone has clicked or 5s pass.
@@ -637,16 +919,16 @@ async def run_reaction_game(room: Room):
             deadline = time.monotonic() + 5.0
             while time.monotonic() < deadline:
                 clicked = {pid for pid in room.round_state["clicks"]}
-                if any(not p.connected for p in room.players):
+                if any(not p.connected for p in active):
                     await asyncio.sleep(0.1)
                     continue
-                remaining = [p for p in room.players
+                remaining = [p for p in active
                              if p.id not in clicked and p.connected]
                 if not remaining:
                     break
                 await asyncio.sleep(0.1)
             results = []
-            for p in room.players:
+            for p in active:
                 c = room.round_state["clicks"].get(p.id)
                 results.append({"player_id": p.id, "nickname": p.nickname,
                                 "colour": p.colour, "is_bot": p.is_bot,
@@ -655,20 +937,45 @@ async def run_reaction_game(room: Room):
             await broadcast(room, {"type": "reaction_round_result",
                                    "round": rnd, "total": total,
                                    "results": results})
-            await asyncio.sleep(1.5)
+            if rnd < total:
+                if challenge:
+                    await asyncio.sleep(1.2)
+                else:
+                    # v2: NEXT vote break between rounds (not after last).
+                    await _vote_phase(room, "reaction", rnd, total)
+        if challenge:
+            return reaction_rankings(active)
         room.phase = "results"
         await broadcast(room, {"type": "results", "game": "reaction",
                                "mode": room.mode,
                                "teams": team_standings(room),
                                "rankings": rankings(room, by_avg=True)})
         await broadcast_lobby(room)
+        return None
     except asyncio.CancelledError:
-        pass
+        return None
+
+
+def reaction_rankings(players):
+    """Rank players by average reaction time (fastest first). Players
+    with no successful round go last. Returns [{player_id, avg_ms}]."""
+    rows = []
+    for p in players:
+        avg = (round(sum(p.reaction_times) / len(p.reaction_times))
+               if p.reaction_times else None)
+        rows.append({"player_id": p.id, "nickname": p.nickname,
+                     "colour": p.colour, "is_bot": p.is_bot,
+                     "avg_ms": avg})
+    rows.sort(key=lambda r: (r["avg_ms"] is None, r["avg_ms"] or 0))
+    return rows
 
 
 def record_reaction(room: Room, player: Player, ms, false_start=False):
     """Record one player's click for the current reaction round."""
     clicks = room.round_state.setdefault("clicks", {})
+    parts = room.round_state.get("participants")
+    if parts is not None and player.id not in parts:
+        return  # eliminated/spectating in an Elimination challenge
     if player.id in clicks:
         return  # only the first click per round counts
     clicks[player.id] = {"ms": ms, "false_start": false_start}
@@ -716,11 +1023,28 @@ async def _vote_phase(room: Room, game: str, idx: int, total: int):
     room.round_state.pop("host_skip", None)
 
 
-async def run_quiz_game(room: Room, game: str):
-    """Shared loop for Speed Math and Speed Trivia."""
+async def run_quiz_game(room: Room, game: str, participants=None,
+                      challenge=False):
+    """Shared loop for Speed Math and Speed Trivia.
+
+    v2: `participants` limits the game to a subset of players and
+    `challenge=True` runs it as an Elimination challenge — shorter
+    (3 questions), no NEXT vote between questions, and instead of
+    broadcasting the final results it returns the ranking (highest
+    score first; ties broken by total time spent on correct answers,
+    fastest first) so the caller can use it.
+    """
     settings = room.game_settings[game]
-    total = int(settings.get("questions", 10))
-    time_limit = int(settings.get("time_per_question", 15))
+    if challenge:
+        total = int(ELIM_CHALLENGE[game].get("questions", 3))
+        time_limit = int(ELIM_CHALLENGE[game].get(
+            "time_per_question", settings.get("time_per_question", 15)))
+    else:
+        total = int(settings.get("questions", 10))
+        time_limit = int(settings.get("time_per_question", 15))
+    active = participants if participants is not None else list(room.players)
+    # Total time spent on correct answers, for tie-breaking in challenges.
+    correct_time = {p.id: 0 for p in active}
     # Build the question list.
     questions = []
     if game == "math":
@@ -738,6 +1062,7 @@ async def run_quiz_game(room: Room, game: str):
             room.round_state = {"index": idx, "answers": {},
                                 "start": time.monotonic(),
                                 "correct": q["answer"],
+                                "participants": {p.id for p in active},
                                 "question": {"text": q["text"],
                                              "options": q["options"],
                                              "time_limit": time_limit}}
@@ -752,6 +1077,8 @@ async def run_quiz_game(room: Room, game: str):
                     return
                 st = room.round_state
                 if st.get("index") != idx or bot.id in st["answers"]:
+                    return
+                if st.get("participants") and bot.id not in st["participants"]:
                     return
                 if game == "math":
                     if correct:
@@ -768,7 +1095,7 @@ async def run_quiz_game(room: Room, game: str):
                         ans = random.choice([i for i in range(4)
                                              if i != q["answer"]])
                     record_answer(room, bot, ans)
-            for p in room.players:
+            for p in active:
                 if p.is_bot:
                     cfg = BOT_QUIZ[p.difficulty or "Medium"]
                     delay = random.uniform(*cfg["delay"])
@@ -784,11 +1111,11 @@ async def run_quiz_game(room: Room, game: str):
             # alone made "everyone answered" true immediately.
             deadline = time.monotonic() + time_limit
             while time.monotonic() < deadline:
-                if any(not pl.connected for pl in room.players):
+                if any(not pl.connected for pl in active):
                     await asyncio.sleep(0.1)
                     continue
                 answered = set(room.round_state["answers"])
-                remaining = [pl for pl in room.players
+                remaining = [pl for pl in active
                              if pl.id not in answered and pl.connected]
                 if not remaining:
                     break
@@ -799,6 +1126,7 @@ async def run_quiz_game(room: Room, game: str):
             for pid, a in room.round_state["answers"].items():
                 if a["points"]:
                     points.append({"player_id": pid, "points": a["points"]})
+                    correct_time[pid] = correct_time.get(pid, 0) + a["elapsed_ms"]
             await broadcast(room, {"type": "question_result",
                                    "index": idx, "total": total,
                                    "correct_answer": correct,
@@ -809,22 +1137,33 @@ async def run_quiz_game(room: Room, game: str):
                                                "is_bot": pl.is_bot,
                                                "score": pl.score,
                                                "team": room.teams.get(pl.id)}
-                                              for pl in room.players],
+                                              for pl in active],
                                    "mode": room.mode,
                                    "teams": team_standings(room)})
             if idx < total:
-                # v1.1 NEXT QUESTION vote break (not after the last question).
-                await _vote_phase(room, game, idx, total)
+                if challenge:
+                    await asyncio.sleep(1.2)
+                else:
+                    # v1.1 NEXT QUESTION vote break (not after the last question).
+                    await _vote_phase(room, game, idx, total)
             else:
                 await asyncio.sleep(1.2)
+        if challenge:
+            rows = [{"player_id": p.id, "nickname": p.nickname,
+                     "colour": p.colour, "is_bot": p.is_bot,
+                     "score": p.score,
+                     "time_ms": correct_time.get(p.id, 0)} for p in active]
+            rows.sort(key=lambda r: (-r["score"], r["time_ms"]))
+            return rows
         room.phase = "results"
         await broadcast(room, {"type": "results", "game": game,
                                "mode": room.mode,
                                "teams": team_standings(room),
                                "rankings": rankings(room)})
         await broadcast_lobby(room)
+        return None
     except asyncio.CancelledError:
-        pass
+        return None
 
 
 def record_answer(room: Room, player: Player, answer, index=None):
@@ -840,6 +1179,9 @@ def record_answer(room: Room, player: Player, answer, index=None):
     st = room.round_state
     if not st or room.phase != "playing":
         return
+    parts = st.get("participants")
+    if parts is not None and player.id not in parts:
+        return  # eliminated/spectating in an Elimination challenge
     if index is not None and st.get("index") != index:
         return  # stale answer for an earlier question
     if player.id in st.get("answers", {}):
@@ -878,6 +1220,858 @@ def record_answer(room: Room, player: Player, answer, index=None):
                                 "elapsed_ms": round(elapsed * 1000)}
 
 
+def record_memory_answer(room: Room, player: Player, answer):
+    """Record one Memory recall answer (first answer only, participants
+    only). Stores the answer and how long the player took."""
+    st = room.round_state
+    if not st or room.phase != "playing":
+        return
+    parts = st.get("participants")
+    if parts is not None and player.id not in parts:
+        return
+    if player.id in st.get("answers", {}):
+        return
+    start = st.get("start") or time.monotonic()
+    st.setdefault("answers", {})[player.id] = {
+        "answer": str(answer).strip(),
+        "elapsed_ms": round((time.monotonic() - start) * 1000)}
+
+
+def _wrong_number(number: str) -> str:
+    """A wrong version of a number: change one digit to a different one."""
+    i = random.randrange(len(number))
+    digit = random.choice([d for d in "0123456789" if d != number[i]])
+    return number[:i] + digit + number[i + 1:]
+
+
+async def _bot_memory_answer(room: Room, bot: Player, recall_seconds: float):
+    """A bot's Memory recall: it answers after a short delay with the
+    number it (may or may not have) remembered."""
+    await asyncio.sleep(random.uniform(0.5, min(3.0, recall_seconds - 0.5)))
+    if room.phase != "playing":
+        return
+    st = room.round_state
+    if bot.id in st.get("answers", {}):
+        return
+    ans = st.get("bot_answers", {}).get(bot.id)
+    if ans is None:
+        return
+    record_memory_answer(room, bot, ans)
+
+
+async def run_memory_game(room: Room, participants=None, challenge=False,
+                          challenge_settings=None):
+    """Memory game (v2, Matthew's design).
+
+    Each surviving player gets a UNIQUE number to memorize (4 digits
+    first, then 5, 6, 7, ...). Wrong answer or timeout = eliminated.
+    Right answer = survive to the next round with one more digit.
+    Rounds continue until ONE player remains. TIE RULE: if every
+    remaining player is eliminated in the same round, those tied
+    players redo the SAME digit-length round with NEW numbers, until
+    one of them gets it right.
+    Scoring: winner 1000; eliminated players 100 per round survived
+    (eliminated in round 3 = 200).
+    As a challenge (Elimination) it returns (ranking_ids, elim_order)
+    — the full ranking, best first — instead of broadcasting results;
+    challenges are also capped at 5 rounds (digits 4-8), after which
+    survivors are ranked by total recall time, slowest last.
+    """
+    settings = room.game_settings["memory"]
+    if challenge and challenge_settings:
+        memorize = int(challenge_settings.get(
+            "memorize_seconds", settings.get("memorize_seconds", 10)))
+        recall = int(challenge_settings.get(
+            "recall_seconds", settings.get("recall_seconds", 15)))
+    else:
+        memorize = int(settings.get("memorize_seconds", 10))
+        recall = int(settings.get("recall_seconds", 15))
+    alive = list(participants if participants is not None
+                 else room.players)
+    digits = 4
+    elim_order = []
+    survived = {p.id: 0 for p in alive}
+    # Total time spent on correct recalls, for ranking survivors if a
+    # challenge hits the round cap (below).
+    recall_time = {p.id: 0 for p in alive}
+    # As an Elimination challenge, Memory is capped at 5 rounds (digits
+    # 4-8): two perfect memorizers would otherwise play forever, since
+    # the digits just keep growing. A normal Memory game has no cap.
+    max_rounds = 5 if challenge else None
+    rounds_played = 0
+    try:
+        while len(alive) > 1 and (max_rounds is None
+                                  or rounds_played < max_rounds):
+            rounds_played += 1
+            rnd = digits - 3
+            # Unique numbers, one per surviving player.
+            numbers = {}
+            used = set()
+            for p in alive:
+                while True:
+                    num = str(random.randint(1, 9)) + "".join(
+                        str(random.randint(0, 9)) for _ in range(digits - 1))
+                    if num not in used:
+                        used.add(num)
+                        numbers[p.id] = num
+                        break
+            room.round_state = {"participants": {p.id for p in alive},
+                                "digits": digits, "round": rnd,
+                                "numbers": numbers, "answers": {},
+                                "bot_answers": {}, "start": None,
+                                "phase": "memorize"}
+            for p in alive:
+                if p.is_bot:
+                    ok = memory_bot_correct(p.difficulty, digits)
+                    room.round_state["bot_answers"][p.id] = (
+                        numbers[p.id] if ok else _wrong_number(numbers[p.id]))
+                else:
+                    await send(p, {"type": "memory_show", "digits": digits,
+                                   "number": numbers[p.id],
+                                   "seconds": memorize, "round": rnd})
+            await broadcast(room, {"type": "memory_round_start",
+                                   "digits": digits, "round": rnd,
+                                   "seconds": memorize,
+                                   "alive": [p.id for p in alive]})
+            await asyncio.sleep(memorize)
+            if room.phase != "playing":
+                return (None, None) if challenge else None
+            room.round_state["phase"] = "recall"
+            room.round_state["start"] = time.monotonic()
+            await broadcast(room, {"type": "memory_recall", "digits": digits,
+                                   "round": rnd, "time_limit": recall})
+            for p in alive:
+                if p.is_bot:
+                    asyncio.create_task(_bot_memory_answer(room, p, recall))
+            deadline = time.monotonic() + recall
+            while time.monotonic() < deadline:
+                if any(not pl.connected for pl in alive):
+                    await asyncio.sleep(0.1)
+                    continue
+                answered = set(room.round_state["answers"])
+                if all(pl.id in answered for pl in alive if pl.connected):
+                    break
+                await asyncio.sleep(0.1)
+            newly = []
+            for p in alive:
+                a = room.round_state["answers"].get(p.id)
+                if a and a["answer"] == numbers[p.id]:
+                    survived[p.id] += 1
+                    recall_time[p.id] += a["elapsed_ms"]
+                else:
+                    newly.append((p, a["elapsed_ms"] if a else recall * 1000))
+            if newly:
+                # Fastest wrong answer was eliminated first (this order
+                # is what an Elimination challenge uses for last place).
+                newly.sort(key=lambda t: t[1])
+                for p, _ in newly:
+                    elim_order.append(p.id)
+                    p.score = 100 * survived[p.id]
+                eliminated_ids = {p.id for p, _ in newly}
+                alive = [p for p in alive if p.id not in eliminated_ids]
+            await broadcast(room, {"type": "memory_round_result",
+                                   "round": rnd, "digits": digits,
+                                   "survivors": [p.id for p in alive],
+                                   "eliminated": [p.id for p, _ in newly],
+                                   "numbers": numbers})
+            if len(alive) == 0:
+                # TIE: everyone out in the same round — the tied players
+                # redo the SAME digit-length round with new numbers. They
+                # are not actually eliminated, so undo their elim_order
+                # entries (a player must appear exactly once in the
+                # ranking / finishing order).
+                alive = [p for p, _ in newly]
+                for p, _ in newly:
+                    if p.id in elim_order:
+                        elim_order.remove(p.id)
+                await asyncio.sleep(1.5)
+                continue
+            if len(alive) == 1:
+                break
+            digits += 1
+            await asyncio.sleep(1.5)
+        # Ranking, best first: survivors (fastest total recall first),
+        # then the eliminated in reverse elimination order (the most
+        # recently eliminated did best of the eliminated). The last
+        # entry is the challenge's last place: the first player
+        # eliminated, or — if the round cap was hit with nobody left
+        # to eliminate — the slowest survivor.
+        if len(alive) == 1:
+            winner = alive[0]
+            ranking_ids = [winner.id] + list(reversed(elim_order))
+        else:
+            by_time = sorted(alive, key=lambda p: recall_time.get(p.id, 0))
+            ranking_ids = [p.id for p in by_time] + list(reversed(elim_order))
+            winner = by_time[0]
+        winner.score = 1000
+        if challenge:
+            return ranking_ids, elim_order
+        room.phase = "results"
+        await broadcast(room, {"type": "results", "game": "memory",
+                               "mode": room.mode,
+                               "teams": team_standings(room),
+                               "rankings": rankings(room)})
+        await broadcast_lobby(room)
+        return None
+    except asyncio.CancelledError:
+        return (None, None) if challenge else None
+
+
+async def run_secret_game(room: Room):
+    """Secret Word / Impostor (v2).
+
+    1 impostor with 4-5 players, 2 with 6-8. Non-impostors privately
+    see the same secret word; impostors see only that they are the
+    impostor. One clue round (each player gives one word), then a
+    vote: most votes is revealed — if they are an impostor the word
+    team wins (+1000 each), otherwise the impostors win (+1500 each).
+    A tie in votes means nobody is eliminated and the impostors win.
+    """
+    players = list(room.players)
+    n_impostors = 1 if len(players) <= 5 else 2
+    word = random.choice(list(SECRET_WORDS))
+    impostors = set(random.sample([p.id for p in players], n_impostors))
+    room.round_state = {"participants": {p.id for p in players},
+                        "secret": {}, "impostors": impostors, "word": word,
+                        "clues": {}, "votes": {}}
+    for p in players:
+        is_imp = p.id in impostors
+        room.round_state["secret"][p.id] = None if is_imp else word
+        if not p.is_bot:
+            await send(p, {"type": "secret_word", "word": None if is_imp else word,
+                           "is_impostor": is_imp,
+                           "impostor_count": n_impostors})
+    # --- Clue round: one word per player, in join order. ---
+    used_clues = set()
+    for p in players:
+        if p.is_bot:
+            await asyncio.sleep(random.uniform(0.5, 1.5))
+            if p.id in impostors:
+                clue = random.choice(VAGUE_CLUES)
+            else:
+                pool = [c for c in SECRET_WORDS[word] if c not in used_clues]
+                clue = random.choice(pool or SECRET_WORDS[word])
+            room.round_state["clues"][p.id] = clue
+            used_clues.add(clue)
+        else:
+            room.round_state["waiting_clue"] = p.id
+            room.round_state["clue_event"] = asyncio.Event()
+            await broadcast(room, {"type": "secret_clue_turn",
+                                   "player_id": p.id, "nickname": p.nickname})
+            try:
+                await asyncio.wait_for(
+                    room.round_state["clue_event"].wait(), 30)
+            except asyncio.TimeoutError:
+                room.round_state["clues"][p.id] = "thing"
+                used_clues.add("thing")
+            room.round_state.pop("waiting_clue", None)
+        if room.phase != "playing":
+            return
+        clue = room.round_state["clues"].get(p.id)
+        if clue:
+            await broadcast(room, {"type": "secret_clue_shown",
+                                   "player_id": p.id, "nickname": p.nickname,
+                                   "clue": clue})
+    # --- Vote round: who is the impostor? ---
+    await broadcast(room, {"type": "secret_vote_start",
+                           "players": [{"player_id": p.id, "nickname": p.nickname,
+                                        "colour": p.colour, "is_bot": p.is_bot}
+                                       for p in players]})
+    for p in players:
+        if p.is_bot:
+            await asyncio.sleep(random.uniform(0.5, 2.0))
+            clues = room.round_state["clues"]
+            vague = [pid for pid, c in clues.items()
+                     if c in VAGUE_CLUES and pid != p.id]
+            pool = vague or [q.id for q in players if q.id != p.id]
+            room.round_state["votes"][p.id] = random.choice(pool)
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        humans = [p for p in players if not p.is_bot and p.connected]
+        if all(p.id in room.round_state["votes"] for p in humans):
+            break
+        await asyncio.sleep(0.1)
+    eliminated, word_team_won = secret_tally(room.round_state["votes"],
+                                             impostors)
+    if word_team_won:
+        for p in players:
+            if p.id not in impostors:
+                p.score += 1000
+        winners = [p.id for p in players if p.id not in impostors]
+    else:
+        for p in players:
+            if p.id in impostors:
+                p.score += 1500
+        winners = sorted(impostors)
+    await broadcast(room, {"type": "secret_result", "word": word,
+                           "impostors": sorted(impostors),
+                           "eliminated": eliminated,
+                           "word_team_won": word_team_won,
+                           "winners": winners})
+    room.phase = "results"
+    await broadcast(room, {"type": "results", "game": "secret",
+                           "mode": room.mode,
+                           "teams": team_standings(room),
+                           "rankings": rankings(room)})
+    await broadcast_lobby(room)
+
+
+async def send_president_state(room: Room):
+    """Send every human their President state: their own hand (private)
+    plus the public trick, turn, card counts and finish order."""
+    st = room.round_state
+    hands = st.get("hands", {})
+    for p in room.players:
+        if p.is_bot:
+            continue
+        await send(p, {"type": "president_state",
+                       "turn_id": st.get("turn"),
+                       "trick": st.get("trick"),
+                       "last_played_by": st.get("last_played_by"),
+                       "counts": {pid: len(h) for pid, h in hands.items()},
+                       "finished": st.get("finished", []),
+                       "hand": sorted(hands.get(p.id, []), key=pres_rank),
+                       "can_pass": st.get("trick") is not None})
+
+
+async def run_president_game(room: Room):
+    """President / Ditchdiggers / Asshole (v2).
+
+    Standard 52-card deck, all cards dealt. The player with the 3 of
+    clubs leads. Ranks 3 (low) to 2 (high); suits don't matter except
+    for the lead. On your turn play a set of 1-4 cards of the same
+    rank that beats the current trick (same size, higher rank), or
+    pass. When everyone else passes, the last player to play leads a
+    new trick. First out is President, last is Asshole. Points by
+    finish order on a linear 1000-to-0 scale.
+    """
+    players = list(room.players)
+    deck = build_president_deck()
+    hands = {p.id: [] for p in players}
+    for i, card in enumerate(deck):
+        hands[players[i % len(players)].id].append(card)
+    for h in hands.values():
+        h.sort(key=pres_rank)
+    leader = next(p for p in players if "3♣" in hands[p.id])
+    room.round_state = {"participants": {p.id for p in players},
+                        "hands": hands, "trick": None, "turn": leader.id,
+                        "last_played_by": None, "passed": set(),
+                        "finished": [], "turn_event": asyncio.Event(),
+                        "turn_action": None}
+    turn_seconds = int(room.game_settings["president"].get("turn_seconds", 30))
+    try:
+        while len(room.round_state["finished"]) < len(players):
+            st = room.round_state
+            current = room.get_player(st["turn"])
+            if current is None or current.id in st["finished"]:
+                # Turn holder finished (played their last cards) — move on.
+                st["turn"] = _next_president_turn(room, current.id if current else None)
+                continue
+            await send_president_state(room)
+            st["turn_event"] = asyncio.Event()
+            st["turn_action"] = None
+            if current.is_bot:
+                await asyncio.sleep(random.uniform(1.0, 2.0))
+                play = president_lowest_legal(hands[current.id], st["trick"])
+                if play:
+                    _president_apply_play(room, current, play)
+                else:
+                    _president_apply_pass(room, current)
+            else:
+                try:
+                    await asyncio.wait_for(st["turn_event"].wait(), turn_seconds)
+                except asyncio.TimeoutError:
+                    pass
+                action = st.get("turn_action")
+                if action is None:
+                    # Timeout: lead with the lowest set, or pass.
+                    if st["trick"] is None:
+                        play = president_lowest_legal(hands[current.id], None)
+                        if play:
+                            _president_apply_play(room, current, play)
+                    else:
+                        _president_apply_pass(room, current)
+            if room.phase != "playing":
+                return
+            # One player left holding cards: they are the Asshole, the
+            # game is over — no need for them to take another turn.
+            if len(st["finished"]) >= len(players) - 1:
+                break
+            # Advance the turn.
+            nxt = _next_president_turn(room, current.id)
+            if nxt is None:
+                break
+            st["turn"] = nxt
+        # One player left holding cards: they are the Asshole.
+        st = room.round_state
+        remaining = [p for p in players if p.id not in st["finished"]]
+        for p in remaining:
+            st["finished"].append(p.id)
+        scores = president_scores_for(len(players))
+        for i, pid in enumerate(st["finished"]):
+            pl = room.get_player(pid)
+            if pl:
+                pl.score = scores[i]
+        room.phase = "results"
+        await broadcast(room, {"type": "results", "game": "president",
+                               "mode": room.mode,
+                               "teams": team_standings(room),
+                               "rankings": rankings(room)})
+        await broadcast_lobby(room)
+    except asyncio.CancelledError:
+        pass
+
+
+def _president_apply_play(room: Room, player: Player, cards):
+    """Apply a legal President play: remove the cards, set the trick,
+    clear passes, and record a finish if the hand is now empty."""
+    st = room.round_state
+    for c in cards:
+        st["hands"][player.id].remove(c)
+    st["trick"] = {"size": len(cards), "rank": pres_rank(cards[0]),
+                   "cards": list(cards), "by": player.id}
+    st["last_played_by"] = player.id
+    st["passed"] = set()
+    if not st["hands"][player.id]:
+        st["finished"].append(player.id)
+
+
+def _president_apply_pass(room: Room, player: Player):
+    """Apply a pass. If everyone else has now passed, the last player
+    to play leads a new trick."""
+    st = room.round_state
+    st["passed"].add(player.id)
+    in_game = [p for p in room.players if p.id not in st["finished"]]
+    still_to_act = [p for p in in_game
+                    if p.id not in st["passed"] and p.id != st["last_played_by"]]
+    if not still_to_act and st["last_played_by"]:
+        # Trick is over: the last player to play leads again.
+        st["trick"] = None
+        st["passed"] = set()
+        st["turn"] = st["last_played_by"]
+
+
+def _next_president_turn(room: Room, current_id):
+    """The next player to act. Returns None if the game is over.
+
+    Leading a new trick (trick is None): the last player to play
+    leads — or, if they finished by playing their last cards, the
+    next player after them in join order. Mid-trick: the next player
+    after the current one, skipping finished and passed players.
+    """
+    st = room.round_state
+    players = room.players
+    if len(st["finished"]) >= len(players):
+        return None
+    if st["trick"] is None and st.get("last_played_by"):
+        leader = room.get_player(st["last_played_by"])
+        if leader and leader.id not in st["finished"]:
+            return leader.id
+        if leader:
+            for k in range(1, len(players) + 1):
+                p = players[(players.index(leader) + k) % len(players)]
+                if p.id not in st["finished"]:
+                    return p.id
+            return None
+    idx = 0
+    if current_id:
+        for i, p in enumerate(players):
+            if p.id == current_id:
+                idx = i + 1
+                break
+    for k in range(len(players)):
+        p = players[(idx + k) % len(players)]
+        if p.id in st["finished"] or p.id in st["passed"]:
+            continue
+        return p.id
+    return None
+
+
+async def send_uno_state(room: Room):
+    """Send every human their UNO state: their own hand (private) plus
+    the public top card, current colour, direction and card counts."""
+    st = room.round_state
+    hands = st.get("hands", {})
+    for p in room.players:
+        if p.is_bot:
+            continue
+        await send(p, {"type": "uno_state",
+                       "turn_id": st.get("turn"),
+                       "direction": st.get("direction", 1),
+                       "top": st.get("discard", [None])[-1],
+                       "current_colour": st.get("current_colour"),
+                       "counts": {pid: len(h) for pid, h in hands.items()},
+                       "hand": list(hands.get(p.id, [])),
+                       "drawn": st.get("drawn", {}).get(p.id)})
+
+
+def _uno_draw_cards(room: Room, player: Player, n: int):
+    """Draw n cards for a player, reshuffling the discard pile (keeping
+    the top card) if the draw pile runs out."""
+    st = room.round_state
+    for _ in range(n):
+        if not st["draw"]:
+            top = st["discard"].pop()
+            st["draw"] = st["discard"]
+            st["discard"] = [top]
+            random.shuffle(st["draw"])
+        st["hands"][player.id].append(st["draw"].pop())
+
+
+async def run_uno_game(room: Room):
+    """UNO (v2).
+
+    Standard 108-card deck, 7 cards each. Match by colour, number or
+    symbol; Wilds are playable anytime and the player picks the next
+    colour. Draw 2: next player draws 2 and loses their turn. Skip:
+    next player loses their turn. Reverse: reverses direction (with 2
+    players it acts as a Skip). Wild Draw 4: next player draws 4 and
+    loses their turn. No stacking, no Wild Draw 4 challenge. If the
+    draw pile runs out, the discard pile is reshuffled (keeping the
+    top card). First player to empty their hand wins (+1000); the
+    results list everyone by cards remaining, fewest first.
+    """
+    players = list(room.players)
+    deck = build_uno_deck()
+    hands = {p.id: [deck.pop() for _ in range(7)] for p in players}
+    discard = [deck.pop()]
+    while uno_value(discard[-1]) == "draw4":
+        deck.append(discard.pop())
+        random.shuffle(deck)
+        discard.append(deck.pop())
+    top = discard[-1]
+    current_colour = uno_colour(top)
+    if current_colour is None:  # a Wild on top: pick a colour at random
+        current_colour = random.choice(UNO_COLOURS)
+    direction = 1
+    turn_idx = 0
+    pending_draw = 0
+    skip_next = False
+    # Apply the starting card's effect to the first player.
+    if uno_value(top) == "skip":
+        skip_next = True
+    elif uno_value(top) == "draw2":
+        pending_draw = 2
+    elif uno_value(top) == "reverse":
+        direction = -1
+        if len(players) == 2:
+            skip_next = True
+    room.round_state = {"participants": {p.id for p in players},
+                        "hands": hands, "draw": deck, "discard": discard,
+                        "current_colour": current_colour,
+                        "direction": direction, "turn": players[0].id,
+                        "turn_event": asyncio.Event(), "turn_action": None,
+                        "drawn": {}}
+    turn_seconds = int(room.game_settings["uno"].get("turn_seconds", 30))
+    winner = None
+    try:
+        while winner is None:
+            st = room.round_state
+            current = room.get_player(st["turn"])
+            if current is None:
+                break
+            # Pending draw: this player draws and loses their turn.
+            if pending_draw:
+                _uno_draw_cards(room, current, pending_draw)
+                pending_draw = 0
+                st["turn"] = players[(players.index(current) + st["direction"]) % len(players)].id
+                await send_uno_state(room)
+                await asyncio.sleep(0.8)
+                continue
+            if skip_next:
+                skip_next = False
+                st["turn"] = players[(players.index(current) + st["direction"]) % len(players)].id
+                await send_uno_state(room)
+                await asyncio.sleep(0.8)
+                continue
+            await send_uno_state(room)
+            st["turn_event"] = asyncio.Event()
+            st["turn_action"] = None
+            st["drawn"] = {}
+            if current.is_bot:
+                await asyncio.sleep(random.uniform(1.0, 2.0))
+                card = uno_bot_choice(hands[current.id], st["discard"][-1],
+                                      st["current_colour"])
+                if card:
+                    colour = (uno_best_colour(
+                        [c for c in hands[current.id] if c != card])
+                        if card.startswith("W") else None)
+                    _uno_apply_play(room, current, card, colour)
+                else:
+                    _uno_draw_cards(room, current, 1)
+                    drawn = hands[current.id][-1]
+                    if uno_match(drawn, st["discard"][-1], st["current_colour"]):
+                        colour = (uno_best_colour(hands[current.id][:-1])
+                                  if drawn.startswith("W") else None)
+                        _uno_apply_play(room, current, drawn, colour)
+            else:
+                # Human turn. They may play a card, or draw one. If the
+                # drawn card matches, they may play it immediately or
+                # end their turn — so this waits in a small loop until
+                # the turn is over. A timeout on the first action draws
+                # a card (and plays it if it matches); a timeout while
+                # a drawn card is on offer just ends the turn.
+                offered = False
+                while True:
+                    if st.get("turn_action") is None:
+                        st["turn_event"] = asyncio.Event()
+                        try:
+                            await asyncio.wait_for(
+                                st["turn_event"].wait(), turn_seconds)
+                        except asyncio.TimeoutError:
+                            pass
+                    action = st.get("turn_action")
+                    st["turn_action"] = None
+                    if action is None:
+                        if offered:
+                            break  # timed out on the draw offer: end turn
+                        _uno_draw_cards(room, current, 1)
+                        drawn = hands[current.id][-1]
+                        if uno_match(drawn, st["discard"][-1],
+                                     st["current_colour"]):
+                            _uno_apply_play(room, current, drawn,
+                                            random.choice(UNO_COLOURS)
+                                            if drawn.startswith("W") else None)
+                        break
+                    if action[0] == "play":
+                        break  # the handler already applied the play
+                    if action[0] == "draw":
+                        _uno_draw_cards(room, current, 1)
+                        drawn = hands[current.id][-1]
+                        if uno_match(drawn, st["discard"][-1],
+                                     st["current_colour"]):
+                            # Offer the drawn card: the state shows it,
+                            # and the player may play it or end the turn.
+                            st["drawn"] = {current.id: drawn}
+                            offered = True
+                            await send_uno_state(room)
+                            continue
+                        break
+                    if action[0] == "end_turn":
+                        break
+            if room.phase != "playing":
+                return
+            if not hands[current.id]:
+                winner = current
+                break
+            # Advance to the next player.
+            nxt_idx = (players.index(current) + st["direction"]) % len(players)
+            if st.get("skip_next"):
+                st["skip_next"] = False
+                nxt_idx = (nxt_idx + st["direction"]) % len(players)
+            st["turn"] = players[nxt_idx].id
+            if st.get("pending_draw"):
+                pending_draw = st.pop("pending_draw")
+        for p in players:
+            p.score = 1000 if p is winner else 0
+        rows = []
+        for p in players:
+            rows.append({"player_id": p.id, "nickname": p.nickname,
+                         "colour": p.colour, "is_bot": p.is_bot,
+                         "score": p.score, "avg_ms": None, "best_ms": None,
+                         "false_starts": 0, "team": room.teams.get(p.id),
+                         "cards_left": len(room.round_state["hands"][p.id])})
+        rows.sort(key=lambda r: (-r["score"], r["cards_left"]))
+        room.phase = "results"
+        await broadcast(room, {"type": "results", "game": "uno",
+                               "mode": room.mode,
+                               "teams": team_standings(room),
+                               "rankings": rows})
+        await broadcast_lobby(room)
+    except asyncio.CancelledError:
+        pass
+
+
+def _uno_apply_play(room: Room, player: Player, card: str, colour=None):
+    """Apply an UNO play: remove the card, put it on the discard pile,
+    and set any effect (skip / reverse / draw 2 / draw 4 / wild colour)
+    for the next player."""
+    st = room.round_state
+    st["hands"][player.id].remove(card)
+    st["discard"].append(card)
+    value = uno_value(card)
+    if card.startswith("W"):
+        st["current_colour"] = colour or random.choice(UNO_COLOURS)
+        if value == "draw4":
+            st["pending_draw"] = 4
+    else:
+        st["current_colour"] = uno_colour(card)
+        if value == "skip":
+            st["skip_next"] = True
+        elif value == "reverse":
+            st["direction"] = -st["direction"]
+            if len(room.players) == 2:
+                st["skip_next"] = True
+        elif value == "draw2":
+            st["pending_draw"] = 2
+
+
+async def run_challenge(room: Room, game: str, alive):
+    """Run one Elimination challenge and return its ranking (best
+    first) as a list of {"player_id": ...} rows, or None if cancelled."""
+    if game == "reaction":
+        return await run_reaction_game(room, participants=alive,
+                                       challenge=True)
+    if game in ("math", "trivia"):
+        return await run_quiz_game(room, game, participants=alive,
+                                   challenge=True)
+    if game == "memory":
+        ranking_ids, elim_order = await run_memory_game(
+            room, participants=alive, challenge=True,
+            challenge_settings=ELIM_CHALLENGE["memory"])
+        if not ranking_ids:
+            return None
+        return [{"player_id": pid} for pid in ranking_ids]
+    return None
+
+
+async def elimination_end_vote(room: Room):
+    """Community end vote on the Elimination results screen.
+
+    Humans only (bots don't vote). At least half of connected humans
+    voting Play Again starts a NEW elimination series with the same
+    players; at least half voting Return to Lobby (or a 60s timeout)
+    goes back to the lobby. The host has NO override here — the
+    community decides. Returns True (play again), False (lobby) or
+    None (cancelled).
+    """
+    room.round_state = {"end_votes": {"again": set(), "lobby": set()}}
+    needed = votes_needed_humans(room)
+    await broadcast(room, {"type": "elimination_end_vote",
+                           "votes_again": 0, "votes_lobby": 0,
+                           "votes_needed": needed, "timeout": 60})
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        votes = room.round_state.get("end_votes")
+        if not votes:
+            return None
+        if len(votes["again"]) >= needed:
+            return True
+        if len(votes["lobby"]) >= needed:
+            return False
+        await asyncio.sleep(0.1)
+    return False
+
+
+async def run_elimination_game(room: Room):
+    """Elimination mode (v2): a series of quick challenges.
+
+    Each challenge is one quick game picked at random from the pool
+    (Reaction, Speed Math, Speed Trivia, Memory) among the remaining
+    players; the LAST-PLACE player of that challenge is eliminated.
+    The series runs until exactly 3 players remain, then a FINALE
+    challenge eliminates the bottom 2 and crowns the top player the
+    victor. The results screen lists the full finishing order, then
+    a community vote decides Play Again (new series, same players)
+    or Return to Lobby. Runs in FFA only — team display is hidden
+    for the series and individuals are scored.
+    """
+    all_players = list(room.players)
+    try:
+        while True:  # one loop iteration = one full series
+            alive = list(all_players)
+            elim_order = []
+            challenge_no = 0
+            while len(alive) > 3:
+                challenge_no += 1
+                pool = [g for g in ELIM_POOL
+                        if GAMES[g]["min_players"] <= len(alive)]
+                game = random.choice(pool)
+                for p in alive:
+                    p.score = 0
+                    p.reaction_times = []
+                    p.false_starts = 0
+                room.current_game = game
+                await broadcast(room, {"type": "elimination_challenge",
+                                       "challenge": challenge_no,
+                                       "game": game,
+                                       "game_name": GAMES[game]["name"],
+                                       "remaining": len(alive),
+                                       "alive": [p.nickname for p in alive],
+                                       "finale": False})
+                await broadcast(room, {"type": "game_started", "game": game,
+                                       "settings": room.game_settings[game],
+                                       "mode": "competition",
+                                       "party_mode": "ffa",
+                                       "team_count": room.team_count,
+                                       "teams": {}})
+                ranking = await run_challenge(room, game, alive)
+                if ranking is None or room.phase != "playing":
+                    return
+                last = ranking[-1]
+                elim_order.append(last["player_id"])
+                alive = [p for p in alive if p.id != last["player_id"]]
+                loser = room.get_player(last["player_id"])
+                await broadcast(room, {"type": "elimination_eliminated",
+                                       "player_id": last["player_id"],
+                                       "nickname": loser.nickname if loser else "?",
+                                       "remaining": len(alive)})
+                await asyncio.sleep(2)
+            # --- Finale: 3 remain, one last challenge. ---
+            challenge_no += 1
+            pool = [g for g in ELIM_POOL
+                    if GAMES[g]["min_players"] <= len(alive)]
+            game = random.choice(pool)
+            for p in alive:
+                p.score = 0
+                p.reaction_times = []
+                p.false_starts = 0
+            room.current_game = game
+            await broadcast(room, {"type": "elimination_challenge",
+                                   "challenge": challenge_no,
+                                   "game": game,
+                                   "game_name": GAMES[game]["name"],
+                                   "remaining": len(alive),
+                                   "alive": [p.nickname for p in alive],
+                                   "finale": True})
+            await broadcast(room, {"type": "game_started", "game": game,
+                                   "settings": room.game_settings[game],
+                                   "mode": "competition", "party_mode": "ffa",
+                                   "team_count": room.team_count, "teams": {}})
+            ranking = await run_challenge(room, game, alive)
+            if ranking is None or room.phase != "playing":
+                return
+            finishing = [ranking[0]["player_id"], ranking[1]["player_id"],
+                         ranking[2]["player_id"]] + list(reversed(elim_order))
+            place_scores = {finishing[0]: 1000, finishing[1]: 500,
+                            finishing[2]: 250}
+            for p in all_players:
+                p.score = place_scores.get(p.id, 0)
+            order_rows = []
+            for place, pid in enumerate(finishing, start=1):
+                pl = room.get_player(pid)
+                order_rows.append({"place": place, "player_id": pid,
+                                   "nickname": pl.nickname,
+                                   "colour": pl.colour, "is_bot": pl.is_bot,
+                                   "score": place_scores.get(pid, 0),
+                                   "avg_ms": None, "best_ms": None,
+                                   "false_starts": 0,
+                                   "team": room.teams.get(pid)})
+            room.phase = "results"
+            await broadcast(room, {"type": "results", "game": "elimination",
+                                   "mode": "ffa", "teams": [],
+                                   "rankings": order_rows,
+                                   "finishing_order": order_rows,
+                                   "victor": finishing[0]})
+            await broadcast_lobby(room)
+            again = await elimination_end_vote(room)
+            if again is None:
+                return
+            if again:
+                continue  # new series, same players
+            # Community chose Return to Lobby.
+            room.phase = "lobby"
+            room.current_game = None
+            for p in room.players:
+                p.score = 0
+                p.reaction_times = []
+                p.false_starts = 0
+            await broadcast_lobby(room)
+            return
+    except asyncio.CancelledError:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Room actions (called from the WebSocket handler)
 # ---------------------------------------------------------------------------
@@ -895,13 +2089,16 @@ async def start_game(room: Room, player: Player):
         return
     game = room.game
     if game == "random":
-        game = random.choice(list(GAMES))
+        game = random.choice(RANDOM_GAMES)
     if len(room.players) < min_players_for(room, game):
         await send(player, {"type": "error", "message":
             f"{GAMES[game]['name']} needs at least "
             f"{min_players_for(room, game)} player(s). Add bots or wait for players."})
         return
-    if room.mode == "teams":
+    if room.mode == "teams" and game != "elimination":
+        # v1.2: each team must have at least one player/bot, and the
+        # number of teams cannot exceed the number of players+bots.
+        # Elimination (v2) runs in FFA only, so it skips this check.
         # v1.2: each team must have at least one player/bot, and the
         # number of teams cannot exceed the number of players+bots.
         if room.team_count > len(room.players):
@@ -925,16 +2122,29 @@ async def start_game(room: Room, player: Player):
     room.current_game = game
     room.phase = "playing"
     mode = "solo" if len(room.players) == 1 else "competition"
+    # Elimination runs in FFA only (v2): team display is hidden for
+    # the series and individuals are scored.
+    party_mode = "ffa" if game == "elimination" else room.mode
     await broadcast(room, {"type": "game_started", "game": game,
                            "settings": room.game_settings[game],
-                           "mode": mode, "party_mode": room.mode,
+                           "mode": mode, "party_mode": party_mode,
                            "team_count": room.team_count,
                            "teams": {pid: t for pid, t in room.teams.items()}})
     await broadcast_lobby(room)
     if game == "reaction":
         room.game_task = asyncio.create_task(run_reaction_game(room))
-    else:
+    elif game in ("math", "trivia"):
         room.game_task = asyncio.create_task(run_quiz_game(room, game))
+    elif game == "secret":
+        room.game_task = asyncio.create_task(run_secret_game(room))
+    elif game == "president":
+        room.game_task = asyncio.create_task(run_president_game(room))
+    elif game == "uno":
+        room.game_task = asyncio.create_task(run_uno_game(room))
+    elif game == "memory":
+        room.game_task = asyncio.create_task(run_memory_game(room))
+    elif game == "elimination":
+        room.game_task = asyncio.create_task(run_elimination_game(room))
 
 
 async def handle_message(room: Room, player: Player, msg: dict):
@@ -1054,6 +2264,154 @@ async def handle_message(room: Room, player: Player, msg: dict):
         except (ValueError, TypeError):
             idx = None
         record_answer(room, player, msg.get("answer"), index=idx)
+
+    elif mtype == "secret_clue":
+        # v2 Secret Word: one-word clue, only when it is your turn.
+        if room.phase != "playing" or room.current_game != "secret":
+            return
+        st = room.round_state
+        if st.get("waiting_clue") != player.id:
+            return
+        clue = str(msg.get("clue", "")).strip().split()[0][:20] if str(msg.get("clue", "")).strip() else ""
+        if not clue:
+            return
+        st["clues"][player.id] = clue
+        ev = st.get("clue_event")
+        if ev is not None:
+            ev.set()
+
+    elif mtype == "secret_vote":
+        # v2 Secret Word: vote for who you think the impostor is.
+        if room.phase != "playing" or room.current_game != "secret":
+            return
+        st = room.round_state
+        if "votes" not in st or player.is_bot:
+            return
+        target = msg.get("player_id")
+        if not target or target == player.id or not room.get_player(target):
+            return
+        st["votes"][player.id] = target
+
+    elif mtype == "president_play":
+        # v2 President: play a set of cards on your turn. The handler
+        # applies the play (server-validated) and wakes the game loop.
+        if room.phase != "playing" or room.current_game != "president":
+            return
+        st = room.round_state
+        if st.get("turn") != player.id or st.get("turn_action") is not None:
+            return
+        cards = msg.get("cards")
+        if not isinstance(cards, list) or not cards:
+            return
+        hand = st.get("hands", {}).get(player.id, [])
+        if not president_legal_play(hand, cards, st.get("trick")):
+            await send(player, {"type": "error", "message":
+                "That play isn't legal — same rank, same size as the trick, higher rank."})
+            return
+        _president_apply_play(room, player, list(cards))
+        st["turn_action"] = ("play", list(cards))
+        ev = st.get("turn_event")
+        if ev is not None:
+            ev.set()
+
+    elif mtype == "president_pass":
+        # v2 President: pass on your turn (only when a trick is live).
+        if room.phase != "playing" or room.current_game != "president":
+            return
+        st = room.round_state
+        if st.get("turn") != player.id or st.get("turn_action") is not None:
+            return
+        if st.get("trick") is None:
+            await send(player, {"type": "error",
+                                "message": "You lead the trick — you have to play a card."})
+            return
+        _president_apply_pass(room, player)
+        st["turn_action"] = ("pass",)
+        ev = st.get("turn_event")
+        if ev is not None:
+            ev.set()
+
+    elif mtype == "uno_play":
+        # v2 UNO: play a card on your turn. Wilds need a colour.
+        if room.phase != "playing" or room.current_game != "uno":
+            return
+        st = room.round_state
+        if st.get("turn") != player.id or st.get("turn_action") is not None:
+            return
+        card = msg.get("card")
+        hand = st.get("hands", {}).get(player.id, [])
+        if card not in hand:
+            return
+        if not uno_match(card, st["discard"][-1], st["current_colour"]):
+            await send(player, {"type": "error",
+                                "message": "That card doesn't match the colour or value on top."})
+            return
+        colour = msg.get("colour")
+        if card.startswith("W"):
+            if colour not in UNO_COLOURS:
+                await send(player, {"type": "error",
+                                    "message": "Pick a colour for the Wild card."})
+                return
+        _uno_apply_play(room, player, card, colour)
+        st["turn_action"] = ("play", card)
+        ev = st.get("turn_event")
+        if ev is not None:
+            ev.set()
+
+    elif mtype == "uno_draw":
+        # v2 UNO: draw a card on your turn (the game loop draws it and,
+        # if it matches, offers it back to you to play or keep).
+        if room.phase != "playing" or room.current_game != "uno":
+            return
+        st = room.round_state
+        if st.get("turn") != player.id or st.get("turn_action") is not None:
+            return
+        st["turn_action"] = ("draw",)
+        ev = st.get("turn_event")
+        if ev is not None:
+            ev.set()
+
+    elif mtype == "uno_end_turn":
+        # v2 UNO: keep the drawn card and end your turn.
+        if room.phase != "playing" or room.current_game != "uno":
+            return
+        st = room.round_state
+        if st.get("turn") != player.id or st.get("turn_action") is not None:
+            return
+        if player.id not in st.get("drawn", {}):
+            return
+        st["turn_action"] = ("end_turn",)
+        ev = st.get("turn_event")
+        if ev is not None:
+            ev.set()
+
+    elif mtype == "memory_answer":
+        # v2 Memory: type the number back from memory.
+        if room.phase != "playing" or room.current_game != "memory":
+            return
+        record_memory_answer(room, player, msg.get("answer"))
+
+    elif mtype == "elimination_vote":
+        # v2 Elimination end vote (results screen, humans only): Play
+        # Again starts a new series, Return to Lobby goes back. The
+        # host has no override here — the community decides.
+        if room.phase != "results" or room.current_game != "elimination":
+            return
+        st = room.round_state
+        votes = st.get("end_votes")
+        if votes is None or player.is_bot:
+            return
+        choice = msg.get("choice")
+        if choice not in ("again", "lobby"):
+            return
+        votes["again"].discard(player.id)
+        votes["lobby"].discard(player.id)
+        votes[choice].add(player.id)
+        needed = votes_needed_humans(room)
+        await broadcast(room, {"type": "elimination_end_vote_update",
+                               "votes_again": len(votes["again"]),
+                               "votes_lobby": len(votes["lobby"]),
+                               "votes_needed": needed})
 
     elif mtype == "update_profile":
         # v1.1: every human can change their OWN nickname/colour in the
@@ -1340,6 +2698,35 @@ async def ws_endpoint(ws: WebSocket):
                     await send(player, {"type": "reaction_go",
                                         "round": st.get("round", 1),
                                         "total": int(room.game_settings["reaction"].get("rounds", 5))})
+            elif room.current_game == "secret":
+                # v2: re-send this player's private word/impostor status.
+                secret = st.get("secret", {})
+                impostors = st.get("impostors", set())
+                await send(player, {"type": "secret_word",
+                                    "word": secret.get(player.id),
+                                    "is_impostor": player.id in impostors,
+                                    "impostor_count": len(impostors)})
+            elif room.current_game == "president":
+                # v2: re-send the current President state (own hand).
+                await send_president_state(room)
+            elif room.current_game == "uno":
+                # v2: re-send the current UNO state (own hand).
+                await send_uno_state(room)
+            elif room.current_game == "memory":
+                # v2: if still in the memorize phase, re-send the number
+                # with the time left; in the recall phase, re-send the
+                # recall prompt so the player can still guess.
+                if st.get("phase") == "memorize" and player.id in st.get("numbers", {}):
+                    await send(player, {"type": "memory_show",
+                                        "digits": st.get("digits", 4),
+                                        "number": st["numbers"][player.id],
+                                        "seconds": int(room.game_settings["memory"].get("memorize_seconds", 10)),
+                                        "round": st.get("round", 1)})
+                elif st.get("phase") == "recall":
+                    await send(player, {"type": "memory_recall",
+                                        "digits": st.get("digits", 4),
+                                        "round": st.get("round", 1),
+                                        "time_limit": int(room.game_settings["memory"].get("recall_seconds", 15))})
             elif st.get("question"):
                 remaining = 1
                 if st.get("start") is not None:
