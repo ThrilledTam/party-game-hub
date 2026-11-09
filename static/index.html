@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Party Game Hub</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, sans-serif; margin: 0; background: #1e1e2e; color: #f5f5f5; }
+  .wrap { max-width: 640px; margin: 0 auto; padding: 16px; }
+  h1 { text-align: center; font-size: 1.8rem; margin: 8px 0 4px; }
+  .sub { text-align: center; color: #bbb; margin-bottom: 20px; }
+  .card { background: #2b2b40; border-radius: 12px; padding: 16px; margin-bottom: 14px; }
+  label { display: block; margin: 10px 0 4px; font-weight: 600; }
+  input, select, button { font-size: 1rem; padding: 10px; border-radius: 8px; border: 1px solid #555; width: 100%; }
+  input, select { background: #1e1e2e; color: #fff; }
+  button { background: #3498db; color: #fff; border: none; cursor: pointer; margin-top: 10px; font-weight: 700; }
+  button:disabled { background: #555; cursor: not-allowed; }
+  button.secondary { background: #555; }
+  button.green { background: #27ae60; }
+  button.danger { background: #c0392b; }
+  .row { display: flex; gap: 8px; } .row > * { flex: 1; }
+  .palette { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+  .swatch { width: 36px; height: 36px; border-radius: 50%; border: 3px solid transparent; cursor: pointer; padding: 0; }
+  .swatch.sel { border-color: #fff; }
+  .player { display: flex; align-items: center; gap: 10px; padding: 10px; background: #1e1e2e; border-radius: 8px; margin-bottom: 8px; cursor: default; }
+  .player.bot { cursor: pointer; }
+  .chip { width: 22px; height: 22px; border-radius: 50%; flex-shrink: 0; }
+  .badge { background: #e67e22; color: #fff; font-size: .7rem; font-weight: 800; padding: 2px 6px; border-radius: 6px; }
+  .crown { font-size: 1.1rem; }
+  .code { font-size: 1.6rem; letter-spacing: .2em; font-weight: 800; text-align: center; }
+  #reactionArea { min-height: 220px; border-radius: 12px; display: flex; align-items: center; justify-content: center; text-align: center; font-size: 1.6rem; font-weight: 800; cursor: pointer; user-select: none; padding: 20px; }
+  #reactionArea.wait { background: #c0392b; } #reactionArea.go { background: #27ae60; }
+  .opt { display: block; width: 100%; text-align: left; background: #3d3d5c; margin-top: 8px; }
+  .opt:disabled { opacity: .6; }
+  table { width: 100%; border-collapse: collapse; } td, th { padding: 8px; border-bottom: 1px solid #444; text-align: left; }
+  .err { color: #ff8a80; font-weight: 600; } .ok { color: #7ee2a8; }
+  .hidden { display: none; } .muted { color: #bbb; font-size: .9rem; }
+  .timer { font-size: 1.4rem; font-weight: 800; text-align: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🎉 Party Game Hub</h1>
+  <p class="sub">1–8 players · quick rounds · humans + bots</p>
+
+  <!-- HOME -->
+  <div id="home" class="card">
+    <label>Your nickname</label>
+    <input id="nickname" maxlength="20" placeholder="e.g. Matthew">
+    <label>Your colour</label>
+    <div id="palette" class="palette"></div>
+    <label>Room name (when creating)</label>
+    <input id="roomName" maxlength="40" placeholder="Party Room" value="Party Room">
+    <button id="createBtn" class="green">Create Server</button>
+    <hr>
+    <label>Join a server — paste a link or enter a code</label>
+    <div class="row"><input id="joinCode" maxlength="6" placeholder="e.g. KQ7X2P" style="text-transform:uppercase">
+    <button id="joinBtn">Join Server</button></div>
+    <p id="homeErr" class="err"></p>
+    <p class="muted">No account needed. Share the room code or link with your cousins — they just open it, pick a nickname and colour, and join.</p>
+  </div>
+
+  <!-- LOBBY -->
+  <div id="lobby" class="card hidden">
+    <h2 id="lobbyTitle">Lobby</h2>
+    <p class="code" id="roomCode"></p>
+    <button id="copyLinkBtn" class="secondary">Copy invite link</button>
+    <p id="copyMsg" class="ok"></p>
+    <h3>Players (<span id="playerCount">0</span>/8)</h3>
+    <div id="playerList"></div>
+    <p class="muted" id="botHint">Host: tap a bot in the list to change its nickname, colour or difficulty — or remove it.</p>
+
+    <div id="botEdit" class="card hidden" style="background:#1e1e2e">
+      <h3>Edit bot</h3>
+      <label>Nickname</label><input id="botName" maxlength="20">
+      <label>Colour</label><div id="botPalette" class="palette"></div>
+      <label>Difficulty</label>
+      <select id="botDiff"><option>Easy</option><option>Medium</option><option>Hard</option></select>
+      <button id="botSaveBtn">Save bot</button>
+      <button id="botRemoveBtn" class="danger">Remove bot</button>
+      <button id="botCancelBtn" class="secondary">Cancel</button>
+    </div>
+
+    <div id="settings">
+      <h3>Settings</h3>
+      <div id="hostSettings">
+        <label>Room name</label><input id="setRoomName" maxlength="40">
+        <label>Max players</label>
+        <select id="setMaxPlayers"><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option selected>8</option></select>
+        <label>Game</label>
+        <select id="setGame">
+          <option value="reaction">Reaction Test</option>
+          <option value="math">Speed Math</option>
+          <option value="trivia">Speed Trivia</option>
+          <option value="random">🎲 Random game</option>
+        </select>
+        <div id="setReaction">
+          <label>Rounds</label>
+          <select id="setReactionRounds"><option>3</option><option selected>5</option><option>10</option></select>
+        </div>
+        <div id="setMath" class="hidden">
+          <label>Difficulty</label>
+          <select id="setMathDiff"><option>Easy</option><option selected>Medium</option><option>Hard</option></select>
+          <label>Questions</label>
+          <select id="setMathQ"><option>5</option><option selected>10</option><option>15</option></select>
+          <label>Time per question</label>
+          <select id="setMathTime"><option>10</option><option selected>15</option><option>20</option></select>
+        </div>
+        <div id="setTrivia" class="hidden">
+          <label>Category</label>
+          <select id="setTriviaCat"><option>Mixed</option><option>General</option><option>Science</option><option>Geography</option><option>History</option></select>
+          <label>Difficulty</label>
+          <select id="setTriviaDiff"><option>Easy</option><option selected>Medium</option><option>Hard</option></select>
+          <label>Questions</label>
+          <select id="setTriviaQ"><option>5</option><option selected>10</option><option>15</option></select>
+          <label>Time per question</label>
+          <select id="setTriviaTime"><option>10</option><option selected>15</option><option>20</option></select>
+        </div>
+        <button id="addBotBtn">+ Add BOT</button>
+      </div>
+      <p id="settingsReadOnly" class="muted hidden">Only the host can change settings. Waiting for the host to start…</p>
+      <p id="startHint" class="muted"></p>
+      <button id="startBtn" class="green">Start Game</button>
+      <p id="lobbyErr" class="err"></p>
+    </div>
+  </div>
+
+  <!-- GAME -->
+  <div id="game" class="card hidden">
+    <h2 id="gameTitle"></h2>
+    <p id="gameInfo" class="muted"></p>
+    <div id="reactionBox" class="hidden">
+      <div id="reactionArea" class="wait">Wait…</div>
+      <p class="muted">Click / tap the box as soon as it turns green. Clicking early is a false start — that round counts as a fail.</p>
+      <div id="reactionResults"></div>
+    </div>
+    <div id="quizBox" class="hidden">
+      <p class="timer" id="quizTimer"></p>
+      <h3 id="quizQ"></h3>
+      <div id="quizOpts"></div>
+      <div id="mathBox" class="hidden">
+        <div class="row"><input id="mathAns" inputmode="numeric" placeholder="Your answer"><button id="mathSubmit">Answer</button></div>
+      </div>
+      <p id="quizFeedback"></p>
+      <div id="scoreboard"></div>
+    </div>
+  </div>
+
+  <!-- RESULTS -->
+  <div id="results" class="card hidden">
+    <h2>🏆 Results</h2>
+    <div id="resultsTable"></div>
+    <button id="againBtn" class="green">Play Again (same players)</button>
+    <button id="changeBtn" class="secondary">Back to Lobby / Change Game</button>
+  </div>
+</div>
+
+<script>
+const PALETTE = ["#e74c3c","#e67e22","#f1c40f","#2ecc71","#3498db","#9b59b6","#fd79a8","#1abc9c","#95a5a6","#34495e"];
+const GAME_NAMES = {reaction:"Reaction Test", math:"Speed Math", trivia:"Speed Trivia", random:"Random"};
+let ws=null, myId=null, room=null, myColour=PALETTE[4], editingBot=null, botColour=PALETTE[0];
+let quizTimerInt=null, reactionClicked=false, quizAnswered=false;
+
+function $(id){return document.getElementById(id);}
+function show(id){["home","lobby","game","results"].forEach(s=>$(s).classList.toggle("hidden", s!==id));}
+function buildPalette(el, onPick, selected){
+  el.innerHTML="";
+  PALETTE.forEach(c=>{const b=document.createElement("button");b.className="swatch"+(c===selected?" sel":"");b.style.background=c;b.type="button";
+    b.onclick=()=>{onPick(c);buildPalette(el,onPick,c);};el.appendChild(b);});
+}
+buildPalette($("palette"), c=>myColour=c, myColour);
+buildPalette($("botPalette"), c=>botColour=c, botColour);
+
+function joinLink(code){return location.origin+"/?code="+code;}
+function connect(firstMsg){
+  const proto = location.protocol==="https:"?"wss":"ws";
+  ws = new WebSocket(proto+"://"+location.host+"/ws");
+  ws.onopen = ()=> ws.send(JSON.stringify(firstMsg));
+  ws.onmessage = e=> handle(JSON.parse(e.data));
+  ws.onclose = ()=>{ if(room) $("lobbyErr").textContent="Disconnected from the server. Refresh to rejoin."; };
+}
+function nickname(){return $("nickname").value.trim();}
+function validNick(){ if(!nickname()){$("homeErr").textContent="Pick a nickname first.";return false;} return true; }
+
+$("createBtn").onclick=()=>{ if(!validNick())return; $("homeErr").textContent="";
+  connect({type:"create_room", nickname:nickname(), colour:myColour, room_name:$("roomName").value.trim()||"Party Room"}); };
+$("joinBtn").onclick=()=>{ if(!validNick())return; const code=$("joinCode").value.trim().toUpperCase();
+  if(!code){$("homeErr").textContent="Enter a room code or paste a link.";return;}
+  connect({type:"join_room", code, nickname:nickname(), colour:myColour}); };
+
+// Prefill a code from ?code=XXXXXX in the URL.
+const params=new URLSearchParams(location.search);
+if(params.get("code")) $("joinCode").value=params.get("code").toUpperCase();
+
+function send(m){ if(ws && ws.readyState===1) ws.send(JSON.stringify(m)); }
+function isHost(){ return room && room.players.find(p=>p.id===myId)?.is_host; }
+
+function handle(msg){
+  if(msg.type==="error"){ (room?$("lobbyErr"):$("homeErr")).textContent=msg.message; return; }
+  if(msg.type==="joined"){ myId=msg.player_id; room=msg.room; history.replaceState(null,"",joinLink(room.code)); renderLobby(); show("lobby"); return; }
+  if(msg.type==="lobby"){ room=msg.room; if(room.phase==="lobby") renderLobby(); return; }
+  if(msg.type==="game_started"){ room.current_game=msg.game; $("gameTitle").textContent=GAME_NAMES[msg.game]+(msg.mode==="solo"?" — Solo practice":"");
+    $("gameInfo").textContent = msg.mode==="solo" ? "Just you — have fun, no pressure!" : "Fastest correct answers score the most points.";
+    $("reactionResults").innerHTML=""; $("quizFeedback").textContent=""; $("scoreboard").innerHTML="";
+    $("reactionBox").classList.toggle("hidden", msg.game!=="reaction");
+    $("quizBox").classList.toggle("hidden", msg.game==="reaction");
+    show("game"); return; }
+  if(msg.type==="reaction_wait"){ reactionClicked=false; const a=$("reactionArea"); a.className="wait"; a.textContent="Wait…"; return; }
+  if(msg.type==="reaction_go"){ const a=$("reactionArea"); a.className="go"; a.textContent="CLICK NOW!"; return; }
+  if(msg.type==="reaction_round_result"){
+    const me=msg.results.find(r=>r.player_id===myId);
+    $("reactionResults").innerHTML = "<h3>Round "+msg.round+"/"+msg.total+"</h3><table>"+
+      msg.results.map(r=>"<tr><td><span class='chip' style='display:inline-block;background:"+r.colour+"'></span> "+r.nickname+(r.is_bot?" 🤖":"")+"</td><td>"+
+        (r.false_start?"Too soon! ❌":(r.ms==null?"—":r.ms+" ms"))+"</td></tr>").join("")+"</table>";
+    if(me && me.false_start) $("reactionArea").textContent="Too soon! That round doesn't count.";
+    return; }
+  if(msg.type==="question"){ quizAnswered=false; $("quizFeedback").textContent="";
+    $("quizQ").textContent="Q"+msg.index+"/"+msg.total+": "+msg.text;
+    $("quizOpts").innerHTML=""; $("mathBox").classList.add("hidden");
+    if(msg.options){ msg.options.forEach((o,i)=>{const b=document.createElement("button");b.className="opt";b.textContent=o;
+      b.onclick=()=>{ if(quizAnswered)return; quizAnswered=true; send({type:"answer",answer:i}); [...$("quizOpts").children].forEach(x=>x.disabled=true); $("quizFeedback").textContent="Answer sent — waiting…"; };
+      $("quizOpts").appendChild(b);}); }
+    else { $("mathBox").classList.remove("hidden"); $("mathAns").value=""; $("mathAns").focus(); }
+    let left=msg.time_limit; $("quizTimer").textContent=left+"s";
+    clearInterval(quizTimerInt); quizTimerInt=setInterval(()=>{left--; if(left<=0){clearInterval(quizTimerInt);left=0;} $("quizTimer").textContent=left+"s";},1000);
+    return; }
+  if(msg.type==="question_result"){
+    clearInterval(quizTimerInt);
+    const corr = msg.correct_answer;
+    $("quizFeedback").innerHTML = "Correct answer: <b>"+corr+"</b>" +
+      (msg.points.find(p=>p.player_id===myId) ? " — you scored +"+msg.points.find(p=>p.player_id===myId).points+"!" : " — no points this round.");
+    $("scoreboard").innerHTML="<h3>Scores</h3><table>"+[...msg.scores].sort((a,b)=>b.score-a.score)
+      .map(s=>"<tr><td><span class='chip' style='display:inline-block;background:"+s.colour+"'></span> "+s.nickname+(s.is_bot?" 🤖":"")+"</td><td>"+s.score+"</td></tr>").join("")+"</table>";
+    return; }
+  if(msg.type==="results"){
+    clearInterval(quizTimerInt);
+    const unit = msg.game==="reaction" ? " ms" : " pts";
+    $("resultsTable").innerHTML="<table><tr><th>#</th><th>Player</th><th>"+(msg.game==="reaction"?"Avg reaction":"Score")+"</th></tr>"+
+      msg.rankings.map((r,i)=>"<tr><td>"+(i+1)+"</td><td><span class='chip' style='display:inline-block;background:"+r.colour+"'></span> "+r.nickname+(r.is_bot?" 🤖 BOT":"")+"</td><td>"+
+        (msg.game==="reaction" ? (r.avg_ms==null?"— (all false starts)":r.avg_ms+unit+" (best "+r.best_ms+")") : r.score+unit)+"</td></tr>").join("")+"</table>";
+    show("results"); return; }
+}
+
+function renderLobby(){
+  if(!room) return;
+  $("lobbyTitle").textContent=room.name+" — Lobby";
+  $("roomCode").textContent=room.code;
+  $("playerCount").textContent=room.players.length;
+  const host=isHost();
+  $("hostSettings").style.display=host?"":"none";
+  $("settingsReadOnly").classList.toggle("hidden", host);
+  $("botHint").style.display=host?"":"none";
+  $("setRoomName").value=room.name; $("setMaxPlayers").value=String(room.max_players); $("setGame").value=room.game;
+  $("setReaction").classList.toggle("hidden", room.game!=="reaction");
+  $("setMath").classList.toggle("hidden", room.game!=="math");
+  $("setTrivia").classList.toggle("hidden", room.game!=="trivia");
+  $("setReactionRounds").value=String(room.game_settings.reaction.rounds);
+  $("setMathDiff").value=room.game_settings.math.difficulty; $("setMathQ").value=String(room.game_settings.math.questions); $("setMathTime").value=String(room.game_settings.math.time_per_question);
+  $("setTriviaCat").value=room.game_settings.trivia.category; $("setTriviaDiff").value=room.game_settings.trivia.difficulty; $("setTriviaQ").value=String(room.game_settings.trivia.questions); $("setTriviaTime").value=String(room.game_settings.trivia.time_per_question);
+  const list=$("playerList"); list.innerHTML="";
+  room.players.forEach(p=>{
+    const d=document.createElement("div"); d.className="player"+(p.is_bot?" bot":"");
+    d.innerHTML="<span class='chip' style='background:"+p.colour+"'></span><b>"+p.nickname+"</b>"+
+      (p.is_host?" <span class='crown'>👑</span>":"")+(p.is_bot?" <span class='badge'>BOT</span>":"")+
+      (p.is_bot?" <span class='muted'>"+p.difficulty+"</span>":"")+(p.connected===false?" <span class='muted'>(disconnected)</span>":"");
+    if(p.is_bot && host) d.onclick=()=>openBotEdit(p);
+    list.appendChild(d);
+  });
+  const min = room.game==="random"?1:({reaction:1,math:1,trivia:1}[room.game]||1);
+  const need = Math.max(0, min - room.players.length);
+  $("startBtn").disabled = !host || need>0;
+  $("startBtn").textContent = !host ? "Waiting for host to start…" : need>0 ? "Need "+need+" more player"+(need>1?"s":"")+" / bot"+(need>1?"s":"") : "Start "+GAME_NAMES[room.game];
+  $("startHint").textContent = room.game==="reaction" && room.players.length===1 ? "Solo practice: only you — Reaction Test works with 1 player." : "";
+}
+
+function openBotEdit(bot){
+  editingBot=bot; botColour=bot.colour;
+  $("botName").value=bot.nickname; $("botDiff").value=bot.difficulty||"Medium";
+  buildPalette($("botPalette"), c=>botColour=c, botColour);
+  $("botEdit").classList.remove("hidden");
+}
+$("botCancelBtn").onclick=()=>{editingBot=null;$("botEdit").classList.add("hidden");};
+$("botSaveBtn").onclick=()=>{ if(!editingBot)return;
+  send({type:"update_bot", bot_id:editingBot.id, nickname:$("botName").value.trim(), colour:botColour, difficulty:$("botDiff").value});
+  editingBot=null; $("botEdit").classList.add("hidden"); };
+$("botRemoveBtn").onclick=()=>{ if(!editingBot)return; send({type:"remove_bot", bot_id:editingBot.id}); editingBot=null; $("botEdit").classList.add("hidden"); };
+
+$("copyLinkBtn").onclick=async()=>{ try{ await navigator.clipboard.writeText(joinLink(room.code)); $("copyMsg").textContent="Link copied!"; }
+  catch(e){ prompt("Copy this link:", joinLink(room.code)); } };
+$("addBotBtn").onclick=()=>send({type:"add_bot"});
+$("startBtn").onclick=()=>{ pushSettings(); send({type:"start_game"}); };
+function pushSettings(){
+  send({type:"update_settings", room_name:$("setRoomName").value.trim(), max_players:parseInt($("setMaxPlayers").value),
+    game:$("setGame").value,
+    game_settings:{ reaction:{rounds:parseInt($("setReactionRounds").value)},
+      math:{difficulty:$("setMathDiff").value, questions:parseInt($("setMathQ").value), time_per_question:parseInt($("setMathTime").value)},
+      trivia:{category:$("setTriviaCat").value, difficulty:$("setTriviaDiff").value, questions:parseInt($("setTriviaQ").value), time_per_question:parseInt($("setTriviaTime").value)} }});
+}
+["setRoomName","setMaxPlayers","setGame","setReactionRounds","setMathDiff","setMathQ","setMathTime","setTriviaCat","setTriviaDiff","setTriviaQ","setTriviaTime"]
+  .forEach(id=>$(id).addEventListener("change", pushSettings));
+$("reactionArea").onclick=()=>{ if(reactionClicked)return; reactionClicked=true; send({type:"reaction_click"}); };
+function submitMath(){ if(quizAnswered)return; const v=$("mathAns").value.trim(); if(!v)return; quizAnswered=true; send({type:"answer", answer:v}); $("quizFeedback").textContent="Answer sent — waiting…"; }
+$("mathSubmit").onclick=submitMath;
+$("mathAns").addEventListener("keydown", e=>{ if(e.key==="Enter") submitMath(); });
+$("againBtn").onclick=()=>{ send({type:"play_again"}); show("lobby"); };
+$("changeBtn").onclick=()=>{ send({type:"play_again"}); show("lobby"); };
+</script>
+</body>
+</html>
