@@ -37,12 +37,15 @@
   .err { color: #ff8a80; font-weight: 600; } .ok { color: #7ee2a8; }
   .hidden { display: none; } .muted { color: #bbb; font-size: .9rem; }
   .timer { font-size: 1.4rem; font-weight: 800; text-align: center; }
+  #connStatus { background: #e67e22; color: #fff; font-weight: 700; text-align: center; border-radius: 8px; padding: 8px; margin-bottom: 12px; }
+  #voteBox { background: #1e1e2e; border-radius: 8px; padding: 12px; margin-top: 12px; text-align: center; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1>🎉 Party Game Hub</h1>
   <p class="sub">1–8 players · quick rounds · humans + bots</p>
+  <div id="connStatus" class="hidden">Reconnecting…</div>
 
   <!-- HOME -->
   <div id="home" class="card">
@@ -69,6 +72,13 @@
     <p id="copyMsg" class="ok"></p>
     <h3>Players (<span id="playerCount">0</span>/8)</h3>
     <div id="playerList"></div>
+    <div class="card" style="background:#1e1e2e">
+      <h3>Edit my nickname / colour</h3>
+      <label>Nickname</label><input id="myNick" maxlength="20">
+      <label>Colour</label><div id="myPalette" class="palette"></div>
+      <button id="myProfileSaveBtn">Save my nickname / colour</button>
+      <p id="myProfileMsg" class="ok"></p>
+    </div>
     <p class="muted" id="botHint">Host: tap a bot in the list to change its nickname, colour or difficulty — or remove it.</p>
 
     <div id="botEdit" class="card hidden" style="background:#1e1e2e">
@@ -102,6 +112,7 @@
         <div id="setMath" class="hidden">
           <label>Difficulty</label>
           <select id="setMathDiff"><option>Easy</option><option selected>Medium</option><option>Hard</option></select>
+          <p class="muted" id="mathHelp">Medium: + − × ÷, multiplication up to 12×12.</p>
           <label>Questions</label>
           <select id="setMathQ"><option>5</option><option selected>10</option><option>15</option></select>
           <label>Time per question</label>
@@ -144,6 +155,11 @@
       </div>
       <p id="quizFeedback"></p>
       <div id="scoreboard"></div>
+      <div id="voteBox" class="hidden">
+        <h3>Take a breather — scores above ☝️</h3>
+        <p id="voteCount" class="muted">0/0 voted NEXT</p>
+        <button id="nextBtn" class="green">NEXT QUESTION →</button>
+      </div>
     </div>
   </div>
 
@@ -151,6 +167,13 @@
   <div id="results" class="card hidden">
     <h2>🏆 Results</h2>
     <div id="resultsTable"></div>
+    <div class="card" style="background:#1e1e2e">
+      <h3>Edit my nickname / colour</h3>
+      <label>Nickname</label><input id="myNick2" maxlength="20">
+      <label>Colour</label><div id="myPalette2" class="palette"></div>
+      <button id="myProfileSaveBtn2">Save my nickname / colour</button>
+      <p id="myProfileMsg2" class="ok"></p>
+    </div>
     <button id="againBtn" class="green">Play Again (same players)</button>
     <button id="changeBtn" class="secondary">Back to Lobby / Change Game</button>
   </div>
@@ -160,7 +183,9 @@
 const PALETTE = ["#e74c3c","#e67e22","#f1c40f","#2ecc71","#3498db","#9b59b6","#fd79a8","#1abc9c","#95a5a6","#34495e"];
 const GAME_NAMES = {reaction:"Reaction Test", math:"Speed Math", trivia:"Speed Trivia", random:"Random"};
 let ws=null, myId=null, room=null, myColour=PALETTE[4], editingBot=null, botColour=PALETTE[0];
-let quizTimerInt=null, reactionClicked=false, quizAnswered=false;
+let quizTimerInt=null, reactionClicked=false, quizAnswered=false, currentQIndex=null;
+let myProfileColour=PALETTE[4], votedNext=false, voteIndex=null;
+let heartbeatInt=null, reconnectAttempts=0, lastJoinMsg=null;
 
 function $(id){return document.getElementById(id);}
 function show(id){["home","lobby","game","results"].forEach(s=>$(s).classList.toggle("hidden", s!==id));}
@@ -171,23 +196,48 @@ function buildPalette(el, onPick, selected){
 }
 buildPalette($("palette"), c=>myColour=c, myColour);
 buildPalette($("botPalette"), c=>botColour=c, botColour);
+buildPalette($("myPalette"), c=>{myProfileColour=c;}, myProfileColour);
+buildPalette($("myPalette2"), c=>{myProfileColour=c;}, myProfileColour);
 
 function joinLink(code){return location.origin+"/?code="+code;}
+function setConnStatus(text){ const el=$("connStatus"); if(!text){el.classList.add("hidden");return;} el.textContent=text; el.classList.remove("hidden"); }
 function connect(firstMsg){
   const proto = location.protocol==="https:"?"wss":"ws";
+  // v1.1: reconnect sends our player id so the server reclaims the
+  // exact same seat (score, host, colour) instead of matching by name.
+  if(myId && firstMsg && firstMsg.type==="join_room") firstMsg.player_id=myId;
   ws = new WebSocket(proto+"://"+location.host+"/ws");
-  ws.onopen = ()=> ws.send(JSON.stringify(firstMsg));
+  ws.onopen = ()=> { reconnectAttempts=0; setConnStatus(""); $("lobbyErr").textContent=""; ws.send(JSON.stringify(firstMsg)); };
   ws.onmessage = e=> handle(JSON.parse(e.data));
-  ws.onclose = ()=>{ if(room) $("lobbyErr").textContent="Disconnected from the server. Refresh to rejoin."; };
+  ws.onclose = ()=>{
+    clearInterval(heartbeatInt);
+    if(!room) return;
+    if(reconnectAttempts < 20){
+      reconnectAttempts++;
+      const msg="Reconnecting… (attempt "+reconnectAttempts+"/20) — your seat, nickname and score are held.";
+      setConnStatus(msg); $("lobbyErr").textContent=msg;
+      setTimeout(()=>connect(lastJoinMsg), Math.min(1500*reconnectAttempts, 5000));
+    } else {
+      setConnStatus("Disconnected from the server. Refresh to rejoin.");
+      $("lobbyErr").textContent="Disconnected from the server. Refresh to rejoin.";
+    }
+  };
+  clearInterval(heartbeatInt);
+  // v1.1: 5s heartbeat (was 15s) so idle-proxy drops are noticed sooner.
+  heartbeatInt=setInterval(()=>{ if(ws && ws.readyState===1) ws.send(JSON.stringify({type:"ping"})); }, 5000);
 }
 function nickname(){return $("nickname").value.trim();}
 function validNick(){ if(!nickname()){$("homeErr").textContent="Pick a nickname first.";return false;} return true; }
 
 $("createBtn").onclick=()=>{ if(!validNick())return; $("homeErr").textContent="";
+  // Reconnects always rejoin by code (create would make a new room),
+  // so remember the join form; the code is filled in on "joined".
+  lastJoinMsg={type:"join_room", code:"", nickname:nickname(), colour:myColour};
   connect({type:"create_room", nickname:nickname(), colour:myColour, room_name:$("roomName").value.trim()||"Party Room"}); };
 $("joinBtn").onclick=()=>{ if(!validNick())return; const code=$("joinCode").value.trim().toUpperCase();
   if(!code){$("homeErr").textContent="Enter a room code or paste a link.";return;}
-  connect({type:"join_room", code, nickname:nickname(), colour:myColour}); };
+  lastJoinMsg={type:"join_room", code, nickname:nickname(), colour:myColour};
+  connect(lastJoinMsg); };
 
 // Prefill a code from ?code=XXXXXX in the URL.
 const params=new URLSearchParams(location.search);
@@ -198,7 +248,10 @@ function isHost(){ return room && room.players.find(p=>p.id===myId)?.is_host; }
 
 function handle(msg){
   if(msg.type==="error"){ (room?$("lobbyErr"):$("homeErr")).textContent=msg.message; return; }
-  if(msg.type==="joined"){ myId=msg.player_id; room=msg.room; history.replaceState(null,"",joinLink(room.code)); renderLobby(); show("lobby"); return; }
+  if(msg.type==="joined"){ myId=msg.player_id; room=msg.room; if(lastJoinMsg){lastJoinMsg.code=room.code; lastJoinMsg.player_id=myId;}
+    const me=room.players.find(p=>p.id===myId); if(me){myProfileColour=me.colour; $("myNick").value=me.nickname; $("myNick2").value=me.nickname;
+      buildPalette($("myPalette"), c=>{myProfileColour=c;}, myProfileColour); buildPalette($("myPalette2"), c=>{myProfileColour=c;}, myProfileColour);}
+    history.replaceState(null,"",joinLink(room.code)); renderLobby(); show("lobby"); return; }
   if(msg.type==="lobby"){ room=msg.room; if(room.phase==="lobby") renderLobby(); return; }
   if(msg.type==="game_started"){ room.current_game=msg.game; $("gameTitle").textContent=GAME_NAMES[msg.game]+(msg.mode==="solo"?" — Solo practice":"");
     $("gameInfo").textContent = msg.mode==="solo" ? "Just you — have fun, no pressure!" : "Fastest correct answers score the most points.";
@@ -215,16 +268,22 @@ function handle(msg){
         (r.false_start?"Too soon! ❌":(r.ms==null?"—":r.ms+" ms"))+"</td></tr>").join("")+"</table>";
     if(me && me.false_start) $("reactionArea").textContent="Too soon! That round doesn't count.";
     return; }
-  if(msg.type==="question"){ quizAnswered=false; $("quizFeedback").textContent="";
+  if(msg.type==="question"){ quizAnswered=false; currentQIndex=msg.index; votedNext=false; voteIndex=null; $("voteBox").classList.add("hidden"); $("quizFeedback").textContent="";
     $("quizQ").textContent="Q"+msg.index+"/"+msg.total+": "+msg.text;
     $("quizOpts").innerHTML=""; $("mathBox").classList.add("hidden");
     if(msg.options){ msg.options.forEach((o,i)=>{const b=document.createElement("button");b.className="opt";b.textContent=o;
-      b.onclick=()=>{ if(quizAnswered)return; quizAnswered=true; send({type:"answer",answer:i}); [...$("quizOpts").children].forEach(x=>x.disabled=true); $("quizFeedback").textContent="Answer sent — waiting…"; };
+      b.onclick=()=>{ if(quizAnswered)return; quizAnswered=true; send({type:"answer",answer:i,index:currentQIndex}); [...$("quizOpts").children].forEach(x=>x.disabled=true); $("quizFeedback").textContent="Answer sent — waiting…"; };
       $("quizOpts").appendChild(b);}); }
-    else { $("mathBox").classList.remove("hidden"); $("mathAns").value=""; $("mathAns").focus(); }
+    else { $("mathBox").classList.remove("hidden"); $("mathAns").value=""; $("mathAns").disabled=false; $("mathSubmit").disabled=false; $("mathAns").focus(); }
     let left=msg.time_limit; $("quizTimer").textContent=left+"s";
-    clearInterval(quizTimerInt); quizTimerInt=setInterval(()=>{left--; if(left<=0){clearInterval(quizTimerInt);left=0;} $("quizTimer").textContent=left+"s";},1000);
+    clearInterval(quizTimerInt); quizTimerInt=setInterval(()=>{left--; if(left<=0){clearInterval(quizTimerInt);left=0; if(!quizAnswered){quizAnswered=true; $("mathAns").disabled=true; $("mathSubmit").disabled=true; $("quizFeedback").textContent="Time's up — waiting…";}} $("quizTimer").textContent=left+"s";},1000);
     return; }
+  if(msg.type==="pong"){ return; }
+  if(msg.type==="vote_break"){ votedNext=false; voteIndex=msg.index;
+    $("voteBox").classList.remove("hidden"); $("nextBtn").disabled=false;
+    $("voteCount").textContent=msg.votes+"/"+msg.votes_needed+" voted NEXT — auto-advances at "+msg.timeout+"s";
+    return; }
+  if(msg.type==="vote_update"){ $("voteCount").textContent=msg.votes+"/"+msg.votes_needed+" voted NEXT"; return; }
   if(msg.type==="question_result"){
     clearInterval(quizTimerInt);
     const corr = msg.correct_answer;
@@ -278,6 +337,8 @@ function openBotEdit(bot){
   editingBot=bot; botColour=bot.colour;
   $("botName").value=bot.nickname; $("botDiff").value=bot.difficulty||"Medium";
   buildPalette($("botPalette"), c=>botColour=c, botColour);
+buildPalette($("myPalette"), c=>{myProfileColour=c;}, myProfileColour);
+buildPalette($("myPalette2"), c=>{myProfileColour=c;}, myProfileColour);
   $("botEdit").classList.remove("hidden");
 }
 $("botCancelBtn").onclick=()=>{editingBot=null;$("botEdit").classList.add("hidden");};
@@ -300,11 +361,30 @@ function pushSettings(){
 ["setRoomName","setMaxPlayers","setGame","setReactionRounds","setMathDiff","setMathQ","setMathTime","setTriviaCat","setTriviaDiff","setTriviaQ","setTriviaTime"]
   .forEach(id=>$(id).addEventListener("change", pushSettings));
 $("reactionArea").onclick=()=>{ if(reactionClicked)return; reactionClicked=true; send({type:"reaction_click"}); };
-function submitMath(){ if(quizAnswered)return; const v=$("mathAns").value.trim(); if(!v)return; quizAnswered=true; send({type:"answer", answer:v}); $("quizFeedback").textContent="Answer sent — waiting…"; }
+// v1.1: ENTER and the Answer button are provably the same path.
+// There is no <form> here, so ENTER cannot reload/submit the page;
+// we still preventDefault, and we disable the input + button after
+// submitting so a double-send cannot happen. The server only advances
+// when every connected player has answered or the timer expires.
+function submitMath(e){ if(e) e.preventDefault(); if(quizAnswered)return; const v=$("mathAns").value.trim(); if(!v)return; quizAnswered=true;
+  $("mathAns").disabled=true; $("mathSubmit").disabled=true;
+  send({type:"answer", answer:v, index:currentQIndex}); $("quizFeedback").textContent="Answer sent — waiting…"; }
 $("mathSubmit").onclick=submitMath;
-$("mathAns").addEventListener("keydown", e=>{ if(e.key==="Enter") submitMath(); });
+$("mathAns").addEventListener("keydown", e=>{ if(e.key==="Enter"){ e.preventDefault(); submitMath(e); } });
 $("againBtn").onclick=()=>{ send({type:"play_again"}); show("lobby"); };
 $("changeBtn").onclick=()=>{ send({type:"play_again"}); show("lobby"); };
+$("nextBtn").onclick=()=>{ if(votedNext) return; votedNext=true; $("nextBtn").disabled=true; send({type:"vote_next", index:voteIndex}); };
+function saveProfile(nickEl, msgEl){
+  const nick=nickEl.value.trim(); if(!nick){ msgEl.textContent="Pick a nickname first."; return; }
+  send({type:"update_profile", nickname:nick, colour:myProfileColour});
+  msgEl.textContent="Saved — your new nickname / colour will show for everyone.";
+}
+$("myProfileSaveBtn").onclick=()=>saveProfile($("myNick"), $("myProfileMsg"));
+$("myProfileSaveBtn2").onclick=()=>saveProfile($("myNick2"), $("myProfileMsg2"));
+const MATH_HELP={"Easy":"Easy: addition and subtraction only, numbers from -30 to 30.",
+  "Medium":"Medium: + − × ÷, multiplication up to 12×12, division is exact.",
+  "Hard":"Hard: functions f(x), solving for x, max/min of a function, advanced BEDMAS, fractions (answer as a decimal to 2 places)."};
+$("setMathDiff").addEventListener("change", ()=>{ $("mathHelp").textContent=MATH_HELP[$("setMathDiff").value]||""; });
 </script>
 </body>
 </html>
