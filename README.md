@@ -1,4 +1,4 @@
-# Party Game Hub — v2
+# Party Game Hub — v2.1
 
 A free, simple online party-game hub for 1–8 players (humans + bots),
 built for Matthew and his cousins. Simple 2D, text and coloured shapes
@@ -8,6 +8,14 @@ only — no fancy graphics, no accounts, no sign-in.
 Impostor, President / Ditchdiggers / Asshole, UNO, Memory, and
 Elimination mode (a series of quick challenges). After v2 the hub is
 at its initial playable phase for the cousins.
+
+**v2.1 (playtest fixes, 2026-11-09):** President card selection is
+now unambiguous (client-side legality, plain-English hints, specific
+rejection reasons, visible turn countdown, and a notice when the
+server auto-plays on timeout); Memory bots were retuned so Medium
+and especially Hard bots survive much longer; Elimination mode is
+paced with a NEXT vote break and a challenge intro between
+challenges. UNO is unchanged — it playtested great.
 
 ## How it works
 
@@ -95,6 +103,18 @@ at its initial playable phase for the cousins.
   with an error, never trusted from the client. Turn timeout is
   30 s (host setting): a bot or idle player auto-plays their lowest
   legal set when leading, or passes.
+  - **v2.1 selection UX:** the key rule is that a play must match
+    the trick's SIZE *and* beat its rank — one higher card does
+    NOT beat a pair. The UI now says so at all times ("Beat a pair
+    of 8s — pick 2 cards of the same rank, 9 or higher"), cards
+    that can legally be played are highlighted green and the rest
+    dimmed, the Play button is disabled while nothing (or nothing
+    legal) is selected, and a rejected play keeps your selection
+    and tells you exactly why ("You picked 1 card but the trick
+    needs 2"). A visible turn countdown warns in the last 10 s,
+    and when the server auto-plays on timeout it announces it
+    ("Matthew ran out of time — lowest card played
+    automatically"), so it never looks like a random card.
 - **UNO (v2, min 2):** a standard 108-card deck — 4 colours ×
   numbers 0–9 (0 once, 1–9 twice), Skip / Reverse / Draw 2 (twice
   per colour), Wild and Wild Draw 4 (4 each). 7 cards each; the
@@ -132,9 +152,12 @@ at its initial playable phase for the cousins.
   Scoring: winner 1000; eliminated players score **100 per round
   they survived** — a player eliminated in round 3 survived rounds
   1 and 2, so they score 200. Bots recall with a difficulty-based
-  per-digit error chance, so longer numbers are harder: Easy ~12%
-  error per digit (~60% correct at 4 digits), Medium ~6% (~78%),
-  Hard ~2% (~92%).
+  per-digit error chance that *grows* with the number's length, so
+  bots breeze through the early rounds and fail gradually as the
+  digits grow (v2.1 retune — the old flat rates let a Hard bot lose
+  within 3 rounds ~26% of the time). Simulated mean last digit
+  survived: Easy ~4.8, Medium ~6.3, Hard ~8.3. At 4 digits Easy is
+  ~83% correct, Medium ~94%, Hard ~98%.
 - **Elimination mode (v2, min 4):** a series of quick challenges.
   Each challenge is one game picked at random from the pool of
   games that produce a clear per-challenge ranking: **Reaction
@@ -158,7 +181,17 @@ at its initial playable phase for the cousins.
   and 3rd, then earlier eliminated players in reverse elimination
   order (most recently eliminated first). Scoring: victor 1000,
   2nd 500, 3rd 250, earlier eliminated 100 per challenge they
-  survived. **End votes:** two community votes on the results
+  survived. **Pacing (v2.1):** after EVERY challenge — including
+  the finale, before the final results — there is a break screen
+  showing the challenge ranking, who was eliminated, how many
+  players remain, and the finishing order so far, with a NEXT
+  vote: at least half of the connected humans *still alive* vote
+  NEXT (bots don't vote, eliminated spectators don't count), or
+  the 60 s timeout, or the host's Skip button. Nothing advances
+  until the break ends. Before each challenge (including the first
+  and the finale) there is a 4-second intro naming the game and
+  who is still in, so nobody is ambushed by a new game starting.
+  **End votes:** two community votes on the results
   screen, "Play Again" and "Return to Lobby". Humans only (bots
   don't vote); at least half of connected humans voting Play Again
   starts a NEW elimination series with the same players; at least

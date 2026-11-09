@@ -75,6 +75,11 @@ Protocol (JSON over one WebSocket per player, endpoint /ws):
     question_result {index, total, correct_answer, points:[{player_id,points}], scores:[...], mode, teams}
     vote_break  {index, total, scores, votes, votes_needed, timeout, mode, teams}
     vote_update {index, votes, votes_needed, voters:[player_id], host_skipped?}
+    # v2.1 Elimination breaks reuse vote_break with extra fields:
+    #   elim_break, eliminated:[nicknames], remaining, finishing:[names], ranking:[names]
+    #   — only players still alive may vote (eliminated spectators don't count).
+    president_notice {message}   # v2.1: a player timed out in President —
+                                  # their lowest card was auto-played / they passed
     results     {game, mode, teams, rankings:[{player_id,nickname,colour,is_bot,score,avg_ms,best_ms,team}]}
     kicked      {message}         # v1.2 reply to the kicked player only
     game_cancelled {reason}
@@ -181,7 +186,9 @@ DEFAULT_SETTINGS = {
     "president": {"turn_seconds": 30},
     "uno":      {"turn_seconds": 30},
     "memory":   {"memorize_seconds": 10, "recall_seconds": 15},
-    "elimination": {},
+    # v2.1: the between-challenge NEXT vote break uses this timeout
+    # (tests override it to a few seconds).
+    "elimination": {"vote_timeout": 60},
 }
 
 # ---------------------------------------------------------------------------
@@ -235,11 +242,18 @@ SECRET_WORDS = {
 VAGUE_CLUES = ["thing", "big", "useful", "common", "nice", "interesting",
                "everyday", "special"]
 
-# Memory game (v2): per-digit recall error chance for bots — longer
-# numbers are harder because every digit must be right.
-# P(correct) = (1 - p) ** digits: Easy ~60% at 4 digits, Medium ~80%,
-# Hard ~95%, all falling as the number gets longer.
-BOT_MEMORY_ERROR = {"Easy": 0.12, "Medium": 0.06, "Hard": 0.02}
+# Memory game (v2, retuned v2.1): per-digit recall error chance for
+# bots — longer numbers are harder because every digit must be right,
+# AND the per-digit error itself grows with length. p(digits) =
+# base + growth * (digits - 4), so P(correct round) = (1 - p) ** digits.
+# Simulated survival (mean last digit survived, 4000 bots each):
+# Easy ~4.8 digits, Medium ~6.3, Hard ~8.3 — Easy is clearly weakest,
+# Hard clearly strongest, at every length. The old flat rates (0.12 /
+# 0.06 / 0.02) let a Hard bot lose within 3 rounds ~26% of the time,
+# which is what Matthew saw; the new shape keeps bots alive through
+# the early rounds and makes them fail gradually as digits grow.
+BOT_MEMORY_ERROR = {"Easy": (0.05, 0.03), "Medium": (0.015, 0.012),
+                    "Hard": (0.005, 0.005)}
 
 # Elimination mode (v2): challenges are picked at random from the
 # quick games that produce a clear per-challenge ranking. Secret Word,
@@ -696,6 +710,56 @@ def build_president_deck():
     return deck
 
 
+PRES_SIZE_WORDS = {1: "a single", 2: "a pair", 3: "three of a kind",
+                   4: "four of a kind"}
+
+
+def pres_rank_name(value: int) -> str:
+    """Rank label for a rank value, e.g. 8 -> '8', 13 -> 'K', 15 -> '2'."""
+    return PRES_RANKS[value - 3]
+
+
+def president_illegal_reason(hand, cards, trick):
+    """Why `cards` is NOT a legal President play, in plain English —
+    or None if the play is legal. `trick` is None when leading a new
+    trick, else {"size": n, "rank": v}.
+
+    This is the authority the server sends back on a rejected play,
+    so the player is never left guessing: the single most common
+    confusion is the SIZE rule — one higher card does NOT beat a pair,
+    you must match the trick's size with a higher rank.
+    """
+    if not cards:
+        return "You haven't selected any cards — pick at least one card to play."
+    if len(cards) > 4:
+        return "You can play at most 4 cards at once — you picked %d." % len(cards)
+    missing = [c for c in cards if c not in hand]
+    if missing:
+        return ("That card isn't in your hand anymore (%s) — "
+                "your hand may have changed; pick again."
+                % ", ".join(missing))
+    ranks = {pres_rank(c) for c in cards}
+    if len(ranks) != 1:
+        return ("All the cards in a set must be the same rank — you "
+                "picked different ranks.")
+    rank = pres_rank(cards[0])
+    if trick is None:
+        return None  # leading: any set of 1-4 of the same rank
+    size, trick_rank = trick["size"], trick["rank"]
+    if len(cards) != size:
+        return ("The trick is %s of %ss — you need to play %d card%s "
+                "of the same rank, not %d."
+                % (PRES_SIZE_WORDS[size], pres_rank_name(trick_rank),
+                   size, "s" if size > 1 else "", len(cards)))
+    if rank <= trick_rank:
+        return ("%s of %ss doesn't beat %s of %ss — you need a "
+                "higher rank." % (PRES_SIZE_WORDS[size],
+                                  pres_rank_name(rank),
+                                  PRES_SIZE_WORDS[size],
+                                  pres_rank_name(trick_rank)))
+    return None
+
+
 def president_legal_play(hand, cards, trick):
     """Is `cards` (a list of card strings) a legal President play?
 
@@ -703,16 +767,7 @@ def president_legal_play(hand, cards, trick):
     Legal = every card is in the hand, all the same rank, and either
     leading (any set of 1-4) or matching the trick size with a higher rank.
     """
-    if not cards or len(cards) > 4:
-        return False
-    if any(c not in hand for c in cards):
-        return False
-    if len({pres_rank(c) for c in cards}) != 1:
-        return False  # a set must be all the same rank
-    if trick is None:
-        return True
-    return (len(cards) == trick["size"]
-            and pres_rank(cards[0]) > trick["rank"])
+    return president_illegal_reason(hand, cards, trick) is None
 
 
 def president_lowest_legal(hand, trick):
@@ -841,8 +896,14 @@ def secret_tally(votes, impostor_ids):
 
 def memory_bot_correct(difficulty: str, digits: int) -> bool:
     """Does a bot of this difficulty recall a `digits`-digit number?
-    Per-digit error chance, so longer numbers are harder."""
-    p = BOT_MEMORY_ERROR.get(difficulty or "Medium", 0.06)
+
+    Per-digit error chance grows with length: p = base + growth *
+    (digits - 4), capped at 0.5, so a bot that breezes through 4
+    digits still starts failing as the number gets longer.
+    """
+    base, growth = BOT_MEMORY_ERROR.get(difficulty or "Medium",
+                                        (0.015, 0.012))
+    p = min(0.5, base + growth * max(0, digits - 4))
     return all(random.random() >= p for _ in range(digits))
 
 
@@ -985,32 +1046,52 @@ def record_reaction(room: Room, player: Player, ms, false_start=False):
         player.reaction_times.append(ms)
 
 
-async def _vote_phase(room: Room, game: str, idx: int, total: int):
-    """NEXT QUESTION vote break after a quiz question (v1.1, v1.2).
+async def _vote_phase(room: Room, game: str, idx: int, total: int, *,
+                      scores=None, extra=None, eligible=None):
+    """NEXT vote break (v1.1, v1.2, v2.1).
 
     Advances when at least half of the CONNECTED HUMAN players have
     voted NEXT, or after the vote timeout (default 60s), or when the
     host uses the host-skip override (v1.2, see host_skip).
     v1.2: bots do NOT vote and do NOT count toward the threshold —
     they used to auto-vote, which let bots decide the break.
+    v2.1: `scores` overrides the scoreboard rows shown on the break,
+    `extra` adds fields to the vote_break message (used by
+    Elimination breaks), and `eligible` restricts who may vote and
+    who counts toward the threshold (Elimination: only players still
+    alive — an eliminated spectator must not be able to hold the
+    break hostage, and must not count toward the half).
     """
     settings = room.game_settings[game]
     timeout = int(settings.get("vote_timeout", VOTE_TIMEOUT_DEFAULT))
     room.round_state["votes"] = set()
     room.round_state["vote_index"] = idx
     room.round_state["host_skip"] = False
-    scores = [{"player_id": pl.id, "nickname": pl.nickname,
-               "colour": pl.colour, "is_bot": pl.is_bot, "score": pl.score,
-               "team": room.teams.get(pl.id)}
-              for pl in room.players]
+    if scores is None:
+        scores = [{"player_id": pl.id, "nickname": pl.nickname,
+                   "colour": pl.colour, "is_bot": pl.is_bot,
+                   "score": pl.score, "team": room.teams.get(pl.id)}
+                  for pl in room.players]
+    if eligible is None:
+        room.round_state["vote_eligible"] = None
+    else:
+        room.round_state["vote_eligible"] = {p.id for p in eligible}
 
     def votes_needed():
-        return votes_needed_humans(room)
+        if eligible is None:
+            return votes_needed_humans(room)
+        alive_humans = [p for p in room.players
+                        if not p.is_bot and p.connected
+                        and p.id in room.round_state["vote_eligible"]]
+        return max(1, (len(alive_humans) + 1) // 2)
 
-    await broadcast(room, {"type": "vote_break", "index": idx, "total": total,
-                           "scores": scores, "votes": 0,
-                           "votes_needed": votes_needed(), "timeout": timeout,
-                           "mode": room.mode, "teams": team_standings(room)})
+    msg = {"type": "vote_break", "index": idx, "total": total,
+           "scores": scores, "votes": 0,
+           "votes_needed": votes_needed(), "timeout": timeout,
+           "mode": room.mode, "teams": team_standings(room)}
+    if extra:
+        msg.update(extra)
+    await broadcast(room, msg)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if room.round_state.get("host_skip"):
@@ -1021,6 +1102,7 @@ async def _vote_phase(room: Room, game: str, idx: int, total: int):
     room.round_state.pop("votes", None)
     room.round_state.pop("vote_index", None)
     room.round_state.pop("host_skip", None)
+    room.round_state.pop("vote_eligible", None)
 
 
 async def run_quiz_game(room: Room, game: str, participants=None,
@@ -1531,7 +1613,11 @@ async def send_president_state(room: Room):
                        "counts": {pid: len(h) for pid, h in hands.items()},
                        "finished": st.get("finished", []),
                        "hand": sorted(hands.get(p.id, []), key=pres_rank),
-                       "can_pass": st.get("trick") is not None})
+                       "can_pass": st.get("trick") is not None,
+                       # v2.1: the client counts the turn down from
+                       # this, so the player can see the timeout coming.
+                       "turn_seconds": int(room.game_settings["president"]
+                                           .get("turn_seconds", 30))})
 
 
 async def run_president_game(room: Room):
@@ -1578,13 +1664,25 @@ async def run_president_game(room: Room):
                 else:
                     _president_apply_pass(room, current)
             else:
+                timed_out = False
                 try:
                     await asyncio.wait_for(st["turn_event"].wait(), turn_seconds)
                 except asyncio.TimeoutError:
-                    pass
+                    timed_out = True
                 action = st.get("turn_action")
                 if action is None:
                     # Timeout: lead with the lowest set, or pass.
+                    # v2.1: say so out loud — a silent auto-play looked
+                    # like a "random card" being played for no reason.
+                    if timed_out:
+                        if st["trick"] is None:
+                            what = "their lowest card was played automatically"
+                        else:
+                            what = "they passed automatically"
+                        await broadcast(room, {
+                            "type": "president_notice",
+                            "message": "%s ran out of time (%ds) — %s."
+                            % (current.nickname, turn_seconds, what)})
                     if st["trick"] is None:
                         play = president_lowest_legal(hands[current.id], None)
                         if play:
@@ -1953,6 +2051,41 @@ async def elimination_end_vote(room: Room):
     return False
 
 
+async def _elimination_break(room: Room, challenge_no: int, alive,
+                             ranking, eliminated_names, remaining,
+                             finishing_names):
+    """Pacing break between Elimination challenges (v2.1).
+
+    Shows the challenge ranking, who was eliminated, how many players
+    remain, and the finishing order so far, then waits for the NEXT
+    vote: at least half of the CONNECTED HUMAN players still alive
+    vote NEXT, or the 60s timeout, or the host's Skip override. Bots
+    do not vote. The series never advances to the next challenge
+    until the break ends — this is what stops the mode feeling like
+    a blur. `ranking` is the challenge's ranking rows
+    ({"player_id": ...}); scores shown are each alive player's score
+    from that challenge.
+    """
+    scores = []
+    for p in alive:
+        scores.append({"player_id": p.id, "nickname": p.nickname,
+                       "colour": p.colour, "is_bot": p.is_bot,
+                       "score": p.score, "team": None})
+    # The ranking order is the challenge order (best first); the
+    # scoreboard sorts by score, so keep the ranking visible too.
+    rank_names = []
+    for row in ranking:
+        pl = room.get_player(row["player_id"])
+        rank_names.append(pl.nickname if pl else "?")
+    await _vote_phase(room, "elimination", challenge_no, challenge_no,
+                      scores=scores, eligible=list(alive),
+                      extra={"elim_break": True,
+                             "eliminated": eliminated_names,
+                             "remaining": remaining,
+                             "finishing": finishing_names,
+                             "ranking": rank_names})
+
+
 async def run_elimination_game(room: Room):
     """Elimination mode (v2): a series of quick challenges.
 
@@ -1989,6 +2122,9 @@ async def run_elimination_game(room: Room):
                                        "remaining": len(alive),
                                        "alive": [p.nickname for p in alive],
                                        "finale": False})
+                # v2.1: challenge intro — 4 seconds to read what game
+                # is coming and who is still in, before it starts.
+                await asyncio.sleep(4)
                 await broadcast(room, {"type": "game_started", "game": game,
                                        "settings": room.game_settings[game],
                                        "mode": "competition",
@@ -2006,7 +2142,17 @@ async def run_elimination_game(room: Room):
                                        "player_id": last["player_id"],
                                        "nickname": loser.nickname if loser else "?",
                                        "remaining": len(alive)})
-                await asyncio.sleep(2)
+                # v2.1: pacing break — ranking, who went out, who is
+                # left — with a NEXT vote. Nothing advances until the
+                # vote passes, the host skips, or the timeout hits.
+                await _elimination_break(
+                    room, challenge_no, alive, ranking,
+                    [loser.nickname if loser else "?"], len(alive),
+                    [room.get_player(pid).nickname
+                     for pid in reversed(elim_order)
+                     if room.get_player(pid)])
+                if room.phase != "playing":
+                    return
             # --- Finale: 3 remain, one last challenge. ---
             challenge_no += 1
             pool = [g for g in ELIM_POOL
@@ -2024,6 +2170,9 @@ async def run_elimination_game(room: Room):
                                    "remaining": len(alive),
                                    "alive": [p.nickname for p in alive],
                                    "finale": True})
+            # v2.1: finale intro — same 4-second breather as every
+            # other challenge, so the finale doesn't ambush anyone.
+            await asyncio.sleep(4)
             await broadcast(room, {"type": "game_started", "game": game,
                                    "settings": room.game_settings[game],
                                    "mode": "competition", "party_mode": "ffa",
@@ -2033,6 +2182,18 @@ async def run_elimination_game(room: Room):
                 return
             finishing = [ranking[0]["player_id"], ranking[1]["player_id"],
                          ranking[2]["player_id"]] + list(reversed(elim_order))
+            # v2.1: one last pacing break after the finale challenge,
+            # before the final results — same NEXT vote as the rest.
+            await _elimination_break(
+                room, challenge_no, [room.get_player(finishing[0])],
+                ranking,
+                [room.get_player(pid).nickname
+                 for pid in finishing[1:3] if room.get_player(pid)],
+                1,
+                [room.get_player(pid).nickname
+                 for pid in finishing if room.get_player(pid)])
+            if room.phase != "playing":
+                return
             place_scores = {finishing[0]: 1000, finishing[1]: 500,
                             finishing[2]: 250}
             for p in all_players:
@@ -2301,12 +2462,17 @@ async def handle_message(room: Room, player: Player, msg: dict):
         if st.get("turn") != player.id or st.get("turn_action") is not None:
             return
         cards = msg.get("cards")
-        if not isinstance(cards, list) or not cards:
+        if not isinstance(cards, list):
             return
         hand = st.get("hands", {}).get(player.id, [])
-        if not president_legal_play(hand, cards, st.get("trick")):
-            await send(player, {"type": "error", "message":
-                "That play isn't legal — same rank, same size as the trick, higher rank."})
+        # v2.1: send the SPECIFIC reason (size / rank / mixed ranks /
+        # not in hand / nothing selected) instead of the old generic
+        # "that play isn't legal". Nothing is played, the turn is
+        # still theirs, and the client keeps the selection so the
+        # player can fix it instead of starting over.
+        reason = president_illegal_reason(hand, cards, st.get("trick"))
+        if reason is not None:
+            await send(player, {"type": "error", "message": reason})
             return
         _president_apply_play(room, player, list(cards))
         st["turn_action"] = ("play", list(cards))
@@ -2452,6 +2618,11 @@ async def handle_message(room: Room, player: Player, msg: dict):
             return
         st = room.round_state
         if "votes" not in st or player.is_bot:
+            return
+        # v2.1: during an Elimination break only players still alive
+        # may vote — eliminated spectators don't count.
+        eligible = st.get("vote_eligible")
+        if eligible is not None and player.id not in eligible:
             return
         if msg.get("index") is not None:
             try:
