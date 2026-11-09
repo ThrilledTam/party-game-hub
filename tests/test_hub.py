@@ -25,6 +25,12 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from questions import QUESTIONS  # noqa: E402
 from server import make_math_question, record_answer, Room, Player, team_standings  # noqa: E402
+from server import (GAMES, ELIM_POOL, SECRET_WORDS, VAGUE_CLUES, secret_tally,  # noqa: E402
+                    build_president_deck, president_legal_play,  # noqa: E402
+                    president_lowest_legal, president_scores_for,  # noqa: E402
+                    pres_rank,  # noqa: E402
+                    build_uno_deck, uno_match, uno_bot_choice,  # noqa: E402
+                    uno_best_colour, uno_value, memory_bot_correct)  # noqa: E402
 from fractions import Fraction  # noqa: E402
 
 PORT = 8001
@@ -113,6 +119,29 @@ class Client:
             await self.ws.close()
 
 
+async def wait_any(client, types, timeout=20):
+    """Wait for the next message whose type is one of `types`,
+    buffering other messages back into the client's queue (like
+    Client.wait_for does for a single type)."""
+    deadline = time.monotonic() + timeout
+    buf = []
+    while time.monotonic() < deadline:
+        try:
+            msg = await asyncio.wait_for(
+                client.queue.get(),
+                timeout=max(0.1, deadline - time.monotonic()))
+        except asyncio.TimeoutError:
+            break
+        if msg.get("type") in types:
+            for b in buf:
+                await client.queue.put(b)
+            return msg
+        buf.append(msg)
+    for b in buf:
+        await client.queue.put(b)
+    raise AssertionError(f"{client.name}: timed out waiting for {types}")
+
+
 def solve_math(text):
     # Simple a op b questions (Easy/Medium), e.g. "12 + 5 = ?",
     # "-12 + 5 = ?", "8 - (-7) = ?", "8 \u00d7 3 = ?", "20 \u00f7 4 = ?"
@@ -152,7 +181,11 @@ def eval_hard_math(text, answer):
 
 
 async def main():
-    check("trivia bank has >= 60 questions", len(QUESTIONS) >= 60,
+    check("trivia bank has 144 questions (36 per category, no duplicates)",
+          len(QUESTIONS) == 144
+          and len({q["question"] for q in QUESTIONS}) == 144
+          and all(len(q["options"]) == 4 and 0 <= q["answer"] <= 3
+                  for q in QUESTIONS),
           f"{len(QUESTIONS)} questions")
 
     # --- start the server ---
@@ -246,6 +279,17 @@ async def main():
             res = await host.wait_for("reaction_round_result", timeout=10)
             check(f"reaction round {rnd} result has all 4 players",
                   len(res["results"]) == 4)
+            if rnd < 3:
+                # v2: NEXT vote break between rounds (not after the last).
+                vb = await host.wait_for("vote_break", timeout=10)
+                check(f"reaction round {rnd} vote break shown",
+                      vb["votes_needed"] == 1, str(vb))
+                if rnd == 1:
+                    await host.send({"type": "vote_next", "index": rnd})
+                    await p2.send({"type": "vote_next", "index": rnd})
+                else:
+                    # Round 2: the host's Skip override advances instead.
+                    await host.send({"type": "host_skip"})
         results = await host.wait_for("results", timeout=10)
         check("Reaction Test produces results",
               len(results["rankings"]) == 4 and results["game"] == "reaction",
@@ -845,6 +889,425 @@ async def main():
               "max-width: 210px" in html and ".compact .swatch" in html)
         check("v1.2 bot edit panel uses the compact class",
               'id="botEdit" class="card compact hidden"' in html)
+
+        # ================= v2 tests =================
+        # --- Unit: Secret Word tally + word bank ---
+        check("v2 secret tally: catching an impostor wins for the word team",
+              secret_tally({"a": "x", "b": "x", "c": "y"}, {"x"}) == ("x", True))
+        check("v2 secret tally: voting out an innocent wins for the impostors",
+              secret_tally({"a": "y", "b": "y"}, {"x"}) == ("y", False))
+        check("v2 secret tally: a tie eliminates nobody, impostors win",
+              secret_tally({"a": "x", "b": "y"}, {"x"}) == (None, False))
+        check("v2 secret tally: no votes, impostors win",
+              secret_tally({}, {"x"}) == (None, False))
+        check("v2 secret word bank has >= 60 words with 3+ clues each",
+              len(SECRET_WORDS) >= 60
+              and all(len(v) >= 3 for v in SECRET_WORDS.values()),
+              f"{len(SECRET_WORDS)} words")
+
+        # --- Unit: President legality / strategy / scoring / deck ---
+        _hand = ["3♣", "3♦", "5♥", "K♠", "2♦"]
+        check("v2 president: a pair of 3s is legal when leading",
+              president_legal_play(_hand, ["3♣", "3♦"], None))
+        check("v2 president: a mixed-rank set is illegal",
+              not president_legal_play(_hand, ["3♣", "5♥"], None))
+        check("v2 president: a lower pair cannot beat a higher pair",
+              not president_legal_play(_hand, ["3♣", "3♦"], {"size": 2, "rank": 5}))
+        check("v2 president: a 2 beats a King as a single",
+              president_legal_play(_hand, ["2♦"], {"size": 1, "rank": 13}))
+        check("v2 president: the wrong size cannot beat the trick",
+              not president_legal_play(_hand, ["3♣"], {"size": 2, "rank": 3}))
+        check("v2 president: a card not in hand is illegal",
+              not president_legal_play(_hand, ["4♣"], None))
+        check("v2 president: lowest legal set when leading is a single 3",
+              president_lowest_legal(_hand, None) == ["3♣"])
+        check("v2 president: no pair can beat a pair of 4s here",
+              president_lowest_legal(_hand, {"size": 2, "rank": 4}) == [])
+        check("v2 president: 52-card deck, all unique",
+              len(set(build_president_deck())) == 52)
+        check("v2 president: scoring scale is 1000..0",
+              president_scores_for(4) == [1000, 667, 333, 0]
+              and president_scores_for(5) == [1000, 750, 500, 250, 0])
+
+        # --- Unit: UNO deck / matching / bot strategy ---
+        _deck = build_uno_deck()
+        check("v2 UNO: 108-card deck", len(_deck) == 108, f"{len(_deck)}")
+        check("v2 UNO: 4 wilds and 4 draw-4s",
+              _deck.count("Wwild") == 4 and _deck.count("Wdraw4") == 4)
+        check("v2 UNO: matching by colour", uno_match("R5", "G5", "R"))
+        check("v2 UNO: matching by number", uno_match("B5", "R5", "G"))
+        check("v2 UNO: wild always matches", uno_match("Wwild", "R5", "G"))
+        check("v2 UNO: non-matching card rejected",
+              not uno_match("B7", "R5", "G"))
+        check("v2 UNO: bot prefers a number card over a wild",
+              uno_bot_choice(["R5", "Wwild"], "R9", "R") == "R5")
+        check("v2 UNO: bot with no match draws",
+              uno_bot_choice(["B7"], "R5", "G") is None)
+        check("v2 UNO: bot wild colour is its most common colour",
+              uno_best_colour(["R5", "R7", "B3"]) == "R")
+        check("v2 UNO: value parsing",
+              uno_value("Gdraw2") == "draw2" and uno_value("Wwild") == "wild")
+
+        # --- Unit: Memory bot recall (seeded, statistical with wide margins) ---
+        import random as _random
+        _state = _random.getstate()  # restore after: the seed must not
+        _random.seed(1234)           # leak into later game draws
+        _easy = sum(memory_bot_correct("Easy", 4) for _ in range(200))
+        _hard = sum(memory_bot_correct("Hard", 4) for _ in range(200))
+        _random.setstate(_state)
+        check("v2 memory: Hard bots recall better than Easy bots at 4 digits",
+              _hard > _easy and 100 < _easy < 160 and _hard > 160,
+              f"easy={_easy}/200 hard={_hard}/200")
+
+        # --- Unit: Elimination pool filter ---
+        check("v2 elimination: pool is the four quick games at 4+ players",
+              [g for g in ELIM_POOL if GAMES[g]["min_players"] <= 4]
+              == ["reaction", "math", "trivia", "memory"])
+        check("v2 elimination: pool excludes Secret Word, President, UNO",
+              not any(g in ELIM_POOL for g in ("secret", "president", "uno")))
+        check("v2 elimination: Memory drops out of the pool below 2 players",
+              "memory" not in [g for g in ELIM_POOL
+                               if GAMES[g]["min_players"] <= 1])
+
+        # --- v2: Secret Word full game (2 humans + 2 bots) ---
+        hs = Client("secret-host"); await hs.connect()
+        await hs.send({"type": "create_room", "nickname": "SecretHost", "colour": "#e74c3c"})
+        js = await hs.wait_for("joined"); codes = js["code"]; hs_id = js["player_id"]
+        rs = Client("secret-p2"); await rs.connect()
+        await rs.send({"type": "join_room", "code": codes, "nickname": "SecretP2", "colour": "#3498db"})
+        jr = await rs.wait_for("joined"); rs_id = jr["player_id"]
+        await hs.send({"type": "add_bot"}); await hs.wait_lobby_count(3)
+        await hs.send({"type": "add_bot"}); await hs.wait_lobby_count(4)
+        await hs.send({"type": "update_settings", "game": "secret"})
+        await hs.wait_lobby()
+        await hs.send({"type": "start_game"})
+        started = await hs.wait_for("game_started", timeout=5)
+        check("v2 Secret Word starts", started["game"] == "secret")
+        my_word = await hs.wait_for("secret_word", timeout=5)
+        check("v2 Secret Word: host gets a private word or impostor notice",
+              (my_word["is_impostor"] and my_word["word"] is None)
+              or (not my_word["is_impostor"] and my_word["word"] in SECRET_WORDS),
+              str(my_word))
+
+        async def secret_driver(client, my_id, store):
+            while True:
+                msg = await wait_any(client, ("secret_clue_turn", "secret_vote_start"), timeout=45)
+                if msg["type"] == "secret_vote_start":
+                    target = next(p["player_id"] for p in msg["players"] if p["is_bot"])
+                    await client.send({"type": "secret_vote", "player_id": target})
+                    break
+                if msg["player_id"] == my_id:
+                    await client.send({"type": "secret_clue", "clue": "sweet"})
+            store["result"] = await client.wait_for("secret_result", timeout=40)
+
+        sstore = {}
+        await asyncio.wait_for(asyncio.gather(
+            secret_driver(hs, hs_id, sstore),
+            secret_driver(rs, rs_id, sstore)), timeout=120)
+        sres = sstore["result"]
+        check("v2 Secret Word: result names the word and 1-2 impostors",
+              sres.get("word") in SECRET_WORDS
+              and len(sres.get("impostors", [])) in (1, 2)
+              and len(sres.get("winners", [])) >= 1, str(sres))
+        check("v2 Secret Word: winners are consistent with the vote",
+              (sres["word_team_won"] and sres["eliminated"] in sres["impostors"])
+              or (not sres["word_team_won"] and sres["eliminated"] not in sres["impostors"]),
+              str(sres))
+        results = await hs.wait_for("results", timeout=10)
+        check("v2 Secret Word produces results for all 4 players",
+              len(results["rankings"]) == 4 and results["game"] == "secret",
+              str([(r["nickname"], r["score"]) for r in results["rankings"]]))
+        await hs.close(); await rs.close()
+
+        # --- v2: President full game (2 humans + 2 bots) ---
+        hp = Client("pres-host"); await hp.connect()
+        await hp.send({"type": "create_room", "nickname": "PresHost", "colour": "#e74c3c"})
+        jp = await hp.wait_for("joined"); codep = jp["code"]; hp_id = jp["player_id"]
+        rp = Client("pres-p2"); await rp.connect()
+        await rp.send({"type": "join_room", "code": codep, "nickname": "PresP2", "colour": "#3498db"})
+        jr = await rp.wait_for("joined"); rp_id = jr["player_id"]
+        await hp.send({"type": "add_bot"}); await hp.wait_lobby_count(3)
+        await hp.send({"type": "add_bot"}); await hp.wait_lobby_count(4)
+        await hp.send({"type": "update_settings", "game": "president",
+                       "game_settings": {"president": {"turn_seconds": 5}}})
+        await hp.wait_lobby()
+        await hp.send({"type": "start_game"})
+        started = await hp.wait_for("game_started", timeout=5)
+        check("v2 President starts", started["game"] == "president")
+
+        async def pres_driver(client, my_id):
+            # On my turn, lead with ALL cards of the lowest rank (sheds
+            # fast), or play the lowest legal set; otherwise pass.
+            while True:
+                msg = await wait_any(client, ("president_state", "results"), timeout=60)
+                if msg["type"] == "results":
+                    return msg
+                if msg["turn_id"] != my_id:
+                    continue
+                hand = msg["hand"]
+                trick = msg["trick"]
+                if trick is None:
+                    by_rank = {}
+                    for c in hand:
+                        by_rank.setdefault(pres_rank(c), []).append(c)
+                    play = by_rank[min(by_rank)]
+                else:
+                    play = president_lowest_legal(
+                        hand, {"size": trick["size"], "rank": trick["rank"]})
+                if play:
+                    await client.send({"type": "president_play", "cards": play})
+                else:
+                    await client.send({"type": "president_pass"})
+
+        pres_done = await asyncio.wait_for(asyncio.gather(
+            pres_driver(hp, hp_id), pres_driver(rp, rp_id)), timeout=300)
+        pres_res = pres_done[0]
+        check("v2 President produces results with a finish order of 4",
+              pres_res["game"] == "president" and len(pres_res["rankings"]) == 4,
+              str([(r["nickname"], r["score"]) for r in pres_res["rankings"]]))
+        check("v2 President: winner scores 1000, last scores 0",
+              pres_res["rankings"][0]["score"] == 1000
+              and pres_res["rankings"][-1]["score"] == 0,
+              str([(r["nickname"], r["score"]) for r in pres_res["rankings"]]))
+        await hp.close(); await rp.close()
+
+        # --- v2: UNO full game (2 humans + 1 bot) ---
+        hu = Client("uno-host"); await hu.connect()
+        await hu.send({"type": "create_room", "nickname": "UnoHost", "colour": "#e74c3c"})
+        ju = await hu.wait_for("joined"); codeu = ju["code"]; hu_id = ju["player_id"]
+        ru = Client("uno-p2"); await ru.connect()
+        await ru.send({"type": "join_room", "code": codeu, "nickname": "UnoP2", "colour": "#3498db"})
+        jr = await ru.wait_for("joined"); ru_id = jr["player_id"]
+        await hu.send({"type": "add_bot"}); await hu.wait_lobby_count(3)
+        await hu.send({"type": "update_settings", "game": "uno",
+                       "game_settings": {"uno": {"turn_seconds": 5}}})
+        await hu.wait_lobby()
+        await hu.send({"type": "start_game"})
+        started = await hu.wait_for("game_started", timeout=5)
+        check("v2 UNO starts", started["game"] == "uno")
+
+        async def uno_driver(client, my_id):
+            while True:
+                msg = await wait_any(client, ("uno_state", "results"), timeout=60)
+                if msg["type"] == "results":
+                    return msg
+                if msg["turn_id"] != my_id:
+                    continue
+                if msg.get("drawn"):
+                    drawn = msg["drawn"]
+                    if uno_match(drawn, msg["top"], msg["current_colour"]):
+                        await client.send({"type": "uno_play", "card": drawn,
+                                           "colour": "R" if drawn.startswith("W") else None})
+                    else:
+                        await client.send({"type": "uno_end_turn"})
+                    continue
+                card = uno_bot_choice(msg["hand"], msg["top"], msg["current_colour"])
+                if card:
+                    await client.send({"type": "uno_play", "card": card,
+                                       "colour": "R" if card.startswith("W") else None})
+                else:
+                    await client.send({"type": "uno_draw"})
+
+        uno_done = await asyncio.wait_for(asyncio.gather(
+            uno_driver(hu, hu_id), uno_driver(ru, ru_id)), timeout=300)
+        uno_res = uno_done[0]
+        check("v2 UNO produces results: winner emptied their hand (+1000)",
+              uno_res["game"] == "uno" and uno_res["rankings"][0]["score"] == 1000
+              and uno_res["rankings"][0].get("cards_left") == 0,
+              str([(r["nickname"], r["score"], r.get("cards_left"))
+                   for r in uno_res["rankings"]]))
+        await hu.close(); await ru.close()
+
+        # --- v2: Memory game (3 humans; host answers right, others wrong) ---
+        hm = Client("mem-host"); await hm.connect()
+        await hm.send({"type": "create_room", "nickname": "MemHost", "colour": "#e74c3c"})
+        jm = await hm.wait_for("joined"); codem = jm["code"]
+        m2 = Client("mem-p2"); await m2.connect()
+        await m2.send({"type": "join_room", "code": codem, "nickname": "MemP2", "colour": "#3498db"})
+        await m2.wait_for("joined")
+        m3 = Client("mem-p3"); await m3.connect()
+        await m3.send({"type": "join_room", "code": codem, "nickname": "MemP3", "colour": "#2ecc71"})
+        await m3.wait_for("joined")
+        await hm.send({"type": "update_settings", "game": "memory",
+                       "game_settings": {"memory": {"memorize_seconds": 2, "recall_seconds": 5}}})
+        await hm.wait_lobby()
+        await hm.send({"type": "start_game"})
+        started = await hm.wait_for("game_started", timeout=5)
+        check("v2 Memory starts", started["game"] == "memory")
+
+        async def mem_driver(client, correct, rounds_seen=None):
+            number = None
+            while True:
+                msg = await wait_any(client, ("memory_show", "memory_recall",
+                                              "memory_round_result", "results"),
+                                     timeout=30)
+                if msg["type"] == "memory_show":
+                    number = msg["number"]
+                    check(f"v2 Memory: round {msg['round']} number has {msg['digits']} digits",
+                          len(str(msg["number"])) == msg["digits"], str(msg))
+                elif msg["type"] == "memory_recall":
+                    await client.send({"type": "memory_answer",
+                                       "answer": number if correct else "0000"})
+                elif msg["type"] == "memory_round_result":
+                    if rounds_seen is not None:
+                        rounds_seen.append(msg)
+                elif msg["type"] == "results":
+                    return msg
+
+        mem_done = await asyncio.wait_for(asyncio.gather(
+            mem_driver(hm, True), mem_driver(m2, False), mem_driver(m3, False)),
+            timeout=120)
+        mem_res = mem_done[0]
+        check("v2 Memory: host wins by answering right, others score 0",
+              mem_res["game"] == "memory"
+              and mem_res["rankings"][0]["nickname"] == "MemHost"
+              and mem_res["rankings"][0]["score"] == 1000
+              and all(r["score"] == 0 for r in mem_res["rankings"][1:]),
+              str([(r["nickname"], r["score"]) for r in mem_res["rankings"]]))
+        await hm.close(); await m2.close(); await m3.close()
+
+        # --- v2: Memory tie-redo (2 humans; both wrong, then host right) ---
+        ht = Client("tie-host"); await ht.connect()
+        await ht.send({"type": "create_room", "nickname": "TieHost", "colour": "#e74c3c"})
+        jt = await ht.wait_for("joined"); codet = jt["code"]
+        rt = Client("tie-p2"); await rt.connect()
+        await rt.send({"type": "join_room", "code": codet, "nickname": "TieP2", "colour": "#3498db"})
+        await rt.wait_for("joined")
+        await ht.send({"type": "update_settings", "game": "memory",
+                       "game_settings": {"memory": {"memorize_seconds": 2, "recall_seconds": 5}}})
+        await ht.wait_lobby()
+        await ht.send({"type": "start_game"})
+        await ht.wait_for("game_started", timeout=5)
+
+        async def mem_tie_driver(client, plan, rounds_seen=None):
+            # plan: one boolean per memory_show seen (wrong, then right).
+            shows = 0
+            number = None
+            while True:
+                msg = await wait_any(client, ("memory_show", "memory_recall",
+                                              "memory_round_result", "results"),
+                                     timeout=30)
+                if msg["type"] == "memory_show":
+                    number = msg["number"]
+                    shows += 1
+                elif msg["type"] == "memory_recall":
+                    ok = plan[min(shows - 1, len(plan) - 1)]
+                    await client.send({"type": "memory_answer",
+                                       "answer": number if ok else "0000"})
+                elif msg["type"] == "memory_round_result":
+                    if rounds_seen is not None:
+                        rounds_seen.append(msg)
+                elif msg["type"] == "results":
+                    return msg
+
+        tie_rounds = []
+        tie_done = await asyncio.wait_for(asyncio.gather(
+            mem_tie_driver(ht, [False, True], tie_rounds),
+            mem_tie_driver(rt, [False, False])), timeout=120)
+        tie_res = tie_done[0]
+        check("v2 Memory tie: first round eliminates everyone (a tie)",
+              len(tie_rounds) >= 2 and len(tie_rounds[0]["survivors"]) == 0,
+              str(tie_rounds))
+        check("v2 Memory tie: redo is the same digit length (4)",
+              tie_rounds[1]["digits"] == tie_rounds[0]["digits"] == 4,
+              str([(r["round"], r["digits"]) for r in tie_rounds]))
+        check("v2 Memory tie: host wins after the redo",
+              tie_res["rankings"][0]["nickname"] == "TieHost"
+              and tie_res["rankings"][0]["score"] == 1000,
+              str([(r["nickname"], r["score"]) for r in tie_res["rankings"]]))
+        await ht.close(); await rt.close()
+
+        # --- v2: Elimination series end-to-end (2 humans + 2 bots) ---
+        he = Client("elim-host"); await he.connect()
+        await he.send({"type": "create_room", "nickname": "ElimHost", "colour": "#e74c3c"})
+        je = await he.wait_for("joined"); codee = je["code"]; he_id = je["player_id"]
+        re_ = Client("elim-p2"); await re_.connect()
+        await re_.send({"type": "join_room", "code": codee, "nickname": "ElimP2", "colour": "#3498db"})
+        jr = await re_.wait_for("joined"); re_id = jr["player_id"]
+        await he.send({"type": "add_bot"}); await he.wait_lobby_count(3)
+        await he.send({"type": "add_bot"}); await he.wait_lobby_count(4)
+        await he.send({"type": "update_settings", "game": "elimination"})
+        await he.wait_lobby()
+        elim_state = {"results": [], "eliminated": [], "challenges": [],
+                      "lobby": False}
+
+        async def elim_driver(client, my_id):
+            number = None
+            my_end_votes = 0
+            while True:
+                msg = await wait_any(client, (
+                    "question", "reaction_wait", "reaction_go",
+                    "memory_show", "memory_recall",
+                    "elimination_challenge", "elimination_eliminated",
+                    "results", "elimination_end_vote", "lobby"), timeout=90)
+                t = msg["type"]
+                if t == "question":
+                    if msg.get("options"):
+                        await client.send({"type": "answer", "answer": 0,
+                                           "index": msg["index"]})
+                    else:
+                        ans = solve_math(msg["text"])
+                        await client.send({"type": "answer", "answer": str(ans),
+                                           "index": msg["index"]})
+                elif t == "reaction_go":
+                    await client.send({"type": "reaction_click"})
+                elif t == "memory_show":
+                    number = msg["number"]
+                elif t == "memory_recall":
+                    await client.send({"type": "memory_answer",
+                                       "answer": number or "0000"})
+                elif t == "elimination_challenge":
+                    elim_state["challenges"].append(
+                        (msg["game"], msg.get("finale", False)))
+                elif t == "elimination_eliminated":
+                    elim_state["eliminated"].append(msg["nickname"])
+                elif t == "results":
+                    elim_state["results"].append(msg)
+                elif t == "elimination_end_vote":
+                    # First end vote -> Play Again (new series);
+                    # second end vote -> Return to Lobby.
+                    my_end_votes += 1
+                    choice = "again" if my_end_votes == 1 else "lobby"
+                    await client.send({"type": "elimination_vote",
+                                       "choice": choice})
+                elif t == "lobby":
+                    if msg["room"]["phase"] == "lobby" and elim_state["results"]:
+                        elim_state["lobby"] = True
+                        return
+
+        ed1 = asyncio.create_task(elim_driver(he, he_id))
+        ed2 = asyncio.create_task(elim_driver(re_, re_id))
+        await he.send({"type": "start_game"})
+        deadline = time.monotonic() + 300
+        while time.monotonic() < deadline and not elim_state["lobby"]:
+            await asyncio.sleep(1)
+        check("v2 Elimination: two series ran (Play Again, then Lobby)",
+              len(elim_state["results"]) == 2,
+              f"results={len(elim_state['results'])} challenges={elim_state['challenges']}")
+        check("v2 Elimination: challenges came from the quick-game pool",
+              all(g in ("reaction", "math", "trivia", "memory")
+                  for g, _ in elim_state["challenges"])
+              and any(f for _, f in elim_state["challenges"]),
+              str(elim_state["challenges"]))
+        check("v2 Elimination: players were eliminated down to the finale",
+              len(elim_state["eliminated"]) >= 2,
+              str(elim_state["eliminated"]))
+        first = elim_state["results"][0]
+        check("v2 Elimination: finishing order lists every player once",
+              first["game"] == "elimination"
+              and len(first.get("finishing_order", [])) == 4
+              and len({r["player_id"] for r in first["finishing_order"]}) == 4
+              and first["finishing_order"][0]["player_id"] == first["victor"],
+              str(first.get("finishing_order")))
+        check("v2 Elimination: victor scores 1000, 2nd 500, 3rd 250",
+              first["finishing_order"][0]["score"] == 1000
+              and first["finishing_order"][1]["score"] == 500
+              and first["finishing_order"][2]["score"] == 250,
+              str([(r["nickname"], r["score"]) for r in first["finishing_order"]]))
+        check("v2 Elimination: series ends back in the lobby",
+              elim_state["lobby"])
+        await asyncio.wait_for(asyncio.gather(ed1, ed2), timeout=30)
+        await he.close(); await re_.close()
 
         await host.close(); await p2b.close(); await p2.close()
         print(f"\nALL CHECKS PASSED: {sum(PASS)}/{len(PASS)}")
