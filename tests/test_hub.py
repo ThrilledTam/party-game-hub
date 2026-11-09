@@ -24,7 +24,7 @@ import websockets
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from questions import QUESTIONS  # noqa: E402
-from server import make_math_question, record_answer, Room, Player  # noqa: E402
+from server import make_math_question, record_answer, Room, Player, team_standings  # noqa: E402
 from fractions import Fraction  # noqa: E402
 
 PORT = 8001
@@ -156,6 +156,11 @@ async def main():
           f"{len(QUESTIONS)} questions")
 
     # --- start the server ---
+    # v1.2: short disconnect/room graces so the stale-nickname and
+    # room-deletion tests finish in seconds, not minutes.
+    import os
+    os.environ["PARTY_GRACE_SECONDS"] = "3"
+    os.environ["PARTY_ROOM_GRACE_SECONDS"] = "6"
     proc = subprocess.Popen(
         [str(ROOT / ".venv" / "bin" / "uvicorn"), "server:app",
          "--host", "127.0.0.1", "--port", str(PORT)],
@@ -270,8 +275,8 @@ async def main():
                   str(res["points"]))
             if q < 5:
                 vb = await host.wait_for("vote_break", timeout=10)
-                check(f"math Q{q} vote break shown, needs half",
-                      vb["votes_needed"] == 2, str(vb))
+                check(f"math Q{q} vote break shown, needs half of HUMANS only",
+                      vb["votes_needed"] == 1, str(vb))
                 await host.send({"type": "vote_next", "index": q})
                 await p2.send({"type": "vote_next", "index": q})
         results = await host.wait_for("results", timeout=10)
@@ -303,8 +308,8 @@ async def main():
                   res["correct_answer"] in (0, 1, 2, 3))
             if q < 5:
                 vb = await host.wait_for("vote_break", timeout=10)
-                check(f"trivia Q{q} vote break shown",
-                      vb["votes_needed"] == 2, str(vb))
+                check(f"trivia Q{q} vote break shown (humans only)",
+                      vb["votes_needed"] == 1, str(vb))
                 await host.send({"type": "vote_next", "index": q})
                 await p2.send({"type": "vote_next", "index": q})
         results = await host.wait_for("results", timeout=10)
@@ -358,6 +363,10 @@ async def main():
         check("stale answer ignored, real answer still scores",
               any(p["points"] > 0 for p in res["points"]),
               str(res["points"]))
+        # v1.2: bots no longer auto-vote, so a human must vote NEXT
+        # to leave the break (1 of 2 humans is enough).
+        await host.wait_for("vote_break", timeout=10)
+        await host.send({"type": "vote_next", "index": 1})
         # Q2: an answer tagged with Q1's index must also be ignored.
         msg2 = await host.wait_for("question", timeout=15)
         ans2 = solve_math(msg2["text"])
@@ -561,6 +570,281 @@ async def main():
         results = await h4.wait_for("results", timeout=10)
         check("Fix1 disconnect game produces results", len(results["rankings"]) == 2)
         await h4.close(); await r4b.close()
+
+        # ================= v1.2 tests =================
+        # --- Fix 5: colour uniqueness on every path ---
+        # Join with a colour the host already uses is rejected.
+        copy = Client("colour-copy"); await copy.connect()
+        await copy.send({"type": "join_room", "code": code,
+                         "nickname": "CopyCat", "colour": "#e74c3c"})
+        err = await copy.wait_for("error", timeout=5)
+        check("v1.2 join with a taken colour is rejected",
+              "already taken" in err["message"], err["message"])
+        await copy.close()
+        # update_profile with a taken colour is rejected.
+        await p2b.send({"type": "update_profile", "colour": "#e74c3c"})
+        err = await p2b.wait_for("error", timeout=5)
+        check("v1.2 profile edit with a taken colour is rejected",
+              "already taken" in err["message"], err["message"])
+        # update_bot with a taken colour is rejected, bot keeps its colour.
+        # (Force a fresh lobby broadcast first — the host's queue was
+        # drained by earlier checks and no new one has been sent.)
+        await host.send({"type": "update_settings", "room_name": "Test Room"})
+        lobby = await host.wait_lobby_count(4)
+        bots = [p for p in lobby["room"]["players"] if p["is_bot"]]
+        bot0_colour = bots[0]["colour"]
+        await host.send({"type": "update_bot", "bot_id": bots[0]["id"],
+                         "colour": "#e74c3c"})
+        err = await host.wait_for("error", timeout=5)
+        check("v1.2 bot edit with a taken colour is rejected",
+              "already taken" in err["message"], err["message"])
+        # Add BOT auto-picks a colour nobody uses.
+        used_before = {p["colour"] for p in lobby["room"]["players"]}
+        await host.send({"type": "add_bot"})
+        lobby = await host.wait_lobby_count(5)
+        new_bots = [p for p in lobby["room"]["players"]
+                    if p["is_bot"] and p["colour"] not in used_before]
+        check("v1.2 Add BOT auto-picks an unused colour",
+              len(new_bots) == 1, str([p["colour"] for p in lobby["room"]["players"]]))
+
+        # --- Fix 1: stale nickname is freed after the grace period ---
+        temp = Client("temp"); await temp.connect()
+        await temp.send({"type": "join_room", "code": code,
+                         "nickname": "Temp", "colour": "#95a5a6"})
+        await temp.wait_for("joined")
+        await host.wait_lobby_count(6)
+        await temp.close()
+        # Grace is 3s in this test run; after it, Temp must be gone
+        # and the nickname free again (the v1.1 bug: it stayed taken
+        # for minutes when the disconnect happened after a game).
+        await asyncio.sleep(4.5)
+        lobby = await host.wait_lobby_count(5)
+        check("v1.2 disconnected player is removed after the grace",
+              "Temp" not in [p["nickname"] for p in lobby["room"]["players"]],
+              str([p["nickname"] for p in lobby["room"]["players"]]))
+        temp2 = Client("temp2"); await temp2.connect()
+        await temp2.send({"type": "join_room", "code": code,
+                          "nickname": "Temp", "colour": "#95a5a6"})
+        rej2 = await temp2.wait_for("joined", timeout=5)
+        check("v1.2 nickname is free again after the grace",
+              rej2["player_id"] is not None)
+        await host.wait_lobby_count(6)
+
+        # --- Fix 1: host kick ---
+        kickme = Client("kickme"); await kickme.connect()
+        await kickme.send({"type": "join_room", "code": code,
+                           "nickname": "KickMe", "colour": "#34495e"})
+        km_joined = await kickme.wait_for("joined")
+        # The joined message already carries the new player's id —
+        # no need to wait on a lobby broadcast for it.
+        await host.send({"type": "kick_player",
+                         "player_id": km_joined["player_id"]})
+        kicked = await kickme.wait_for("kicked", timeout=5)
+        check("v1.2 kicked player is told they were kicked",
+              "kicked" in kicked["message"], kicked["message"])
+        # Verify with a fresh HTTP read (lobby broadcasts in the
+        # queue may be stale from before the kick).
+        await asyncio.sleep(0.5)
+        async with httpx.AsyncClient(trust_env=False) as http:
+            r = await http.get(f"{BASE}/api/rooms/{code}")
+        names = [p["nickname"] for p in r.json()["room"]["players"]]
+        check("v1.2 kicked player leaves the lobby",
+              "KickMe" not in names and len(names) == 6, str(names))
+        await temp2.close(); await kickme.close()
+
+        # --- Fix 1: room survives the host disconnecting (new host promoted) ---
+        h5 = Client("fix1b-host"); await h5.connect()
+        await h5.send({"type": "create_room", "nickname": "Fix1bHost", "colour": "#e74c3c"})
+        j5 = await h5.wait_for("joined"); code5 = j5["code"]
+        r5 = Client("fix1b-p2"); await r5.connect()
+        await r5.send({"type": "join_room", "code": code5, "nickname": "Fix1bP2", "colour": "#3498db"})
+        await r5.wait_for("joined")
+        await h5.close()  # host drops out of the lobby
+        promoted = False
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            lb = await r5.wait_for("lobby", timeout=deadline - time.monotonic())
+            me5 = [p for p in lb["room"]["players"] if p["nickname"] == "Fix1bP2"]
+            if me5 and me5[0]["is_host"]:
+                promoted = True
+                break
+        check("v1.2 room survives host disconnect, another human is promoted",
+              promoted)
+        async with httpx.AsyncClient(trust_env=False) as http:
+            r = await http.get(f"{BASE}/api/rooms/{code5}")
+        check("v1.2 room still exists after host disconnect",
+              r.json().get("exists") is True)
+        await r5.close()
+
+        # --- Fix 1: a room with no humans left is held, then deleted ---
+        h6 = Client("fix1c-host"); await h6.connect()
+        await h6.send({"type": "create_room", "nickname": "Fix1cHost", "colour": "#e74c3c"})
+        j6 = await h6.wait_for("joined"); code6 = j6["code"]
+        await h6.close()
+        await asyncio.sleep(1)
+        async with httpx.AsyncClient(trust_env=False) as http:
+            r = await http.get(f"{BASE}/api/rooms/{code6}")
+        check("v1.2 empty room is still there during the grace",
+              r.json().get("exists") is True)
+        await asyncio.sleep(9)  # 3s player grace + 6s room grace
+        async with httpx.AsyncClient(trust_env=False) as http:
+            r = await http.get(f"{BASE}/api/rooms/{code6}")
+        check("v1.2 empty room is deleted after the grace",
+              r.json().get("exists") is False)
+
+        # --- Fix 2 + Fix 3: bots out of the vote, host skip ---
+        h7 = Client("fix23-host"); await h7.connect()
+        await h7.send({"type": "create_room", "nickname": "Fix23Host", "colour": "#e74c3c"})
+        j7 = await h7.wait_for("joined"); code7 = j7["code"]
+        r7 = Client("fix23-p2"); await r7.connect()
+        await r7.send({"type": "join_room", "code": code7, "nickname": "Fix23P2", "colour": "#3498db"})
+        await r7.wait_for("joined")
+        await h7.send({"type": "add_bot"})
+        await h7.wait_lobby_count(3)
+        await h7.send({"type": "update_settings", "game": "math",
+                       "game_settings": {"math": {"difficulty": "Easy", "questions": 3,
+                                                  "time_per_question": 5, "vote_timeout": 8}}})
+        await h7.wait_lobby()
+        await h7.send({"type": "start_game"})
+        await h7.wait_for("game_started")
+        m7 = await h7.wait_for("question", timeout=15)
+        a7 = solve_math(m7["text"])
+        await h7.send({"type": "answer", "answer": str(a7), "index": m7["index"]})
+        await r7.send({"type": "answer", "answer": str(a7 + 1), "index": m7["index"]})
+        await h7.wait_for("question_result", timeout=10)
+        vb7 = await h7.wait_for("vote_break", timeout=10)
+        check("v1.2 vote threshold counts HUMANS only (2 humans + 1 bot -> 1)",
+              vb7["votes_needed"] == 1 and vb7["votes"] == 0, str(vb7))
+        # The bot must not auto-vote: no vote_update for 4.5s.
+        try:
+            await h7.wait_for("vote_update", timeout=4.5)
+            check("v1.2 bot does not vote in the NEXT vote", False,
+                  "a vote_update arrived with no human voting")
+        except AssertionError:
+            check("v1.2 bot does not vote in the NEXT vote", True)
+        # Host alone voting (1 of 2 humans) advances.
+        await h7.send({"type": "vote_next", "index": 1})
+        m7b = await h7.wait_for("question", timeout=10)
+        check("v1.2 one human vote advances (bot excluded)",
+              m7b["index"] == 2)
+        # Q2: host skip advances with ZERO votes.
+        a7b = solve_math(m7b["text"])
+        await h7.send({"type": "answer", "answer": str(a7b), "index": 2})
+        await r7.send({"type": "answer", "answer": str(a7b + 1), "index": 2})
+        await h7.wait_for("question_result", timeout=10)
+        await h7.wait_for("vote_break", timeout=10)
+        t0 = time.monotonic()
+        await h7.send({"type": "host_skip"})
+        m7c = await h7.wait_for("question", timeout=5)
+        check("v1.2 host skip advances immediately with no votes",
+              m7c["index"] == 3 and time.monotonic() - t0 < 3,
+              f"index={m7c['index']} elapsed={time.monotonic()-t0:.1f}s")
+        a7c = solve_math(m7c["text"])
+        await h7.send({"type": "answer", "answer": str(a7c), "index": 3})
+        await r7.send({"type": "answer", "answer": str(a7c + 1), "index": 3})
+        results = await h7.wait_for("results", timeout=10)
+        check("v1.2 vote/skip game produces results",
+              len(results["rankings"]) == 3)
+        await h7.close(); await r7.close()
+
+        # --- Fix 5: Teams mode (unit + integration) ---
+        # Team average: members scoring 100 and 300 -> team 200;
+        # an Alone player is their own team with their own score.
+        room_t = Room(code="TEAM01", mode="teams", team_count=2)
+        pa = Player(id="ta", nickname="A", colour="#e74c3c", score=100)
+        pb = Player(id="tb", nickname="B", colour="#3498db", score=300)
+        pc = Player(id="tc", nickname="C", colour="#2ecc71", score=50)
+        room_t.players = [pa, pb, pc]
+        room_t.teams = {"ta": 0, "tb": 0, "tc": None}
+        st = team_standings(room_t)
+        team0 = [s for s in st if s["team"] == 0][0]
+        alone = [s for s in st if s["team"] is None][0]
+        check("v1.2 team score is the average of its members",
+              team0["average"] == 200.0, f"average={team0['average']}")
+        check("v1.2 Alone player is their own team with their own score",
+              alone["average"] == 50.0 and alone["members"][0]["nickname"] == "C")
+        check("v1.2 FFA mode has no team standings",
+              team_standings(Room(code="FFA01", mode="ffa")) == [])
+
+        h8 = Client("teams-host"); await h8.connect()
+        await h8.send({"type": "create_room", "nickname": "TeamsHost", "colour": "#e74c3c"})
+        j8 = await h8.wait_for("joined"); code8 = j8["code"]
+        r8 = Client("teams-p2"); await r8.connect()
+        await r8.send({"type": "join_room", "code": code8, "nickname": "TeamsP2", "colour": "#3498db"})
+        await r8.wait_for("joined")
+        await h8.send({"type": "add_bot"})
+        await h8.wait_lobby_count(3)
+        await h8.send({"type": "add_bot"})
+        await h8.wait_lobby_count(4)
+        # Team count cannot exceed the player count.
+        await h8.send({"type": "update_settings", "mode": "teams", "team_count": 4})
+        await h8.wait_lobby()
+        # Start with no assignments -> every team empty -> rejected.
+        await h8.send({"type": "start_game"})
+        err = await h8.wait_for("error", timeout=5)
+        check("v1.2 Teams start is rejected when teams are empty",
+              "every team" in err["message"], err["message"])
+        # Randomize: everyone assigned, every team has >= 1 member.
+        await h8.send({"type": "randomize_teams"})
+        lobby = await h8.wait_lobby_count(4)
+        assigned = {p["team"] for p in lobby["room"]["players"]}
+        check("v1.2 randomize assigns every player to a team",
+              None not in assigned and assigned == {0, 1, 2, 3},
+              str([(p["nickname"], p["team"]) for p in lobby["room"]["players"]]))
+        # Manual assignment + Alone: put one bot Alone. (Reuse the
+        # lobby from the randomize check — no new broadcast has been
+        # sent since, so waiting for another one would time out.)
+        bot8 = [p for p in lobby["room"]["players"] if p["is_bot"]][0]
+        await h8.send({"type": "assign_team", "player_id": bot8["id"], "team": None})
+        await h8.wait_lobby()
+        # Play a short Teams game: results must carry team standings
+        # AND individual rankings.
+        await h8.send({"type": "update_settings", "mode": "teams", "team_count": 2,
+                       "game": "math",
+                       "game_settings": {"math": {"difficulty": "Easy", "questions": 2,
+                                                  "time_per_question": 5, "vote_timeout": 3}}})
+        await h8.wait_lobby()
+        await h8.send({"type": "randomize_teams"})
+        await h8.wait_lobby()
+        await h8.send({"type": "start_game"})
+        started = await h8.wait_for("game_started", timeout=5)
+        check("v1.2 Teams game starts after randomize",
+              started["game"] == "math" and started.get("party_mode") == "teams")
+        for qi in (1, 2):
+            mq = await h8.wait_for("question", timeout=15)
+            aq = solve_math(mq["text"])
+            await h8.send({"type": "answer", "answer": str(aq), "index": mq["index"]})
+            await r8.send({"type": "answer", "answer": str(aq + 1), "index": mq["index"]})
+            await h8.wait_for("question_result", timeout=10)
+            if qi == 1:
+                await h8.wait_for("vote_break", timeout=10)
+                await h8.send({"type": "vote_next", "index": 1})
+        results = await h8.wait_for("results", timeout=10)
+        check("v1.2 Teams results include team standings and individuals",
+              results.get("mode") == "teams" and len(results.get("teams", [])) == 2
+              and len(results["rankings"]) == 4,
+              str(results.get("teams")))
+        team_avgs = {t["team"]: t["average"] for t in results["teams"]}
+        members = {}
+        for t in results["teams"]:
+            members[t["team"]] = [m["nickname"] for m in t["members"]]
+        ok_avg = all(
+            abs(team_avgs[t] - round(sum(
+                next(r["score"] for r in results["rankings"]
+                     if r["nickname"] == n) for n in members[t]) / len(members[t]), 1)) < 0.01
+            for t in team_avgs)
+        check("v1.2 Teams results averages match member scores", ok_avg,
+              str(results["teams"]))
+        await h8.close(); await r8.close()
+
+        # --- Fix 4: customization boxes are compact (~1/3 width) ---
+        html = (ROOT / "static" / "index.html").read_text()
+        check("v1.2 lobby profile box uses the compact class",
+              'class="card compact"' in html)
+        check("v1.2 compact CSS caps width near one third (~210px)",
+              "max-width: 210px" in html and ".compact .swatch" in html)
+        check("v1.2 bot edit panel uses the compact class",
+              'id="botEdit" class="card compact hidden"' in html)
 
         await host.close(); await p2b.close(); await p2.close()
         print(f"\nALL CHECKS PASSED: {sum(PASS)}/{len(PASS)}")
