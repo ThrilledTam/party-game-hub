@@ -136,14 +136,14 @@ DIFFICULTIES = ["Easy", "Medium", "Hard"]
 # reaction: (min_ms, max_ms) simulated reaction time; false_start_chance.
 # quiz:    (min_delay_s, max_delay_s, accuracy) for Math/Trivia answers.
 BOT_REACTION = {
-    "Easy":   {"ms": (380, 600), "false_start": 0.15},
-    "Medium": {"ms": (250, 380), "false_start": 0.05},
-    "Hard":   {"ms": (180, 280), "false_start": 0.0},
+    "Easy":   {"ms": (390, 590), "false_start": 0.15}, # Matthew changed (380, 600) reaction to (390, 590) reaction.
+    "Medium": {"ms": (375, 530), "false_start": 0.05}, # Matthew changed (250, 380) reaction to (375, 530) reaction.
+    "Hard":   {"ms": (320, 430), "false_start": 0.0}, # Matthew changed (180, 280) reaction to (320, 430) reaction.
 }
 BOT_QUIZ = {
-    "Easy":   {"delay": (3.0, 8.0), "accuracy": 0.55},
-    "Medium": {"delay": (2.0, 5.0), "accuracy": 0.75},
-    "Hard":   {"delay": (1.0, 3.0), "accuracy": 0.92},
+    "Easy":   {"delay": (4.0, 8.0), "accuracy": 0.55}, # Matthew changed (3.0, 8.0) delay to (4.0, 8.0) delay.
+    "Medium": {"delay": (3.0, 6.0), "accuracy": 0.75}, # Matthew changed (2.0, 5.0) delay to (3.0, 6.0) delay.
+    "Hard":   {"delay": (2.0, 4.0), "accuracy": 0.92}, # Matthew changed (1.0, 3.0) delay to (2.0, 4.0) delay.
 }
 
 VOTE_TIMEOUT_DEFAULT = 60  # seconds to wait for NEXT votes after a question
