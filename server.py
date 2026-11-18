@@ -128,8 +128,8 @@ PALETTE = [
     "#95a5a6",  # grey
     "#34495e",  # dark blue
 ]
-BOT_NAMES = ["Bot Bob", "Bot Bella", "Bot Max", "Bot Mia", "Bot Leo",
-             "Bot Zoe", "Bot Sam", "Bot Ivy"]
+BOT_NAMES = ["Bot #1", "Bot #2", "Bot #3", "Bot #4", "Bot #5",
+             "Bot #6", "Bot #7", "Bot #8"] # Matthew changed bot names to bot numbers.
 DIFFICULTIES = ["Easy", "Medium", "Hard"]
 
 # Bot behaviour per difficulty.
