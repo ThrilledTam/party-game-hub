@@ -71,9 +71,39 @@
   .uno-card { width: 52px; height: 72px; border-radius: 8px; font-weight: 800; font-size: 1.1rem; color: #fff; border: 2px solid #fff3; padding: 0; }
   .uno-card.sel { border-color: #f1c40f; transform: translateY(-4px); }
   .uno-card.wild { background: #333; }
-  #memoryNumber { font-size: 3rem; font-weight: 800; letter-spacing: .3em; text-align: center; padding: 20px 0; }
   #elimBanner { background: #6c3483; border-radius: 8px; padding: 10px; margin-bottom: 12px; text-align: center; font-weight: 700; }
   .elim-out { opacity: .45; text-decoration: line-through; }
+  /* v2.2 lobby: player CARDS in a grid (2 cols on phones, more on
+     desktop), each tinted/bordered with that player's colour. The
+     lobby is compact so it fits without scrolling on phones. */
+  #lobby { padding: 10px; }
+  #lobby h2 { margin: 4px 0; font-size: 1.25rem; }
+  #lobby h3 { margin: 10px 0 4px; font-size: 1rem; }
+  #lobby .code { font-size: 1.25rem; margin: 4px 0; }
+  @media (max-width: 480px){ .wrap { padding: 8px; } h1 { font-size: 1.4rem; margin: 4px 0; } .card { padding: 10px; } }
+  .player-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+  @media (min-width: 640px){ .player-grid { grid-template-columns: repeat(4, 1fr); } }
+  .player { flex-direction: column; align-items: stretch; gap: 4px; padding: 10px; border: 2px solid transparent; margin-bottom: 0; }
+  .pcard-top { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  #playerList .team-select { margin-left: 0; width: 100%; }
+  .card-edit { display: flex; flex-direction: column; gap: 6px; border-top: 1px solid #555; padding-top: 8px; margin-top: 4px; }
+  .card-edit input, .card-edit select, .card-edit button { padding: 7px; font-size: .9rem; margin-top: 0; }
+  .card-edit .swatch { width: 24px; height: 24px; border-width: 2px; }
+  .card-edit .palette { gap: 5px; }
+  /* v2.2: per-game settings collapse behind a <summary>; the whole
+     settings panel sits behind a host-only Settings button. */
+  details.gameSet { background: #1e1e2e; border-radius: 8px; padding: 8px 10px; margin-top: 8px; }
+  details.gameSet summary { cursor: pointer; font-weight: 700; }
+  details.gameSet label { margin: 8px 0 2px; }
+  #settingsPanel { background: #1e1e2e; border-radius: 8px; padding: 10px; margin-top: 8px; }
+  #settingsPanel label { margin: 8px 0 2px; }
+  .ord-row { display: flex; align-items: center; gap: 6px; padding: 4px 0; }
+  .ord-row span { flex: 1; }
+  .ord-btn { width: auto; padding: 4px 10px; margin-top: 0; font-size: .9rem; }
+  .champ-table { font-size: .85rem; }
+  .champ-table td, .champ-table th { padding: 5px; }
+  #memoryCanvas { display: block; margin: 0 auto; max-width: 100%; }
+  .role-badge { background: #8e44ad; color: #fff; font-size: .7rem; font-weight: 800; padding: 2px 6px; border-radius: 6px; }
 </style>
 </head>
 <body>
@@ -107,29 +137,14 @@
     <button id="copyLinkBtn" class="secondary">Copy invite link</button>
     <p id="copyMsg" class="ok"></p>
     <h3>Players (<span id="playerCount">0</span>/8)</h3>
-    <div id="playerList"></div>
-    <div class="card compact" style="background:#1e1e2e">
-      <h3>Edit my nickname / colour</h3>
-      <label>Nickname</label><input id="myNick" maxlength="20">
-      <label>Colour</label><div id="myPalette" class="palette"></div>
-      <button id="myProfileSaveBtn">Save my nickname / colour</button>
-      <p id="myProfileMsg" class="ok"></p>
-    </div>
-    <p class="muted" id="botHint">Host: tap a bot in the list to change its nickname, colour or difficulty — or remove it.</p>
-
-    <div id="botEdit" class="card compact hidden" style="background:#1e1e2e">
-      <h3>Edit bot</h3>
-      <label>Nickname</label><input id="botName" maxlength="20">
-      <label>Colour</label><div id="botPalette" class="palette"></div>
-      <label>Difficulty</label>
-      <select id="botDiff"><option>Easy</option><option>Medium</option><option>Hard</option></select>
-      <button id="botSaveBtn">Save bot</button>
-      <button id="botRemoveBtn" class="danger">Remove bot</button>
-      <button id="botCancelBtn" class="secondary">Cancel</button>
-    </div>
+    <div id="playerList" class="player-grid"></div>
+    <p class="muted" id="botHint">Host: tap a card to edit it (bots: nickname, colour, difficulty). Tap your own card to edit yourself.</p>
+    <p id="champCounter" class="muted hidden"></p>
+    <details id="champDetails" class="hidden"><summary>🏆 Championship history</summary><div id="champTable"></div></details>
 
     <div id="settings">
-      <h3>Settings</h3>
+      <button id="settingsBtn" class="secondary">⚙️ Settings</button>
+      <div id="settingsPanel" class="hidden">
       <div id="hostSettings">
         <label>Room name</label><input id="setRoomName" maxlength="40">
         <label>Max players</label>
@@ -154,14 +169,20 @@
         <div id="teamSettings" class="hidden">
           <label>Number of teams</label>
           <select id="setTeamCount"><option>2</option><option>3</option><option>4</option></select>
-          <p class="muted">Every team needs at least one player/bot. Anyone with no team is "Alone" — their own one-person team. Team score = the average of its members' scores.</p>
+          <p class="muted">Every team needs at least one player/bot. Anyone with no team is "Alone" — their own one-person team.</p>
+          <label>Team scoring</label>
+          <select id="setTeamScoring"><option value="average">Average</option><option value="sum">Sum</option><option value="best">Best member</option></select>
           <button id="randomTeamsBtn" class="secondary">🎲 Randomize teams</button>
         </div>
-        <div id="setReaction">
+        <label>Turn order</label>
+        <select id="setTurnOrderMode"><option value="random">Random each game</option><option value="manual">Manual (host sets the order)</option></select>
+        <div id="turnOrderEditor" class="hidden"><div id="turnOrderList"></div><p class="muted">Use ↑ ↓ to reorder. The first player in the order leads. Re-randomized every game when set to Random.</p></div>
+        <label><input type="checkbox" id="setChampionship" style="width:auto"> Championship mode — scores carry across games</label>
+        <details id="setReaction" class="gameSet"><summary>Reaction settings</summary>
           <label>Rounds</label>
           <select id="setReactionRounds"><option>3</option><option selected>5</option><option>10</option></select>
-        </div>
-        <div id="setMath" class="hidden">
+        </details>
+        <details id="setMath" class="gameSet hidden"><summary>Speed Math settings</summary>
           <label>Difficulty</label>
           <select id="setMathDiff"><option>Easy</option><option selected>Medium</option><option>Hard</option></select>
           <p class="muted" id="mathHelp">Medium: + − × ÷, multiplication up to 12×12.</p>
@@ -169,8 +190,8 @@
           <select id="setMathQ"><option>5</option><option selected>10</option><option>15</option></select>
           <label>Time per question</label>
           <select id="setMathTime"><option>10</option><option selected>15</option><option>20</option></select>
-        </div>
-        <div id="setTrivia" class="hidden">
+        </details>
+        <details id="setTrivia" class="gameSet hidden"><summary>Speed Trivia settings</summary>
           <label>Category</label>
           <select id="setTriviaCat"><option>Mixed</option><option>General</option><option>Science</option><option>Geography</option><option>History</option></select>
           <label>Difficulty</label>
@@ -179,25 +200,31 @@
           <select id="setTriviaQ"><option>5</option><option selected>10</option><option>15</option></select>
           <label>Time per question</label>
           <select id="setTriviaTime"><option>10</option><option selected>15</option><option>20</option></select>
-        </div>
-        <div id="setSecret" class="hidden">
-          <p class="muted">Secret Word: 1 impostor (4–5 players) or 2 (6–8). Everyone else sees the same secret word; the impostor must blend in. One clue each, then vote out the impostor — catch one and the word team wins.</p>
-        </div>
-        <div id="setPresident" class="hidden">
-          <p class="muted">President: shed all your cards first to become President. Play a set of the same rank that beats the trick, or pass. The 3 of clubs leads. Last player left is the Asshole.</p>
-        </div>
-        <div id="setUno" class="hidden">
+        </details>
+        <details id="setSecret" class="gameSet hidden"><summary>Secret Word options</summary>
+          <p class="muted">Secret Word: everyone gives one clue per round, then votes out the impostor. Citizens see the word; impostors only see the category. Catch all impostors to win; impostors win when only 2 citizens remain.</p>
+          <label>Impostors</label>
+          <select id="setSecretImpostors"><option value="1">1 impostor</option><option value="2">2 impostors (needs 5+ players)</option></select>
+        </details>
+        <details id="setPresident" class="gameSet hidden"><summary>President options</summary>
+          <p class="muted">President: shed all your cards first to become President. Play a set of the same rank that beats the trick, or pass. First in the turn order leads with any cards. Roles from the last match's finish order apply from match 2 onward.</p>
+        </details>
+        <details id="setUno" class="gameSet hidden"><summary>UNO house rules</summary>
           <p class="muted">UNO: match the top card by colour, number or symbol. Wilds let you pick the next colour. First to empty your hand wins.</p>
-        </div>
-        <div id="setMemory" class="hidden">
+          <label><input type="checkbox" id="setUnoDrawUntil" style="width:auto"> Draw until playable (a drawn playable card must be played)</label>
+          <label><input type="checkbox" id="setUnoStacking" style="width:auto"> +2 / +4 stacking (same type only)</label>
+          <label><input type="checkbox" id="setUnoMulti" style="width:auto"> Multi-card plays (same value, all effects trigger)</label>
+        </details>
+        <details id="setMemory" class="gameSet hidden"><summary>Memory settings</summary>
           <label>Memorize time (seconds)</label>
           <select id="setMemoryTime"><option>5</option><option selected>10</option><option>15</option><option>20</option><option>30</option></select>
           <p class="muted">Memory: memorize a 4-digit number, then type it back. Wrong and you're out! Survive and the number grows: 5 digits, 6, 7, 8… until one player remains. Recall time is 15 seconds.</p>
-        </div>
-        <div id="setElimination" class="hidden">
+        </details>
+        <details id="setElimination" class="gameSet hidden"><summary>Elimination options</summary>
           <p class="muted">Elimination: a series of quick challenges (Reaction, Speed Math, Speed Trivia, Memory). Last place in each challenge is eliminated, until 3 remain — then a finale crowns the victor. At the end, everyone votes Play Again or Return to Lobby.</p>
-        </div>
+        </details>
         <button id="addBotBtn">+ Add BOT</button>
+      </div>
       </div>
       <p id="settingsReadOnly" class="muted hidden">Only the host can change settings. Waiting for the host to start…</p>
       <p id="startHint" class="muted"></p>
@@ -230,18 +257,11 @@
       <p id="quizFeedback"></p>
       <div id="scoreboard"></div>
     </div>
-    <!-- v2: NEXT vote break — shared by quiz games AND Reaction Test -->
-    <div id="voteBox" class="hidden">
-      <h3 id="voteHeading">Take a breather — scores above ☝️</h3>
-      <div id="voteScores"></div>
-      <div id="voteTeams"></div>
-      <p id="voteCount" class="muted">0/0 voted NEXT</p>
-      <button id="nextBtn" class="green">NEXT QUESTION →</button>
-      <button id="hostSkipBtn" class="hostskip hidden">HOST: Skip to next question →</button>
-    </div>
     <div id="secretBox" class="hidden">
       <p id="secretPrivate" style="font-size:1.2rem;font-weight:800;text-align:center"></p>
       <p id="secretStatus" class="muted"></p>
+      <div id="secretLists" class="muted"></div>
+      <div id="secretRoundResults"></div>
       <div id="secretClueArea" class="hidden">
         <label>Your clue (one word — don't give the word away!)</label>
         <div class="row"><input id="secretClueInput" maxlength="20" placeholder="e.g. furry"><button id="secretClueBtn">Send clue</button></div>
@@ -259,16 +279,22 @@
       <p id="presTrick" class="muted"></p>
       <p id="presHint" class="pres-hint"></p>
       <p id="presNotice" class="muted"></p>
+      <div id="presRoles" class="muted"></div>
       <div id="presHand" class="hand"></div>
       <div class="row"><button id="presPlayBtn" class="green">Play Selected</button><button id="presPassBtn" class="secondary">Pass</button></div>
+      <div id="presExchange" class="hidden" style="background:#1e1e2e;border-radius:8px;padding:10px;margin-top:10px;text-align:center">
+        <p id="presExchangeText" style="font-weight:700"></p>
+        <button id="presExchangeBtn" class="green">Give selected cards</button>
+      </div>
       <div id="presCounts" class="muted"></div>
       <div id="presFinished"></div>
     </div>
     <div id="unoBox" class="hidden">
       <p id="unoTurn" style="font-weight:800"></p>
       <p>Top card: <b id="unoTop"></b> · Colour in play: <b id="unoColour"></b> <span id="unoDir" class="muted"></span></p>
+      <p id="unoPending" style="font-weight:800;color:#f1c40f"></p>
       <div id="unoHand" class="hand"></div>
-      <div class="row"><button id="unoDrawBtn">Draw a card</button><button id="unoEndTurnBtn" class="secondary hidden">Keep drawn card — end turn</button></div>
+      <div class="row"><button id="unoPlayBtn" class="green">Play selected</button><button id="unoDrawBtn">Draw a card</button><button id="unoEndTurnBtn" class="secondary hidden">Keep drawn card — end turn</button></div>
       <div id="unoColourPick" class="hidden">
         <label>Pick a colour for the Wild card</label>
         <div class="row">
@@ -283,13 +309,26 @@
     <div id="memoryBox" class="hidden">
       <p id="memoryStatus" style="font-weight:800;text-align:center"></p>
       <p class="timer" id="memoryTimer"></p>
-      <div id="memoryNumber"></div>
+      <canvas id="memoryCanvas" width="340" height="90"></canvas>
       <div id="memoryRecallBox" class="hidden">
         <label>Type the number back from memory</label>
         <div class="row"><input id="memoryAns" inputmode="numeric" placeholder="e.g. 4827"><button id="memorySubmit" class="green">Submit</button></div>
       </div>
       <div id="memoryElim"></div>
     </div>
+  </div>
+
+  <!-- v2: NEXT vote break — shared by quiz games, Reaction Test and the
+       end-of-game ready gate. It lives OUTSIDE #game so it can show on
+       the results screen too (phase "results"). -->
+  <div id="voteBox" class="card hidden">
+    <h3 id="voteHeading">Take a breather — scores above ☝️</h3>
+    <p id="voteLabel" class="muted"></p>
+    <div id="voteScores"></div>
+    <div id="voteTeams"></div>
+    <p id="voteCount" class="muted">0/0 voted NEXT</p>
+    <button id="nextBtn" class="green">NEXT QUESTION →</button>
+    <button id="hostSkipBtn" class="hostskip hidden">HOST: Skip to next question →</button>
   </div>
 
   <!-- RESULTS -->
@@ -305,16 +344,27 @@
         <button id="elimLobbyBtn" class="secondary">🚪 Return to Lobby</button>
       </div>
       <p class="muted">At least half the players must agree. If nobody decides in 60s, we go back to the lobby.</p>
+      <div class="row hidden" id="elimHostRow">
+        <button id="elimForceAgainBtn" class="hostskip">HOST: force Play Again</button>
+        <button id="elimForceLobbyBtn" class="hostskip">HOST: force Lobby</button>
+      </div>
     </div>
-    <div class="card compact" style="background:#1e1e2e">
-      <h3>Edit my nickname / colour</h3>
-      <label>Nickname</label><input id="myNick2" maxlength="20">
-      <label>Colour</label><div id="myPalette2" class="palette"></div>
-      <button id="myProfileSaveBtn2">Save my nickname / colour</button>
-      <p id="myProfileMsg2" class="ok"></p>
+    <p id="champCounterResults" class="muted hidden"></p>
+    <details id="champDetailsResults" class="hidden"><summary>🏆 Championship history</summary><div id="champTableResults"></div></details>
+    <div id="endChoice" class="hidden" style="background:#1e1e2e;border-radius:8px;padding:12px;margin-top:12px;text-align:center">
+      <h3>What next?</h3>
+      <div id="endChoiceStandings"></div>
+      <p id="replayVoteCount" class="muted"></p>
+      <div class="row">
+        <button id="replayAgainBtn" class="green">🔁 Play Again</button>
+        <button id="replayLobbyBtn" class="secondary">🚪 Return to Lobby</button>
+      </div>
+      <div class="row hidden" id="hostReplayRow">
+        <button id="hostReplayAgainBtn" class="hostskip">HOST: force Play Again</button>
+        <button id="hostReplayLobbyBtn" class="hostskip">HOST: force Lobby</button>
+      </div>
+      <p class="muted">At least half the players must agree. If nobody decides in 60s, we go back to the lobby.</p>
     </div>
-    <button id="againBtn" class="green">Play Again (same players)</button>
-    <button id="changeBtn" class="secondary">Back to Lobby / Change Game</button>
   </div>
 </div>
 
@@ -326,14 +376,17 @@ const TEAM_NAMES = ["Team 1","Team 2","Team 3","Team 4"];
 const TEAM_COLOURS = ["#e74c3c","#3498db","#2ecc71","#f1c40f"];
 const UNO_COLOUR_HEX = {R:"#e74c3c", G:"#27ae60", B:"#3498db", Y:"#f1c40f"};
 const UNO_COLOUR_NAMES = {R:"Red", G:"Green", B:"Blue", Y:"Yellow"};
-let ws=null, myId=null, room=null, myColour=PALETTE[4], editingBot=null, botColour=PALETTE[0];
+let ws=null, myId=null, room=null, myColour=PALETTE[4];
 let quizTimerInt=null, reactionClicked=false, quizAnswered=false, currentQIndex=null;
-let myProfileColour=PALETTE[4], votedNext=false, voteIndex=null;
+let votedNext=false, voteIndex=null;
 let heartbeatInt=null, reconnectAttempts=0, lastJoinMsg=null;
 let homeTakenColours = new Set(); // colours already used in the room being joined
 // v2 game state
-let presSelected=new Set(), unoSelected=null, unoPendingWild=null, memoryAnswered=false;
+let presSelected=new Set(), memoryAnswered=false;
 let elimVoted=false, memoryTimerInt=null;
+// v2.2 state
+let unoSelectedIdx=new Set(), unoHandCards=[], unoColourChoice=null, unoPlayPending=null;
+let expandedCardId=null, replayVoted=false, secretEliminated=false, presExchange=null;
 // ---- v2.1 President: client-side legality (mirrors the server rule) ----
 // A single higher card does NOT beat a pair — the set must match the
 // trick's size AND be a higher rank. The UI explains that instead of
@@ -378,6 +431,9 @@ function refreshPresUI(){
   hint.textContent = me ? presHintText() : (presTrick ? "Current trick: "+PRES_SIZE_WORDS[presTrick.size]+" of "+presRankName(presTrick.rank)+"s." : "New trick — the leader plays any set of the same rank.");
   hint.classList.toggle("bad", !!(me && sel.length && bad));
   $("presPlayBtn").disabled = !me || !sel.length || !!bad;
+  if(presExchange && presExchange.giver_id===myId){
+    $("presExchangeBtn").disabled = presSelected.size!==presExchange.count;
+  }
   [...$("presHand").children].forEach(b=>{
     const c=b.textContent;
     b.classList.toggle("playable", me && presPlayable(c));
@@ -413,7 +469,7 @@ function teamsValid(){
 }
 function teamStandingsHtml(teams){
   if(!teams || !teams.length) return "";
-  return "<h3>Team standings (average score)</h3><table>"+
+  return "<h3>Team standings</h3><table>"+
     teams.map(t=>"<tr><td><span class='team-badge' style='background:"+t.colour+"'>"+t.name+"</span></td><td>"+t.average+" pts</td><td class='muted'>"+
       t.members.map(m=>m.nickname).join(", ")+"</td></tr>").join("")+"</table>";
 }
@@ -438,9 +494,6 @@ async function refreshHomePalette(){
   buildPalette($("palette"), c=>myColour=c, myColour, homeTakenColours);
 }
 buildPalette($("palette"), c=>myColour=c, myColour);
-buildPalette($("botPalette"), c=>botColour=c, botColour);
-buildPalette($("myPalette"), c=>{myProfileColour=c;}, myProfileColour);
-buildPalette($("myPalette2"), c=>{myProfileColour=c;}, myProfileColour);
 
 function joinLink(code){return location.origin+"/?code="+code;}
 function setConnStatus(text){ const el=$("connStatus"); if(!text){el.classList.add("hidden");return;} el.textContent=text; el.classList.remove("hidden"); }
@@ -512,8 +565,6 @@ function handle(msg){
     room=null; $("homeErr").textContent=msg.message||"You were kicked from the room by the host.";
     show("home"); return; }
   if(msg.type==="joined"){ myId=msg.player_id; room=msg.room; if(lastJoinMsg){lastJoinMsg.code=room.code; lastJoinMsg.player_id=myId;}
-    const me=room.players.find(p=>p.id===myId); if(me){myProfileColour=me.colour; $("myNick").value=me.nickname; $("myNick2").value=me.nickname;
-      buildPalette($("myPalette"), c=>{myProfileColour=c;}, myProfileColour); buildPalette($("myPalette2"), c=>{myProfileColour=c;}, myProfileColour);}
     history.replaceState(null,"",joinLink(room.code)); renderLobby(); show("lobby"); return; }
   if(msg.type==="lobby"){ room=msg.room; if(room.phase==="lobby") renderLobby(); return; }
   if(msg.type==="game_started"){ room.current_game=msg.game;
@@ -521,14 +572,18 @@ function handle(msg){
     if(msg.teams) room.teams=msg.teams;
     $("gameTitle").textContent=GAME_NAMES[msg.game]+(msg.mode==="solo"?" — Solo practice":"");
     $("gameInfo").textContent = (msg.mode==="solo" ? "Just you — have fun, no pressure!" : "Fastest correct answers score the most points.") +
-      (msg.party_mode==="teams" ? " · Teams mode — team score is the average of its members." : "");
+      (msg.party_mode==="teams" ? " · Teams mode." : "") +
+      (msg.championship ? " · 🏆 Championship — "+(msg.champ_games||0)+" game"+((msg.champ_games||0)===1?"":"s")+" completed so far." : "");
     $("reactionResults").innerHTML=""; $("quizFeedback").textContent=""; $("scoreboard").innerHTML=""; $("gameErr").textContent="";
     $("secretClues").innerHTML=""; $("secretReveal").innerHTML=""; $("secretPrivate").textContent=""; $("secretStatus").textContent="";
+    $("secretLists").innerHTML=""; $("secretRoundResults").innerHTML=""; secretEliminated=false;
     $("secretClueArea").classList.add("hidden"); $("secretVoteArea").classList.add("hidden");
     $("presHand").innerHTML=""; $("presCounts").innerHTML=""; $("presFinished").innerHTML=""; presSelected=new Set(); $("presNotice").textContent=""; $("presHint").textContent=""; clearInterval(presTimerInt); $("presTimer").textContent="";
-    $("unoHand").innerHTML=""; $("unoCounts").innerHTML=""; unoSelected=null; unoPendingWild=null; $("unoColourPick").classList.add("hidden");
-    $("memoryNumber").textContent=""; $("memoryElim").innerHTML=""; memoryAnswered=false; clearInterval(memoryTimerInt);
+    $("presRoles").innerHTML=""; $("presExchange").classList.add("hidden"); presExchange=null;
+    $("unoHand").innerHTML=""; $("unoCounts").innerHTML=""; $("unoPending").textContent=""; unoSelectedIdx=new Set(); unoHandCards=[]; unoColourChoice=null; unoPlayPending=null; $("unoColourPick").classList.add("hidden");
+    drawMemoryNumber(""); $("memoryElim").innerHTML=""; memoryAnswered=false; clearInterval(memoryTimerInt);
     $("voteBox").classList.add("hidden");
+    $("endChoice").classList.add("hidden"); replayVoted=false;
     $("reactionBox").classList.toggle("hidden", msg.game!=="reaction");
     $("quizBox").classList.toggle("hidden", !(msg.game==="math"||msg.game==="trivia"));
     $("secretBox").classList.toggle("hidden", msg.game!=="secret");
@@ -569,6 +624,16 @@ function handle(msg){
       $("voteScores").innerHTML="<h3>Challenge ranking</h3><table>"+
         msg.ranking.map((n,i)=>"<tr><td>"+(i+1)+"</td><td>"+n+"</td></tr>").join("")+"</table>"+
         (msg.finishing && msg.finishing.length ? "<p class='muted'>Out so far: "+msg.finishing.join(" → ")+"</p>" : "");
+    } else if(msg.end_of_game){
+      // v2.2 end-of-game NEXT vote: a ready gate before the Play Again /
+      // Return to Lobby choice. This voteBox lives outside #game so it
+      // shows on the results screen too.
+      $("voteHeading").textContent="🏁 Final results are in — ready to choose what's next?";
+      $("nextBtn").textContent="NEXT →";
+      $("hostSkipBtn").textContent="HOST: Skip to the choice →";
+      $("voteScores").innerHTML = msg.scores ? "<table>"+
+        [...msg.scores].sort((a,b)=>b.score-a.score)
+          .map(s=>"<tr><td><span class='chip' style='display:inline-block;background:"+s.colour+"'></span> "+s.nickname+(s.is_bot?" 🤖":"")+teamBadge(s)+"</td><td>"+(msg.scores_hidden?"hidden":s.score)+"</td></tr>").join("")+"</table>" : "";
     } else {
       $("voteHeading").textContent="Take a breather — scores above ☝️";
       $("nextBtn").textContent="NEXT QUESTION →";
@@ -577,8 +642,9 @@ function handle(msg){
         [...msg.scores].sort((a,b)=>b.score-a.score)
           .map(s=>"<tr><td><span class='chip' style='display:inline-block;background:"+s.colour+"'></span> "+s.nickname+(s.is_bot?" 🤖":"")+teamBadge(s)+"</td><td>"+s.score+"</td></tr>").join("")+"</table>" : "";
     }
+    $("voteLabel").textContent = msg.label ? "Round: "+msg.label : (msg.end_of_game ? "End-of-game vote" : "");
     $("voteTeams").innerHTML = msg.teams ? teamStandingsHtml(msg.teams) : "";
-    $("voteCount").textContent=msg.votes+"/"+msg.votes_needed+" voted NEXT — auto-advances at "+msg.timeout+"s";
+    $("voteCount").textContent=msg.votes+"/"+msg.votes_needed+" voted NEXT"+(msg.timeout ? " — auto-advances at "+msg.timeout+"s" : "");
     return; }
   if(msg.type==="vote_update"){ $("voteCount").textContent=msg.votes+"/"+msg.votes_needed+" voted NEXT";
     if(msg.host_skipped){ $("hostSkipBtn").disabled=true; $("hostSkipBtn").textContent="Host skipped ahead →"; }
@@ -592,19 +658,54 @@ function handle(msg){
       .map(s=>"<tr><td><span class='chip' style='display:inline-block;background:"+s.colour+"'></span> "+s.nickname+(s.is_bot?" 🤖":"")+teamBadge(s)+"</td><td>"+s.score+"</td></tr>").join("")+"</table>" +
       (msg.teams ? teamStandingsHtml(msg.teams) : "");
     return; }
-  // ---- v2: Secret Word ----
+  // ---- v2.2: Secret Word (multi-round) ----
+  // v2.2 message shape: {word?, category, role, round, alive, eliminated,
+  // impostors}. Old shape (is_impostor / impostor_count) still works.
   if(msg.type==="secret_word"){
-    $("secretPrivate").textContent = msg.is_impostor
-      ? "🕵️ You are the IMPOSTOR — figure out the word from the clues, and don't get caught!"
-      : "🤫 The secret word is: "+msg.word;
-    $("secretStatus").textContent = msg.is_impostor
-      ? "There "+(msg.impostor_count>1?"are "+msg.impostor_count+" impostors":"is 1 impostor")+" among you. Give a vague clue that fits in."
-      : "Give a one-word clue that helps the others guess the word — but don't just say the word itself!";
+    const isImp = msg.role ? msg.role==="imposter" : !!msg.is_impostor;
+    // The reconnect re-send carries only word/is_impostor — it has no
+    // alive/eliminated lists, so only update those when present, or a
+    // rejoin would wrongly clear the spectate state and the lists.
+    if(msg.eliminated!==undefined) secretEliminated = msg.eliminated.includes(myId);
+    const nick = id=>{const p=room.players.find(q=>q.id===id); return p?p.nickname:id;};
+    $("secretPrivate").textContent = secretEliminated ? "👻 You were voted out — spectating now." :
+      isImp ? "🕵️ You are the IMPOSTOR — figure out the word from the clues, and don't get caught!"
+      : "🤫 The secret word is: "+(msg.word||"—");
+    $("secretStatus").textContent = secretEliminated ? "You can watch the clues and round results, but you can't give clues or vote." :
+      (msg.category ? "Category: "+msg.category+". " : "") + (isImp
+      ? "There "+(((msg.impostors||msg.impostor_count)||1)>1?"are "+(msg.impostors||msg.impostor_count)+" impostors":"is 1 impostor")+" among you. Give a vague clue that fits in."
+      : "Give a one-word clue that helps the others guess the word — but don't just say the word itself!");
+    if(msg.alive!==undefined){
+      $("secretLists").innerHTML = "<p>Round "+(msg.round||1)+" · Alive: "+msg.alive.map(nick).join(", ")+
+        ((msg.eliminated||[]).length ? " · Out: "+msg.eliminated.map(nick).join(", ") : "")+"</p>";
+    }
+    $("secretClueArea").classList.add("hidden"); $("secretVoteArea").classList.add("hidden");
     return; }
+  if(msg.type==="secret_round_result"){
+    const nick=id=>{const p=room.players.find(q=>q.id===id); return p?p.nickname:id;};
+    if(msg.eliminated===myId) secretEliminated=true;
+    // The server never re-sends secret_word per round, so refresh the
+    // alive/eliminated lists here from the round result.
+    if(msg.alive!==undefined){
+      const outIds = msg.eliminated_ids || (msg.eliminated ? [msg.eliminated] : []);
+      $("secretLists").innerHTML = "<p>Round "+msg.round+" · Alive: "+msg.alive.map(nick).join(", ")+
+        (outIds.length ? " · Out: "+outIds.map(nick).join(", ") : "")+"</p>";
+    }
+    const d=document.createElement("div");
+    d.innerHTML="<p><b>Round "+msg.round+" result:</b> "+(msg.tie ? "Tie — nobody was voted out." :
+      (msg.eliminated ? "<b>"+nick(msg.eliminated)+"</b> was voted out." : "Nobody was voted out."))+
+      " Citizens left: "+msg.citizens_left+" · Impostors left: "+msg.impostors_left+"</p>";
+    $("secretRoundResults").appendChild(d);
+    $("secretStatus").textContent = secretEliminated ? "You were voted out — spectating." : "Round "+msg.round+" done — next clue round coming up…";
+    return; }
+  if(msg.type==="secret_ended"){
+    $("secretReveal").innerHTML="<p><b>"+(msg.message||"The Secret Word game ended early.")+"</b></p>";
+    return; }
+  if(msg.type==="secret_notice"){ $("secretStatus").textContent=msg.message||""; return; }
   if(msg.type==="secret_clue_turn"){
     $("secretStatus").textContent = msg.player_id===myId ? "Your turn — give a one-word clue!" : "Waiting for "+msg.nickname+" to give a clue…";
-    $("secretClueArea").classList.toggle("hidden", msg.player_id!==myId);
-    if(msg.player_id===myId){ $("secretClueInput").value=""; $("secretClueInput").focus(); }
+    $("secretClueArea").classList.toggle("hidden", msg.player_id!==myId || secretEliminated);
+    if(msg.player_id===myId && !secretEliminated){ $("secretClueInput").value=""; $("secretClueInput").focus(); }
     return; }
   if(msg.type==="secret_clue_shown"){
     const d=document.createElement("div");
@@ -612,6 +713,7 @@ function handle(msg){
     $("secretClues").appendChild(d);
     return; }
   if(msg.type==="secret_vote_start"){
+    if(secretEliminated) return; // spectating — no vote input
     $("secretVoteArea").classList.remove("hidden");
     $("secretStatus").textContent="Vote for who you think the impostor is!";
     const box=$("secretVoteBtns"); box.innerHTML="";
@@ -623,11 +725,13 @@ function handle(msg){
   if(msg.type==="secret_result"){
     const meIsImp = msg.impostors.includes(myId);
     const iWon = msg.winners.includes(myId);
+    // v2.2: no points are shown here — Secret Word points stay hidden
+    // until the end_choice standings. Role + word are revealed at end.
     $("secretReveal").innerHTML="<h3>Reveal!</h3><p>The secret word was <b>"+msg.word+"</b>.</p><p>Impostor"+(msg.impostors.length>1?"s":"")+": <b>"+
       msg.impostors.map(id=>{const p=room.players.find(q=>q.id===id); return p?p.nickname:id;}).join(", ")+"</b></p><p>"+
       (msg.eliminated ? "Voted out: <b>"+(room.players.find(q=>q.id===msg.eliminated)||{}).nickname+"</b>. " : "Nobody was voted out (tie). ") +
       (msg.word_team_won ? "The word team caught an impostor!" : "The impostors survived!") +
-      "</p><p>"+(iWon ? "🎉 You win! +"+(meIsImp?1500:1000)+" points." : "You lose this one.")+"</p>";
+      "</p><p>"+(iWon ? "🎉 You win!" : "The other side wins this one.")+"</p>";
     return; }
   // ---- v2: President ----
   if(msg.type==="president_state"){
@@ -655,60 +759,105 @@ function handle(msg){
       const b=document.createElement("button"); b.className="pcard"+(("♥♦".includes(c.slice(-1)))?" red":"");
       b.textContent=c;
       if(presSelected.has(c)) b.classList.add("sel");
-      b.onclick=()=>{ if(!me) return; if(presSelected.has(c)) presSelected.delete(c); else presSelected.add(c); b.classList.toggle("sel"); refreshPresUI(); };
+      // During a card exchange the giver picks cards even though it
+      // is not their "turn" in the trick sense.
+      b.onclick=()=>{ if(!(me || (presExchange && presExchange.giver_id===myId))) return; if(presSelected.has(c)) presSelected.delete(c); else presSelected.add(c); b.classList.toggle("sel"); refreshPresUI(); };
       hand.appendChild(b); });
     $("presCounts").innerHTML = "Cards left: " + Object.entries(msg.counts)
       .map(([pid,n])=>{const p=room.players.find(q=>q.id===pid); return (p?p.nickname:pid)+" "+n;}).join(" · ");
-    $("presFinished").innerHTML = msg.finished.length ? "<p>Finished: "+msg.finished.map((pid,i)=>{
-      const p=room.players.find(q=>q.id===pid); const titles=["President","Vice-President","","","","","","Vice-Asshole","Asshole"];
-      return (i+1)+". "+(p?p.nickname:pid);}).join(" · ")+"</p>" : "";
+    // v2.2: role badges from the server, and finish titles from the
+    // server (the old client titles array was wrong — deleted).
+    $("presRoles").innerHTML = msg.roles ? Object.entries(msg.roles)
+      .map(([pid,role])=>{const p=room.players.find(q=>q.id===pid); return (p?p.nickname:pid)+": <b>"+role+"</b>";}).join(" · ") : "";
+    $("presFinished").innerHTML = msg.finished.length ? "<p>Finished: "+msg.finished.map((f,i)=>{
+      const pid = (f && typeof f==="object") ? (f.player_id||f.id) : f;
+      // v2.2: titles come from the server as a separate {player_id:
+      // title} dict (or, defensively, on the finish entry itself).
+      const title = (msg.titles && msg.titles[pid]) || ((f && typeof f==="object" && f.title) ? f.title : "");
+      const p=room.players.find(q=>q.id===pid);
+      return (i+1)+". "+(title?title+" — ":"")+(p?p.nickname:pid);}).join(" · ")+"</p>" : "";
+    // v2.2: card exchange — the named giver clicks the required number
+    // of cards, then confirms. Bots / other humans just wait.
+    presExchange = msg.exchange||null;
+    const ex=$("presExchange");
+    if(presExchange){
+      const giver=room.players.find(q=>q.id===presExchange.giver_id);
+      const partner=room.players.find(q=>q.id===presExchange.partner_id);
+      ex.classList.remove("hidden");
+      if(presExchange.giver_id===myId){
+        $("presExchangeText").textContent="🔄 Exchange: pick "+presExchange.count+" card"+(presExchange.count>1?"s":"")+" to give to "+(partner?partner.nickname:"your partner")+" — click cards in your hand, then confirm.";
+      } else {
+        $("presExchangeText").textContent="🔄 Exchange: waiting for "+(giver?giver.nickname:"another player")+" to pick "+presExchange.count+" card"+(presExchange.count>1?"s":"")+".";
+      }
+    } else ex.classList.add("hidden");
     refreshPresUI();
     return; }
   if(msg.type==="president_notice"){ $("presNotice").textContent=msg.message; return; }
-  // ---- v2: UNO ----
+  // ---- v2.2: UNO (multi-select, house rules) ----
   if(msg.type==="uno_state"){
     const me = msg.turn_id===myId;
+    const oldHand = unoHandCards;
+    unoHandCards = msg.hand||[];
+    unoColourChoice=null; unoPlayPending=null; $("unoColourPick").classList.add("hidden");
     $("unoTurn").textContent = me ? "👉 Your turn!" : "Waiting for "+(room.players.find(p=>p.id===msg.turn_id)||{}).nickname+"…";
     $("unoTop").textContent = unoLabel(msg.top);
     $("unoTop").style.color = msg.top && msg.top.startsWith("W") ? "#fff" : (UNO_COLOUR_HEX[msg.top?msg.top[0]:"R"]||"#fff");
     $("unoColour").textContent = UNO_COLOUR_NAMES[msg.current_colour]||msg.current_colour;
     $("unoDir").textContent = "· Direction: "+(msg.direction===1?"→ clockwise":"← counter-clockwise");
     $("unoDrawBtn").disabled = !me;
+    $("unoDrawBtn").textContent = (msg.pending_draw && msg.pending_draw>0) ? "Draw +"+msg.pending_draw+" (take it)" : "Draw a card";
+    $("unoPending").textContent = (msg.pending_draw && msg.pending_draw>0) ? "+"+msg.pending_draw+" — stack or take" : "";
     $("unoEndTurnBtn").classList.toggle("hidden", !(me && msg.drawn));
+    // Drop selections for cards no longer in hand. A selection survives
+    // only when the same card is still at the same index (e.g. the
+    // server rejected the play and re-sent the same hand).
+    const kept=new Set();
+    [...unoSelectedIdx].forEach(i=>{ if(oldHand[i]!==undefined && unoHandCards[i]===oldHand[i]) kept.add(i); });
+    unoSelectedIdx=kept;
     const hand=$("unoHand"); hand.innerHTML="";
-    msg.hand.forEach(c=>{
+    unoHandCards.forEach((c,i)=>{
       const b=document.createElement("button"); b.className="uno-card"+(c.startsWith("W")?" wild":"");
       if(!c.startsWith("W")) b.style.background=UNO_COLOUR_HEX[c[0]];
       b.textContent=unoLabel(c);
-      if(unoSelected===c) b.classList.add("sel");
+      if(unoSelectedIdx.has(i)) b.classList.add("sel");
       b.onclick=()=>{
         if(!me) return;
-        if(c.startsWith("W")){ unoSelected=c; unoPendingWild=c; $("unoColourPick").classList.remove("hidden"); [...hand.children].forEach(x=>x.classList.remove("sel")); b.classList.add("sel"); }
-        else { unoSelected=c; unoPendingWild=null; $("unoColourPick").classList.add("hidden"); [...hand.children].forEach(x=>x.classList.remove("sel")); b.classList.add("sel");
-          send({type:"uno_play", card:c}); unoSelected=null; }
+        if(unoSelectedIdx.has(i)){ unoSelectedIdx.delete(i); b.classList.remove("sel"); }
+        else {
+          // Multi-play: every selected card must share the same value.
+          const v=c.slice(1);
+          for(const j of unoSelectedIdx){ if(unoHandCards[j].slice(1)!==v){ $("gameErr").textContent="Multi-play: all cards must be the same value."; return; } }
+          $("gameErr").textContent="";
+          unoSelectedIdx.add(i); b.classList.add("sel");
+        }
+        $("unoPlayBtn").disabled = !me || unoSelectedIdx.size===0;
       };
       hand.appendChild(b); });
     $("unoCounts").innerHTML = "Cards left: " + Object.entries(msg.counts)
       .map(([pid,n])=>{const p=room.players.find(q=>q.id===pid); return (p?p.nickname:pid)+" "+n;}).join(" · ") +
       (msg.drawn ? " · You drew <b>"+unoLabel(msg.drawn)+"</b> — tap it to play it, or keep it and end your turn." : "");
+    $("unoPlayBtn").disabled = !me || unoSelectedIdx.size===0;
     return; }
-  // ---- v2: Memory ----
+  // ---- v2.2: Memory (number on a <canvas>, no text node in the DOM) ----
   if(msg.type==="memory_round_start"){
     $("memoryStatus").textContent="Round "+msg.round+" — "+msg.digits+" digits. Memorize your number!";
     $("memoryRecallBox").classList.add("hidden");
+    drawMemoryNumber("");
     return; }
   if(msg.type==="memory_show"){
     memoryAnswered=false;
     $("memoryStatus").textContent="Round "+msg.round+" — memorize this "+msg.digits+"-digit number!";
-    $("memoryNumber").textContent=msg.number;
+    // Redraw on EVERY memory_show: the server re-sends this on
+    // reconnect mid-memorize, and the same canvas is reused.
+    drawMemoryNumber(String(msg.number));
     $("memoryRecallBox").classList.add("hidden");
     let left=msg.seconds; $("memoryTimer").textContent=left+"s to memorize";
     clearInterval(memoryTimerInt);
-    memoryTimerInt=setInterval(()=>{ left--; if(left<=0){ clearInterval(memoryTimerInt); $("memoryNumber").textContent="•".repeat(msg.digits); $("memoryTimer").textContent="Number hidden — get ready…"; } else $("memoryTimer").textContent=left+"s to memorize"; },1000);
+    memoryTimerInt=setInterval(()=>{ left--; if(left<=0){ clearInterval(memoryTimerInt); drawMemoryNumber("•".repeat(msg.digits)); $("memoryTimer").textContent="Number hidden — get ready…"; } else $("memoryTimer").textContent=left+"s to memorize"; },1000);
     return; }
   if(msg.type==="memory_recall"){
     $("memoryStatus").textContent="Round "+msg.round+" — type the "+msg.digits+"-digit number from memory!";
-    $("memoryNumber").textContent="•".repeat(msg.digits);
+    drawMemoryNumber("•".repeat(msg.digits));
     $("memoryRecallBox").classList.remove("hidden");
     $("memoryAns").value=""; $("memoryAns").disabled=false; $("memorySubmit").disabled=false; memoryAnswered=false; $("memoryAns").focus();
     let left=msg.time_limit; $("memoryTimer").textContent=left+"s to answer";
@@ -741,7 +890,29 @@ function handle(msg){
     return; }
   if(msg.type==="elimination_end_vote" || msg.type==="elimination_end_vote_update"){
     $("elimEndVote").classList.remove("hidden");
-    $("elimVoteCount").textContent = msg.votes_again+"/"+msg.votes_needed+" voted Play Again · "+msg.votes_lobby+"/"+msg.votes_needed+" voted Return to Lobby";
+    $("elimHostRow").classList.toggle("hidden", !isHost());
+    $("elimVoteCount").textContent = msg.votes_again+"/"+msg.votes_needed+" voted Play Again · "+msg.votes_lobby+"/"+msg.votes_needed+" voted Return to Lobby"+
+      (msg.host_choice ? " · Host chose: "+(msg.host_choice==="again"?"Play Again":"Return to Lobby") : "");
+    return; }
+  // ---- v2.2: end-of-game choice (after the end-of-game NEXT vote) ----
+  if(msg.type==="end_choice"){
+    $("voteBox").classList.add("hidden");
+    $("elimEndVote").classList.add("hidden");
+    replayVoted=false; $("replayAgainBtn").disabled=false; $("replayLobbyBtn").disabled=false;
+    $("hostReplayRow").classList.toggle("hidden", !isHost());
+    $("replayVoteCount").textContent="";
+    $("endChoiceStandings").innerHTML =
+      (msg.teams ? teamStandingsHtml(msg.teams) : "") +
+      "<h3>Final standings</h3><table>"+
+      (msg.rankings||[]).map((r,i)=>"<tr><td>"+(i+1)+"</td><td><span class='chip' style='display:inline-block;background:"+r.colour+"'></span> "+r.nickname+(r.is_bot?" 🤖 BOT":"")+teamBadge(r)+"</td><td>"+(r.score!==undefined?r.score+" pts":"")+"</td></tr>").join("")+"</table>";
+    renderChampHistory($("champTableResults"), msg.champ_history, msg.champ_games);
+    $("champDetailsResults").classList.toggle("hidden", !(msg.championship && msg.champ_history && msg.champ_history.length));
+    $("champCounterResults").classList.toggle("hidden", !msg.championship);
+    if(msg.championship) $("champCounterResults").textContent="🏆 Championship — "+(msg.champ_games||0)+" game"+((msg.champ_games||0)===1?"":"s")+" completed";
+    show("results"); return; }
+  if(msg.type==="replay_vote_update"){
+    $("replayVoteCount").textContent = msg.votes_again+"/"+msg.votes_needed+" voted Play Again · "+msg.votes_lobby+"/"+msg.votes_needed+" voted Return to Lobby"+
+      (msg.host_choice ? " · Host chose: "+(msg.host_choice==="again"?"Play Again":"Return to Lobby") : "");
     return; }
   if(msg.type==="results"){
     clearInterval(quizTimerInt); clearInterval(presTimerInt); $("presTimer").textContent="";
@@ -756,11 +927,21 @@ function handle(msg){
     $("resultsTable").innerHTML = finishHtml +
       "<h3>Individual scores</h3><table><tr><th>#</th><th>Player</th><th>"+(msg.game==="reaction"?"Avg reaction":"Score")+"</th></tr>"+
       msg.rankings.map((r,i)=>"<tr><td>"+(i+1)+"</td><td><span class='chip' style='display:inline-block;background:"+r.colour+"'></span> "+r.nickname+(r.is_bot?" 🤖 BOT":"")+teamBadge(r)+"</td><td>"+
-        (msg.game==="reaction" ? (r.avg_ms==null?"— (all false starts)":r.avg_ms+unit+" (best "+r.best_ms+")") : r.score+unit) +
+        (msg.game==="reaction" ? (r.avg_ms==null?"— (all false starts)":r.avg_ms+unit+" (best "+r.best_ms+")") : (msg.scores_hidden ? "hidden until the end vote" : r.score+unit)) +
         (r.cards_left!==undefined ? " · "+r.cards_left+" cards left" : "") + "</td></tr>").join("")+"</table>";
     // v2: the Elimination end vote is shown by its own messages; hide
     // it for every other game.
     if(msg.game!=="elimination"){ $("elimEndVote").classList.add("hidden"); }
+    // v2.2: Elimination has no end-of-game vote_break — its end vote is
+    // the elimEndVote above, so hide the generic vote box here.
+    if(msg.game==="elimination"){ $("voteBox").classList.add("hidden"); }
+    $("endChoice").classList.add("hidden"); replayVoted=false;
+    // v2.2: championship counter + history on the results screen.
+    const chHist = msg.champ_history || (room && room.champ_history);
+    renderChampHistory($("champTableResults"), chHist, msg.champ_games);
+    $("champDetailsResults").classList.toggle("hidden", !(msg.championship && chHist && chHist.length));
+    $("champCounterResults").classList.toggle("hidden", !msg.championship);
+    if(msg.championship) $("champCounterResults").textContent="🏆 Championship — "+(msg.champ_games||0)+" game"+((msg.champ_games||0)===1?"":"s")+" completed";
     elimVoted=false;
     show("results"); return; }
 }
@@ -770,8 +951,12 @@ function renderLobby(){
   $("lobbyTitle").textContent=room.name+" — Lobby";
   $("roomCode").textContent=room.code;
   $("playerCount").textContent=room.players.length;
+  $("voteBox").classList.add("hidden");
+  $("endChoice").classList.add("hidden");
   const host=isHost();
   $("hostSettings").style.display=host?"":"none";
+  $("settingsBtn").style.display=host?"":"none";
+  if(!host) $("settingsPanel").classList.add("hidden");
   $("settingsReadOnly").classList.toggle("hidden", host);
   $("botHint").style.display=host?"":"none";
   $("setRoomName").value=room.name; $("setMaxPlayers").value=String(room.max_players); $("setGame").value=room.game;
@@ -790,22 +975,42 @@ function renderLobby(){
   $("setMode").value=room.mode||"ffa";
   $("teamSettings").classList.toggle("hidden", room.mode!=="teams");
   $("setTeamCount").value=String(room.team_count||2);
-  // Grey out colours already taken by other players in my palette.
-  const me=room.players.find(p=>p.id===myId);
-  const takenByOthers=new Set(room.players.filter(p=>p.id!==myId).map(p=>p.colour));
-  buildPalette($("myPalette"), c=>{myProfileColour=c;}, myProfileColour, takenByOthers);
-  buildPalette($("myPalette2"), c=>{myProfileColour=c;}, myProfileColour, takenByOthers);
+  // v2.2 settings, from the lobby payload (defaults when the server
+  // does not send them yet).
+  const gs=room.game_settings||{};
+  $("setTurnOrderMode").value=room.turn_order_mode||"random";
+  $("turnOrderEditor").classList.toggle("hidden", (room.turn_order_mode||"random")!=="manual");
+  renderTurnOrderList();
+  $("setTeamScoring").value=room.team_scoring||"average";
+  $("setChampionship").checked=!!room.championship;
+  $("setUnoDrawUntil").checked=!!(gs.uno&&gs.uno.draw_until_playable);
+  $("setUnoStacking").checked=!!(gs.uno&&gs.uno.stacking);
+  $("setUnoMulti").checked=!!(gs.uno&&gs.uno.multi_play);
+  $("setSecretImpostors").value=String((gs.secret&&gs.secret.impostors)||1);
+  // v2.2: championship counter + collapsible history tab (everyone).
+  const champOn=!!room.championship;
+  $("champCounter").classList.toggle("hidden", !champOn);
+  if(champOn) $("champCounter").textContent="🏆 Championship mode — "+(room.champ_games||0)+" game"+((room.champ_games||0)===1?"":"s")+" completed";
+  $("champDetails").classList.toggle("hidden", !(champOn && room.champ_history && room.champ_history.length));
+  renderChampHistory($("champTable"), room.champ_history, room.champ_games);
+  // v2.2: player CARDS in a grid, each tinted/bordered with the
+  // player's colour. Tap-to-expand inline editing on the card itself.
   const list=$("playerList"); list.innerHTML="";
   room.players.forEach(p=>{
-    const d=document.createElement("div"); d.className="player"+(p.is_bot?" bot":"");
-    d.innerHTML="<span class='chip' style='background:"+p.colour+"'></span><b>"+p.nickname+"</b>"+
+    const d=document.createElement("div"); d.className="player";
+    d.style.borderColor=p.colour; d.style.background=p.colour+"22";
+    const editable = p.id===myId || (p.is_bot && host);
+    const roleBadge = (room.game==="president" && room.president_roles && room.president_roles[p.id])
+      ? " <span class='role-badge'>"+room.president_roles[p.id]+"</span>" : "";
+    const top=document.createElement("div"); top.className="pcard-top";
+    top.innerHTML="<span class='chip' style='background:"+p.colour+"'></span><b>"+p.nickname+"</b>"+
       (p.is_host?" <span class='crown'>👑</span>":"")+(p.is_bot?" <span class='badge'>BOT</span>":"")+
       (p.is_bot?" <span class='muted'>"+p.difficulty+"</span>":"")+(p.connected===false?" <span class='muted'>(disconnected)</span>":"")+
-      teamBadge(p);
-    if(p.is_bot && host) d.onclick=()=>openBotEdit(p);
+      teamBadge(p)+roleBadge;
+    d.appendChild(top);
     // v1.2: host can kick any human player (not themselves) from the lobby.
     if(host && !p.is_bot && p.id!==myId){
-      const k=document.createElement("button"); k.className="danger team-select"; k.textContent="Kick";
+      const k=document.createElement("button"); k.className="danger"; k.style.cssText="padding:4px 8px;font-size:.8rem;margin-top:2px"; k.textContent="Kick";
       k.onclick=(e)=>{ e.stopPropagation(); if(confirm("Kick "+p.nickname+" from the room?")) send({type:"kick_player", player_id:p.id}); };
       d.appendChild(k);
     }
@@ -819,6 +1024,46 @@ function renderLobby(){
       s.onclick=(e)=>e.stopPropagation();
       d.appendChild(s);
     }
+    if(editable){
+      d.style.cursor="pointer";
+      d.onclick=()=>{ expandedCardId = expandedCardId===p.id ? null : p.id; renderLobby(); };
+      if(expandedCardId===p.id){
+        const ed=document.createElement("div"); ed.className="card-edit";
+        ed.onclick=(e)=>e.stopPropagation();
+        const nick=document.createElement("input"); nick.maxLength=20; nick.value=p.nickname; nick.placeholder="Nickname";
+        ed.appendChild(nick);
+        const pal=document.createElement("div"); pal.className="palette";
+        const taken=new Set(room.players.filter(q=>q.id!==p.id).map(q=>q.colour));
+        let chosenColour=p.colour;
+        buildPalette(pal, c=>{chosenColour=c;}, p.colour, taken);
+        ed.appendChild(pal);
+        let diffSel=null;
+        if(p.is_bot){
+          const dl=document.createElement("label"); dl.textContent="Difficulty"; ed.appendChild(dl);
+          diffSel=document.createElement("select");
+          ["Easy","Medium","Hard"].forEach(dd=>{const o=document.createElement("option"); o.textContent=dd; diffSel.appendChild(o);});
+          diffSel.value=p.difficulty||"Medium";
+          ed.appendChild(diffSel);
+        }
+        const save=document.createElement("button"); save.className="green"; save.textContent="Save";
+        save.onclick=()=>{
+          const nn=nick.value.trim(); if(!nn) return;
+          if(p.is_bot) send({type:"update_bot", bot_id:p.id, nickname:nn, colour:chosenColour, difficulty:diffSel?diffSel.value:p.difficulty});
+          else send({type:"update_profile", nickname:nn, colour:chosenColour});
+          expandedCardId=null;
+        };
+        ed.appendChild(save);
+        if(p.is_bot){
+          const rm=document.createElement("button"); rm.className="danger"; rm.textContent="Remove bot";
+          rm.onclick=()=>{ if(confirm("Remove "+p.nickname+"?")) send({type:"remove_bot", bot_id:p.id}); expandedCardId=null; };
+          ed.appendChild(rm);
+        }
+        const cancel=document.createElement("button"); cancel.className="secondary"; cancel.textContent="Cancel";
+        cancel.onclick=()=>{ expandedCardId=null; renderLobby(); };
+        ed.appendChild(cancel);
+        d.appendChild(ed);
+      }
+    }
     list.appendChild(d);
   });
   const min = MIN_PLAYERS[room.game] || 1;
@@ -828,37 +1073,82 @@ function renderLobby(){
   $("startBtn").textContent = !host ? "Waiting for host to start…" : need>0 ? "Need "+need+" more player"+(need>1?"s":"")+" / bot"+(need>1?"s":"") :
     !teamsOk ? "Teams: every team needs at least 1 player" : "Start "+GAME_NAMES[room.game];
   $("startHint").textContent = room.game==="reaction" && room.players.length===1 ? "Solo practice: only you — Reaction Test works with 1 player." :
-    (room.mode==="teams" ? "Teams mode: team score = average of its members' scores. Individual scores still shown." : "");
+    (room.mode==="teams" ? "Teams mode: team score follows the scoring style picked above. Individual scores still shown." : "") +
+    (champOn ? " Championship mode is ON — scores carry across games." : "");
 }
 
-function openBotEdit(bot){
-  editingBot=bot; botColour=bot.colour;
-  $("botName").value=bot.nickname; $("botDiff").value=bot.difficulty||"Medium";
-  // Grey out colours taken by other players/bots (not this bot's own).
-  const taken=new Set(room.players.filter(p=>p.id!==bot.id).map(p=>p.colour));
-  buildPalette($("botPalette"), c=>botColour=c, botColour, taken);
-  $("botEdit").classList.remove("hidden");
+// v2.2: championship history table — rows (player + team) sorted by
+// tally desc, ties by creation order; columns Game 1..N + Tally.
+function renderChampHistory(el, history, games){
+  if(!el) return;
+  if(!history || !history.length){ el.innerHTML="<p class='muted'>No games completed yet.</p>"; return; }
+  const rows=[...history].sort((a,b)=>(b.tally-a.tally)||((a.created||0)-(b.created||0)));
+  const n=games||Math.max.apply(null, history.map(r=>(r.per_game||[]).length));
+  let h="<table class='champ-table'><tr><th>Player</th><th>Team</th>";
+  for(let g=1;g<=n;g++) h+="<th>G"+g+"</th>";
+  h+="<th>Tally</th></tr>";
+  rows.forEach(r=>{
+    h+="<tr><td>"+r.nickname+"</td><td>"+(r.team==null||r.team===undefined?"Alone":TEAM_NAMES[r.team])+"</td>";
+    for(let g=0;g<n;g++) h+="<td>"+((r.per_game||[])[g]||0)+"</td>";
+    h+="<td><b>"+r.tally+"</b></td></tr>";
+  });
+  el.innerHTML=h+"</table>";
 }
-$("botCancelBtn").onclick=()=>{editingBot=null;$("botEdit").classList.add("hidden");};
-$("botSaveBtn").onclick=()=>{ if(!editingBot)return;
-  send({type:"update_bot", bot_id:editingBot.id, nickname:$("botName").value.trim(), colour:botColour, difficulty:$("botDiff").value});
-  editingBot=null; $("botEdit").classList.add("hidden"); };
-$("botRemoveBtn").onclick=()=>{ if(!editingBot)return; send({type:"remove_bot", bot_id:editingBot.id}); editingBot=null; $("botEdit").classList.add("hidden"); };
+
+// v2.2: manual turn-order editor (host only, bots orderable too).
+function renderTurnOrderList(){
+  const box=$("turnOrderList"); if(!box || !room) return; box.innerHTML="";
+  // The host may have just flipped the select before the server echoes
+  // the new mode back, so read the select when hosting.
+  const mode = isHost() ? $("setTurnOrderMode").value : (room.turn_order_mode||"random");
+  if(mode!=="manual") return;
+  const order=(room.turn_order&&room.turn_order.length?room.turn_order:room.players.map(p=>p.id));
+  order.forEach((pid,i)=>{
+    const p=room.players.find(q=>q.id===pid); if(!p) return;
+    const row=document.createElement("div"); row.className="ord-row";
+    const label=document.createElement("span"); label.textContent=(i+1)+". "+p.nickname+(p.is_bot?" 🤖":"");
+    row.appendChild(label);
+    const up=document.createElement("button"); up.textContent="↑"; up.className="secondary ord-btn"; up.disabled=i===0;
+    up.onclick=()=>moveTurnOrder(i,-1);
+    const down=document.createElement("button"); down.textContent="↓"; down.className="secondary ord-btn"; down.disabled=i===order.length-1;
+    down.onclick=()=>moveTurnOrder(i,1);
+    row.appendChild(up); row.appendChild(down); box.appendChild(row);
+  });
+}
+function moveTurnOrder(i,dir){
+  const order=(room.turn_order&&room.turn_order.length?room.turn_order.slice():room.players.map(p=>p.id));
+  const j=i+dir; if(j<0||j>=order.length) return;
+  const t=order[i]; order[i]=order[j]; order[j]=t;
+  send({type:"update_settings", turn_order:order});
+}
 
 $("copyLinkBtn").onclick=async()=>{ try{ await navigator.clipboard.writeText(joinLink(room.code)); $("copyMsg").textContent="Link copied!"; }
   catch(e){ prompt("Copy this link:", joinLink(room.code)); } };
 $("addBotBtn").onclick=()=>send({type:"add_bot"});
+$("settingsBtn").onclick=()=>{ $("settingsPanel").classList.toggle("hidden"); };
 $("startBtn").onclick=()=>{ pushSettings(); send({type:"start_game"}); };
 function pushSettings(){
-  send({type:"update_settings", room_name:$("setRoomName").value.trim(), max_players:parseInt($("setMaxPlayers").value),
+  // v2.2: actually send the UNO + Secret settings (today it sent none
+  // of them) plus turn order mode, team scoring and championship.
+  const msg={type:"update_settings", room_name:$("setRoomName").value.trim(), max_players:parseInt($("setMaxPlayers").value),
     game:$("setGame").value, mode:$("setMode").value, team_count:parseInt($("setTeamCount").value),
+    turn_order_mode:$("setTurnOrderMode").value, team_scoring:$("setTeamScoring").value, championship:$("setChampionship").checked,
     game_settings:{ reaction:{rounds:parseInt($("setReactionRounds").value)},
       math:{difficulty:$("setMathDiff").value, questions:parseInt($("setMathQ").value), time_per_question:parseInt($("setMathTime").value)},
       trivia:{category:$("setTriviaCat").value, difficulty:$("setTriviaDiff").value, questions:parseInt($("setTriviaQ").value), time_per_question:parseInt($("setTriviaTime").value)},
-      memory:{memorize_seconds:parseInt($("setMemoryTime").value)} }});
+      secret:{impostors:parseInt($("setSecretImpostors").value)},
+      uno:{turn_seconds:30, draw_until_playable:$("setUnoDrawUntil").checked, stacking:$("setUnoStacking").checked, multi_play:$("setUnoMulti").checked},
+      president:{turn_seconds:30},
+      memory:{memorize_seconds:parseInt($("setMemoryTime").value)} }};
+  if($("setTurnOrderMode").value==="manual" && room && room.turn_order) msg.turn_order=room.turn_order;
+  send(msg);
 }
-["setRoomName","setMaxPlayers","setGame","setReactionRounds","setMathDiff","setMathQ","setMathTime","setTriviaCat","setTriviaDiff","setTriviaQ","setTriviaTime","setMemoryTime","setMode","setTeamCount"]
+["setRoomName","setMaxPlayers","setGame","setReactionRounds","setMathDiff","setMathQ","setMathTime","setTriviaCat","setTriviaDiff","setTriviaQ","setTriviaTime","setMemoryTime","setMode","setTeamCount",
+  "setTurnOrderMode","setTeamScoring","setChampionship","setUnoDrawUntil","setUnoStacking","setUnoMulti","setSecretImpostors"]
   .forEach(id=>$(id).addEventListener("change", pushSettings));
+// Switching to Manual shows the order editor at once (the server echo
+// re-renders the lobby too, but don't wait for it).
+$("setTurnOrderMode").addEventListener("change", ()=>{ $("turnOrderEditor").classList.toggle("hidden", $("setTurnOrderMode").value!=="manual"); renderTurnOrderList(); });
 $("randomTeamsBtn").onclick=()=>send({type:"randomize_teams"});
 $("hostSkipBtn").onclick=()=>{ $("hostSkipBtn").disabled=true; send({type:"host_skip"}); };
 $("reactionArea").onclick=()=>{ if(reactionClicked)return; reactionClicked=true; send({type:"reaction_click"}); };
@@ -872,8 +1162,21 @@ function submitMath(e){ if(e) e.preventDefault(); if(quizAnswered)return; const 
   send({type:"answer", answer:v, index:currentQIndex}); $("quizFeedback").textContent="Answer sent — waiting…"; }
 $("mathSubmit").onclick=submitMath;
 $("mathAns").addEventListener("keydown", e=>{ if(e.key==="Enter"){ e.preventDefault(); submitMath(e); } });
-$("againBtn").onclick=()=>{ send({type:"play_again"}); show("lobby"); };
-$("changeBtn").onclick=()=>{ send({type:"play_again"}); show("lobby"); };
+// v2.2: Play Again / Return to Lobby is a community vote now
+// (replay_vote); the host can force it with host_replay. The old
+// play_again message no longer exists server-side.
+function sendReplayVote(choice){
+  if(replayVoted) return; replayVoted=true;
+  $("replayAgainBtn").disabled=true; $("replayLobbyBtn").disabled=true;
+  send({type:"replay_vote", choice});
+  $("replayVoteCount").textContent="You voted "+(choice==="again"?"Play Again":"Return to Lobby")+" — waiting for the others…";
+}
+$("replayAgainBtn").onclick=()=>sendReplayVote("again");
+$("replayLobbyBtn").onclick=()=>sendReplayVote("lobby");
+$("hostReplayAgainBtn").onclick=()=>send({type:"host_replay", choice:"again"});
+$("hostReplayLobbyBtn").onclick=()=>send({type:"host_replay", choice:"lobby"});
+$("elimForceAgainBtn").onclick=()=>send({type:"host_replay", choice:"again"});
+$("elimForceLobbyBtn").onclick=()=>send({type:"host_replay", choice:"lobby"});
 $("nextBtn").onclick=()=>{ if(votedNext) return; votedNext=true; $("nextBtn").disabled=true; send({type:"vote_next", index:voteIndex}); };
 // ---- v2: new-game buttons ----
 function submitSecretClue(){ const v=$("secretClueInput").value.trim(); if(!v) return; send({type:"secret_clue", clue:v}); $("secretClueArea").classList.add("hidden"); $("secretStatus").textContent="Clue sent — waiting for the others…"; }
@@ -886,21 +1189,56 @@ $("secretClueInput").addEventListener("keydown", e=>{ if(e.key==="Enter"){ e.pre
 // while nothing (or nothing legal) is selected.
 $("presPlayBtn").onclick=()=>{ if(!presSelected.size) return; send({type:"president_play", cards:[...presSelected]}); };
 $("presPassBtn").onclick=()=>send({type:"president_pass"});
+// v2.2: President card exchange — the giver confirms the picked cards.
+$("presExchangeBtn").onclick=()=>{ if(!presExchange || presExchange.giver_id!==myId) return; if(presSelected.size!==presExchange.count) return; send({type:"president_exchange", cards:[...presSelected]}); presSelected=new Set(); };
+// v2.2: UNO — click cards to multi-select (same value only), Play
+// plays the selection as uno_play {cards:[...]}. A Wild in the
+// selection opens the colour picker, picked once per play.
+$("unoPlayBtn").onclick=()=>{
+  if(!unoSelectedIdx.size) return;
+  const cards=[...unoSelectedIdx].sort((a,b)=>a-b).map(i=>unoHandCards[i]);
+  if(cards.some(c=>c.startsWith("W")) && !unoColourChoice){
+    unoPlayPending=cards; $("unoColourPick").classList.remove("hidden");
+    $("gameErr").textContent="Pick a colour for the Wild card.";
+    return;
+  }
+  // NOTE (landed server, 2026-11-19): its uno_play handler reads only
+  // `card` (single) — it does not accept `cards` yet. Send both: the
+  // first card as `card` so a play always lands on the current server,
+  // and the full selection as `cards` per the v2.2 protocol, so a
+  // multi-play-aware server plays the whole selection.
+  send({type:"uno_play", card:cards[0], cards, ...(unoColourChoice?{colour:unoColourChoice}:{})});
+  unoSelectedIdx=new Set(); unoColourChoice=null; unoPlayPending=null; $("unoColourPick").classList.add("hidden");
+};
 $("unoDrawBtn").onclick=()=>send({type:"uno_draw"});
 $("unoEndTurnBtn").onclick=()=>send({type:"uno_end_turn"});
-document.querySelectorAll("#unoColourPick button").forEach(b=>{ b.onclick=()=>{ if(!unoPendingWild) return; send({type:"uno_play", card:unoPendingWild, colour:b.dataset.colour}); unoPendingWild=null; unoSelected=null; $("unoColourPick").classList.add("hidden"); }; });
+document.querySelectorAll("#unoColourPick button").forEach(b=>{ b.onclick=()=>{
+  unoColourChoice=b.dataset.colour;
+  if(unoPlayPending){ const cards=unoPlayPending; unoPlayPending=null;
+    send({type:"uno_play", card:cards[0], cards, colour:unoColourChoice});
+    unoSelectedIdx=new Set(); unoColourChoice=null; $("unoColourPick").classList.add("hidden");
+  } else { $("unoColourPick").classList.add("hidden"); }
+}; });
+// v2.2 Memory: the number is drawn on a <canvas> — no text node in
+// the DOM, so it cannot be copied out of the page. Same canvas element
+// is reused and redrawn on every memory_show (survives reconnect).
+function drawMemoryNumber(text){
+  const cv=$("memoryCanvas"); if(!cv) return; const ctx=cv.getContext("2d");
+  ctx.clearRect(0,0,cv.width,cv.height);
+  if(!text) return;
+  ctx.fillStyle="#fff"; ctx.font="800 44px system-ui, sans-serif"; ctx.textBaseline="middle";
+  const gap=14; const chars=[...text]; const widths=chars.map(ch=>ctx.measureText(ch).width);
+  const total=widths.reduce((a,b)=>a+b,0)+gap*(chars.length-1);
+  let x=(cv.width-total)/2;
+  chars.forEach((ch,i)=>{ ctx.fillText(ch, x, cv.height/2+2); x+=widths[i]+gap; });
+}
+// v2.2: block pasting into the recall answer box.
+$("memoryAns").addEventListener("paste", e=>e.preventDefault());
 function submitMemory(){ if(memoryAnswered) return; const v=$("memoryAns").value.trim(); if(!v) return; memoryAnswered=true; $("memoryAns").disabled=true; $("memorySubmit").disabled=true; send({type:"memory_answer", answer:v}); $("memoryStatus").textContent="Answer sent — waiting for the others…"; }
 $("memorySubmit").onclick=submitMemory;
 $("memoryAns").addEventListener("keydown", e=>{ if(e.key==="Enter"){ e.preventDefault(); submitMemory(); } });
 $("elimAgainBtn").onclick=()=>{ if(elimVoted) return; elimVoted=true; send({type:"elimination_vote", choice:"again"}); };
 $("elimLobbyBtn").onclick=()=>{ if(elimVoted) return; elimVoted=true; send({type:"elimination_vote", choice:"lobby"}); };
-function saveProfile(nickEl, msgEl){
-  const nick=nickEl.value.trim(); if(!nick){ msgEl.textContent="Pick a nickname first."; return; }
-  send({type:"update_profile", nickname:nick, colour:myProfileColour});
-  msgEl.textContent="Saved — your new nickname / colour will show for everyone.";
-}
-$("myProfileSaveBtn").onclick=()=>saveProfile($("myNick"), $("myProfileMsg"));
-$("myProfileSaveBtn2").onclick=()=>saveProfile($("myNick2"), $("myProfileMsg2"));
 const MATH_HELP={"Easy":"Easy: addition and subtraction only, numbers from -30 to 30.",
   "Medium":"Medium: + − × ÷, multiplication up to 12×12, division is exact.",
   "Hard":"Hard: functions f(x), solving for x, max/min of a function, advanced BEDMAS, fractions (answer as a decimal to 2 places)."};
