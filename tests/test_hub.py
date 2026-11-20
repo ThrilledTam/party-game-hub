@@ -1,17 +1,24 @@
-"""Automated end-to-end test for Party Game Hub v1.
+"""Automated end-to-end test for Party Game Hub v2.2.
 
 Starts the real server on port 8001, then over real WebSockets:
   - creates a room, joins a 2nd human, adds 2 bots via the host
   - verifies the lobby list and bot editing
-  - starts and plays a full game of Reaction Test (3 rounds),
+  - starts and plays full games of Reaction Test (3 rounds),
     Speed Math (5 questions) and Speed Trivia (5 questions)
   - checks scores / results are produced for each game
+  - covers the v2.2 contracts: the uniform end flow (results ->
+    end-of-game NEXT vote -> end_choice -> replay vote), turn order,
+    UNO house rules, President roles + exchange, the Secret Word
+    multi-round loop, interpolated Reaction points, team scoring
+    styles and Championship mode
 
-Run:  .venv/bin/python tests/test_hub.py
+Run:  .venv/bin/python -m pytest tests/test_hub.py -x -q
+  or:  .venv/bin/python tests/test_hub.py
 Exit code 0 = all checks passed.
 """
 import asyncio
 import json
+import random
 import re
 import subprocess
 import sys
@@ -24,14 +31,19 @@ import websockets
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from questions import QUESTIONS  # noqa: E402
+from secret_clues import SECRET_CLUES, SECRET_CATEGORY, VAGUE_CLUES_80  # noqa: E402
 from server import make_math_question, record_answer, Room, Player, team_standings  # noqa: E402
 from server import (GAMES, ELIM_POOL, SECRET_WORDS, VAGUE_CLUES, secret_tally,  # noqa: E402
                     build_president_deck, president_legal_play,  # noqa: E402
                     president_illegal_reason,  # noqa: E402
                     president_lowest_legal, president_scores_for,  # noqa: E402
-                    pres_rank,  # noqa: E402
+                    pres_rank, compute_turn_order,  # noqa: E402
+                    president_roles_for, president_ordered_ids,  # noqa: E402
+                    president_titles_for_finish,  # noqa: E402
                     build_uno_deck, uno_match, uno_bot_choice,  # noqa: E402
-                    uno_best_colour, uno_value, memory_bot_correct)  # noqa: E402
+                    uno_best_colour, uno_value, uno_validate_play,  # noqa: E402
+                    _uno_handle_draw, _uno_apply_play_multi,  # noqa: E402
+                    memory_bot_correct)  # noqa: E402
 from fractions import Fraction  # noqa: E402
 
 PORT = 8001
@@ -115,9 +127,38 @@ class Client:
                 return lobby
         raise AssertionError(f"{self.name}: no {phase} lobby with {count} players")
 
+    async def wait_lobby_where(self, pred, timeout=15):
+        """Wait for a lobby broadcast whose room satisfies `pred`.
+
+        Lobby broadcasts queue up, so a bare wait_for("lobby") often
+        returns a stale one (from before the last settings change or
+        game end). This loops until the room actually matches.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            lobby = await self.wait_for("lobby", timeout=deadline - time.monotonic())
+            if pred(lobby["room"]):
+                return lobby
+        raise AssertionError(f"{self.name}: no lobby matching predicate in {timeout}s")
+
     async def close(self):
         if self.ws:
             await self.ws.close()
+
+    async def drain(self, mtype):
+        """Drop all currently-queued messages of the given type.
+
+        Lobby broadcasts queue up (join, settings, game end), so a
+        timed wait for the NEXT lobby must first discard the stale
+        ones — otherwise it returns immediately on an old broadcast.
+        """
+        kept = []
+        while not self.queue.empty():
+            msg = self.queue.get_nowait()
+            if msg.get("type") != mtype:
+                kept.append(msg)
+        for m in kept:
+            await self.queue.put(m)
 
 
 async def wait_any(client, types, timeout=20):
@@ -141,6 +182,247 @@ async def wait_any(client, types, timeout=20):
     for b in buf:
         await client.queue.put(b)
     raise AssertionError(f"{client.name}: timed out waiting for {types}")
+
+
+async def drive_end_flow(host, voters, choice="lobby", *, method="skip",
+                         count=None, timeout=15):
+    """v2.2 uniform end flow, driven after a `results` message.
+
+    Passes the end-of-game NEXT vote (phase "results", flagged
+    `end_of_game`), waits for `end_choice` (the FINAL standings),
+    then votes `choice` ("again" | "lobby") via `replay_vote` from
+    each voter in `voters` (>= half of connected humans decides it).
+    `method="skip"` uses the host's host_skip; `method="vote"` has
+    every voter send vote_next instead (covers vote_next working in
+    phase "results"). Returns the `end_choice` message. For "lobby"
+    it also waits for the lobby (when `count` is given); for "again"
+    it waits for the fresh `game_started` and returns it as well.
+    """
+    deadline = time.monotonic() + timeout
+    vb = None
+    while time.monotonic() < deadline:
+        cand = await host.wait_for("vote_break",
+                                   timeout=deadline - time.monotonic())
+        if cand.get("end_of_game"):
+            vb = cand
+            break
+        # A stale round break queued ahead of the end-of-game vote:
+        # vote it through so the game can proceed.
+        await host.send({"type": "vote_next", "index": cand["index"]})
+    check("v2.2 end-of-game vote break is flagged end_of_game",
+          vb is not None and vb.get("end_of_game") is True, str(vb))
+    if method == "skip":
+        await host.send({"type": "host_skip"})
+    else:
+        for v in voters:
+            await v.send({"type": "vote_next", "index": vb["index"]})
+    end = await host.wait_for("end_choice", timeout=timeout)
+    check("v2.2 end_choice carries final standings",
+          len(end.get("rankings", [])) > 0
+          and all("score" in r for r in end["rankings"]),
+          str(end.get("rankings")))
+    for v in voters:
+        await v.send({"type": "replay_vote", "choice": choice})
+    if choice == "lobby":
+        lobby_msg = None
+        if count is not None:
+            lobby_msg = await host.wait_lobby_phase("lobby", count,
+                                                    timeout=timeout)
+        return end, lobby_msg
+    started = await host.wait_for("game_started", timeout=timeout)
+    return end, started
+
+
+async def secret_driver(client, my_id, store, vote_for):
+    """v2.2 Secret Word driver: gives one clue per round (a real
+    non-vague clue for citizens, "thing" for the impostor), votes
+    per `vote_for(round, my_id, alive_ids, clues_by_round)`, votes
+    NEXT on round breaks, and records everything in `store`
+    (words, clue_order, clues by round, round_results, vote_breaks,
+    violations if the server ever asks an eliminated player to play).
+    Returns the `secret_result` message."""
+    my_word = None
+    eliminated = False
+    store["words"] = {}
+    store["clue_order"] = []
+    store["clues"] = {}
+    store["round_results"] = []
+    store["vote_breaks"] = []
+    store["violations"] = []
+    while True:
+        msg = await wait_any(client, ("secret_word", "secret_clue_turn",
+                                      "secret_clue_shown", "secret_vote_start",
+                                      "secret_round_result", "secret_result",
+                                      "vote_break"), timeout=60)
+        t = msg["type"]
+        if t == "secret_word":
+            store["words"][my_id] = msg
+            my_word = msg.get("word")
+        elif t == "secret_clue_turn":
+            store["clue_order"].append((msg["round"], msg["player_id"]))
+            if msg["player_id"] == my_id:
+                if eliminated:
+                    store["violations"].append(
+                        "clue turn after elimination")
+                else:
+                    clue = "thing"
+                    if my_word:
+                        # A real clue: the first one that is not a
+                        # generic vague word (so a vague clue always
+                        # marks the impostor).
+                        clue = next((c for c in SECRET_CLUES.get(my_word, [])
+                                     if c not in VAGUE_CLUES_80), "thing")
+                    await client.send({"type": "secret_clue", "clue": clue})
+        elif t == "secret_clue_shown":
+            store["clues"].setdefault(msg["round"], {})[msg["player_id"]] = msg["clue"]
+        elif t == "secret_vote_start":
+            alive_ids = [p["player_id"] for p in msg["players"]]
+            if my_id not in alive_ids:
+                eliminated = True
+                continue
+            if eliminated:
+                store["violations"].append(
+                    "vote start includes me after elimination")
+                continue
+            target = vote_for(msg["round"], my_id, alive_ids,
+                              store["clues"])
+            if target and target != my_id:
+                await client.send({"type": "secret_vote",
+                                   "player_id": target})
+        elif t == "secret_round_result":
+            store["round_results"].append(msg)
+            if msg.get("eliminated") == my_id:
+                eliminated = True
+        elif t == "secret_result":
+            store["result"] = msg
+            return msg
+        elif t == "vote_break":
+            store["vote_breaks"].append(msg)
+            await client.send({"type": "vote_next", "index": msg["index"]})
+
+
+async def any_game_driver(client, my_id, state, mem_correct=False):
+    """Plays whatever game is current (used by the random re-roll
+    test): Reaction, Math, Trivia, Memory, UNO, President, Secret.
+    Votes NEXT on every vote break. On `end_choice` the host votes
+    "again" while state["want_again"] and state["replays"] < 3, else
+    "lobby". Records game_started games in state["games"] and sets
+    state["lobby"] on reaching the lobby. Memory: only the host
+    answers correctly (mem_correct), so the game ends after round 1;
+    Secret: everyone votes for state["secret_target"] (its owner
+    falls back to the first other alive player), so the vote resolves
+    in round 1."""
+    number = None
+    my_word = None
+    # Drop stale lobby broadcasts (join / settings) queued before the
+    # game started, or the lobby branch below would return at once.
+    await client.drain("lobby")
+    while True:
+        msg = await wait_any(client, (
+            "game_started", "question", "reaction_wait", "reaction_go",
+            "memory_show", "memory_recall", "uno_state", "president_state",
+            "president_notice", "secret_word", "secret_clue_turn",
+            "secret_vote_start", "secret_round_result", "secret_result",
+            "vote_break", "end_choice", "lobby", "error"), timeout=120)
+        t = msg["type"]
+        if t == "game_started":
+            if msg["game"] != "elimination":
+                state["games"].append(msg["game"])
+        elif t == "question":
+            if msg.get("options"):
+                await client.send({"type": "answer", "answer": 0,
+                                   "index": msg["index"]})
+            else:
+                ans = solve_math(msg["text"])
+                await client.send({"type": "answer", "answer": str(ans),
+                                   "index": msg["index"]})
+        elif t == "reaction_go":
+            await client.send({"type": "reaction_click"})
+        elif t == "memory_show":
+            number = msg["number"]
+        elif t == "memory_recall":
+            await client.send({"type": "memory_answer",
+                               "answer": number if mem_correct else "0000"})
+        elif t == "uno_state":
+            if msg["turn_id"] != my_id:
+                continue
+            choice = uno_bot_choice(
+                msg["hand"], msg["top"], msg["current_colour"],
+                pending_type=msg.get("pending_type"),
+                multi_play=msg.get("multi_play", False))
+            if choice:
+                colour = None
+                if any(c.startswith("W") for c in choice):
+                    colour = uno_best_colour(
+                        [c for c in msg["hand"] if c not in choice]) or "R"
+                await client.send({"type": "uno_play", "cards": choice,
+                                   "colour": colour})
+            else:
+                await client.send({"type": "uno_draw"})
+        elif t == "president_state":
+            if msg.get("exchange") and msg["exchange"]["giver_id"] == my_id:
+                n = msg["exchange"]["count"]
+                low = sorted(msg["hand"], key=pres_rank)[:n]
+                await client.send({"type": "president_exchange",
+                                   "cards": low})
+                continue
+            if msg["turn_id"] != my_id:
+                continue
+            hand, trick = msg["hand"], msg["trick"]
+            if trick is None:
+                by_rank = {}
+                for c in hand:
+                    by_rank.setdefault(pres_rank(c), []).append(c)
+                play = by_rank[min(by_rank)]
+            else:
+                play = president_lowest_legal(
+                    hand, {"size": trick["size"], "rank": trick["rank"]})
+            if play:
+                await client.send({"type": "president_play", "cards": play})
+            else:
+                await client.send({"type": "president_pass"})
+        elif t == "secret_word":
+            my_word = msg.get("word")
+        elif t == "secret_clue_turn":
+            if msg["player_id"] == my_id:
+                clue = "thing"
+                if my_word:
+                    clue = next((c for c in SECRET_CLUES.get(my_word, [])
+                                 if c not in VAGUE_CLUES_80), "thing")
+                await client.send({"type": "secret_clue", "clue": clue})
+        elif t == "secret_vote_start":
+            players = msg["players"]
+            alive_ids = [p["player_id"] for p in players]
+            if my_id not in alive_ids:
+                continue
+            target = state.get("secret_target")
+            if target is None or target == my_id \
+                    or target not in alive_ids:
+                target = next((pid for pid in alive_ids if pid != my_id),
+                              None)
+            if target:
+                await client.send({"type": "secret_vote",
+                                   "player_id": target})
+        elif t == "vote_break":
+            await client.send({"type": "vote_next", "index": msg["index"]})
+        elif t == "end_choice":
+            # Every human votes the same way (the replay needs >= half
+            # of connected humans; the host alone cannot carry it).
+            # Only the host counts the replay against the 3-replay cap.
+            if state["want_again"] and state["replays"] < 3:
+                if client is state.get("host_client"):
+                    state["replays"] += 1
+                await client.send({"type": "replay_vote",
+                                   "choice": "again"})
+            else:
+                await client.send({"type": "replay_vote",
+                                   "choice": "lobby"})
+        elif t == "lobby":
+            if msg["room"]["phase"] == "lobby" and state["games"]:
+                state["lobby"] = True
+                return
+        # reaction_wait, secret_round_result, secret_result,
+        # president_notice, error: nothing to do
 
 
 def solve_math(text):
@@ -297,10 +579,38 @@ async def main():
               str([(r["nickname"], r["avg_ms"]) for r in results["rankings"]]))
         check("reaction rankings have an average time",
               any(r["avg_ms"] is not None for r in results["rankings"]))
+        # --- v2.2 §9: Reaction points are interpolated by average
+        # time — best 1000, worst 0, all-equal 1000, no valid time 0.
+        # Recompute the formula from the broadcast averages and
+        # compare it exactly against the broadcast scores.
+        _avgs = [r["avg_ms"] for r in results["rankings"]
+                 if r["avg_ms"] is not None]
+        _best, _worst = min(_avgs), max(_avgs)
+        _formula_ok = True
+        for r in results["rankings"]:
+            if r["avg_ms"] is None:
+                _exp = 0
+            elif _best == _worst:
+                _exp = 1000
+            else:
+                _exp = round(1000 * (_worst - r["avg_ms"]) / (_worst - _best))
+            if r["score"] != _exp:
+                _formula_ok = False
+        check("v2.2 Reaction points match the interpolation formula "
+              "(best 1000 / worst 0 / no valid time 0)",
+              _formula_ok and results["rankings"][0]["score"] == 1000,
+              str([(r["nickname"], r["avg_ms"], r["score"])
+                   for r in results["rankings"]]))
+        check("v2.2 Reaction rankings are ordered by average time",
+              [r["avg_ms"] for r in results["rankings"]]
+              == sorted([r["avg_ms"] for r in results["rankings"]],
+                        key=lambda a: (a is None, a or 0)),
+              str([(r["nickname"], r["avg_ms"]) for r in results["rankings"]]))
 
         # --- back to lobby, Speed Math: 5 questions ---
-        await host.send({"type": "play_again"})
-        await host.wait_lobby_phase("lobby", 4)
+        # v2.2: play_again is gone — results -> end-of-game NEXT vote
+        # -> end_choice -> replay_vote "lobby" -> lobby.
+        await drive_end_flow(host, [host, p2], choice="lobby", count=4)
         await host.send({"type": "update_settings", "game": "math",
                          "game_settings": {"math": {"difficulty": "Easy",
                                                     "questions": 5,
@@ -332,8 +642,10 @@ async def main():
               results["rankings"][0]["nickname"] == "Matthew")
 
         # --- Speed Trivia: 5 questions ---
-        await host.send({"type": "play_again"})
-        await host.wait_lobby_phase("lobby", 4)
+        # v2.2: the end-of-game vote is passed with vote_next here
+        # (not host_skip) — vote_next must work in phase "results".
+        await drive_end_flow(host, [host, p2], choice="lobby",
+                             method="vote", count=4)
         await host.send({"type": "update_settings", "game": "trivia",
                          "game_settings": {"trivia": {"category": "Mixed",
                                                       "difficulty": "Easy",
@@ -363,9 +675,9 @@ async def main():
               str([(r["nickname"], r["score"]) for r in results["rankings"]]))
 
         # --- back to lobby, same players still there ---
-        await host.send({"type": "play_again"})
-        lobby = await host.wait_lobby_phase("lobby", 4)
-        check("Play Again returns to lobby with same 4 players",
+        _, lobby = await drive_end_flow(host, [host, p2], choice="lobby",
+                                        count=4)
+        check("v2.2 end flow returns to lobby with same 4 players",
               len(lobby["room"]["players"]) == 4 and lobby["room"]["phase"] == "lobby")
 
         # --- v1.1: ping/pong keep-alive ---
@@ -428,8 +740,9 @@ async def main():
 
         # ================= v1.1 tests =================
         # --- Fix 4: lobby profile editing (own nickname/colour only) ---
-        await host.send({"type": "play_again"})
-        lobby = await host.wait_lobby_phase("lobby", 4)
+        # v2.2: play_again is gone — drive the end flow instead.
+        _, lobby = await drive_end_flow(host, [host, p2b], choice="lobby",
+                                        count=4)
         await p2b.send({"type": "update_profile", "nickname": "CousinOne",
                         "colour": "#2ecc71"})
         lobby = await host.wait_lobby_count(4)
@@ -882,14 +1195,18 @@ async def main():
               str(results["teams"]))
         await h8.close(); await r8.close()
 
-        # --- Fix 4: customization boxes are compact (~1/3 width) ---
+        # --- Fix 4 (v2.2): the standalone compact customization boxes
+        # are gone — the lobby now edits via tap-to-expand player cards
+        # (v2.2 client redesign). The editing itself is covered live
+        # above (profile edit, bot edit); here pin the new UI.
         html = (ROOT / "static" / "index.html").read_text()
-        check("v1.2 lobby profile box uses the compact class",
-              'class="card compact"' in html)
-        check("v1.2 compact CSS caps width near one third (~210px)",
-              "max-width: 210px" in html and ".compact .swatch" in html)
-        check("v1.2 bot edit panel uses the compact class",
-              'id="botEdit" class="card compact hidden"' in html)
+        check("v2.2 lobby player cards are tap-to-edit (bots + self)",
+              "tap a card to edit it" in html
+              and "update_bot" in html and "update_profile" in html)
+        check("v2.2 lobby card edit covers nickname, colour, difficulty",
+              "nickname:nn, colour:chosenColour, difficulty" in html)
+        check("v2.2 lobby card edit can remove a bot",
+              "remove_bot" in html)
 
         # ================= v2 tests =================
         # --- Unit: Secret Word tally + word bank ---
@@ -897,7 +1214,10 @@ async def main():
               secret_tally({"a": "x", "b": "x", "c": "y"}, {"x"}) == ("x", True))
         check("v2 secret tally: voting out an innocent wins for the impostors",
               secret_tally({"a": "y", "b": "y"}, {"x"}) == ("y", False))
-        check("v2 secret tally: a tie eliminates nobody, impostors win",
+        # v2.2: a tie eliminates nobody and the game continues to the
+        # next clue round — the helper reports (None, False): no
+        # elimination, and the word team did not win this vote.
+        check("v2.2 secret tally: a tie eliminates nobody",
               secret_tally({"a": "x", "b": "y"}, {"x"}) == (None, False))
         check("v2 secret tally: no votes, impostors win",
               secret_tally({}, {"x"}) == (None, False))
@@ -905,6 +1225,30 @@ async def main():
               len(SECRET_WORDS) >= 60
               and all(len(v) >= 3 for v in SECRET_WORDS.values()),
               f"{len(SECRET_WORDS)} words")
+
+        # --- v2.2: secret_clues module (data worker's contract) ---
+        check("v2.2 secret clues: 72 words, 30-40 distinct clues each, "
+              "never the word itself",
+              len(SECRET_CLUES) == 72
+              and all(30 <= len(v) <= 40 for v in SECRET_CLUES.values())
+              and all(len(set(v)) == len(v) for v in SECRET_CLUES.values())
+              and all(w not in v for w, v in SECRET_CLUES.items()),
+              f"{len(SECRET_CLUES)} words, "
+              f"min {min(len(v) for v in SECRET_CLUES.values())} / "
+              f"max {max(len(v) for v in SECRET_CLUES.values())} clues")
+        check("v2.2 secret categories: 72 words across the 5 categories",
+              len(SECRET_CATEGORY) == 72
+              and set(SECRET_CATEGORY.values())
+              == {"Animals", "Food", "Places", "Objects", "Jobs"},
+              str(sorted(set(SECRET_CATEGORY.values()))))
+        check("v2.2 vague pool: 80 unique generic words, none a bank word",
+              len(VAGUE_CLUES_80) == 80
+              and len(set(VAGUE_CLUES_80)) == 80
+              and not any(c in SECRET_CLUES for c in VAGUE_CLUES_80),
+              f"{len(VAGUE_CLUES_80)} vague clues")
+        check("v2.2 secret clues cover the same 72 words as the bank",
+              set(SECRET_CLUES) == set(SECRET_WORDS)
+              and set(SECRET_CATEGORY) == set(SECRET_WORDS))
 
         # --- Unit: President legality / strategy / scoring / deck ---
         _hand = ["3♣", "3♦", "5♥", "K♠", "2♦"]
@@ -951,6 +1295,81 @@ async def main():
               president_scores_for(4) == [1000, 667, 333, 0]
               and president_scores_for(5) == [1000, 750, 500, 250, 0])
 
+        # --- v2.2 §6: President roles from the finish order ---
+        def _pres_room(ids, finish):
+            r = Room(code="PRES01", game="president")
+            r.players = [Player(id=i, nickname=i, colour="#fff")
+                         for i in ids]
+            r.president_finish_order = list(finish)
+            return r
+
+        _pr = _pres_room(["a", "b", "c", "d"], ["a", "b", "c", "d"])
+        check("v2.2 president roles for 4 players: P/C/C/Peasant",
+              president_roles_for(_pr) == {"a": "President", "b": "Citizen",
+                                           "c": "Citizen", "d": "Peasant"},
+              str(president_roles_for(_pr)))
+        _pr = _pres_room(["a", "b", "c", "d", "e"],
+                         ["a", "b", "c", "d", "e"])
+        check("v2.2 president roles for 5 players: P/VP/C/VPs/Peasant",
+              president_roles_for(_pr) == {"a": "President",
+                                           "b": "Vice President",
+                                           "c": "Citizen",
+                                           "d": "Vice Peasant",
+                                           "e": "Peasant"},
+              str(president_roles_for(_pr)))
+        _pr = _pres_room(["a", "b", "c", "d", "e", "f"],
+                         ["a", "b", "c", "d", "e", "f"])
+        check("v2.2 president roles for 6 players: P/VP/C/C/VPs/Peasant",
+              president_roles_for(_pr) == {"a": "President",
+                                           "b": "Vice President",
+                                           "c": "Citizen", "d": "Citizen",
+                                           "e": "Vice Peasant",
+                                           "f": "Peasant"},
+              str(president_roles_for(_pr)))
+        _pr = _pres_room(["a", "b", "c", "d", "e", "f", "g", "h"],
+                         ["a", "b", "c", "d", "e", "f", "g", "h"])
+        check("v2.2 president roles for 8 players: P/VP/Cx4/VPs/Peasant",
+              president_roles_for(_pr) == {"a": "President",
+                                           "b": "Vice President",
+                                           "c": "Citizen", "d": "Citizen",
+                                           "e": "Citizen", "f": "Citizen",
+                                           "g": "Vice Peasant",
+                                           "h": "Peasant"},
+              str(president_roles_for(_pr)))
+        # A newcomer is appended at the bottom (as if they finished
+        # last), which naturally promotes the old Peasant.
+        _pr = _pres_room(["a", "b", "c", "d", "e"], ["a", "b", "c", "d"])
+        check("v2.2 president: newcomer appended at bottom of the order",
+              president_ordered_ids(_pr) == ["a", "b", "c", "d", "e"],
+              str(president_ordered_ids(_pr)))
+        check("v2.2 president: newcomer arrival promotes Peasant to "
+              "Vice Peasant and the newcomer is Peasant",
+              president_roles_for(_pr)["d"] == "Vice Peasant"
+              and president_roles_for(_pr)["e"] == "Peasant",
+              str(president_roles_for(_pr)))
+        # A player who left is filtered out of the stored order.
+        _pr = _pres_room(["a", "b", "d"], ["a", "b", "c", "d"])
+        check("v2.2 president: stored order filters to current players",
+              president_ordered_ids(_pr) == ["a", "b", "d"])
+        # Match 1 (no stored finish order): everyone is a Citizen.
+        _pr = _pres_room(["a", "b", "c", "d"], [])
+        check("v2.2 president match 1: everyone is a Citizen",
+              president_roles_for(_pr) == {i: "Citizen"
+                                           for i in "abcd"},
+              str(president_roles_for(_pr)))
+        # Roles are only published when President is the selected game.
+        _pr.game = "reaction"
+        check("v2.2 president roles are empty when President is not "
+              "the selected game",
+              president_roles_for(_pr) == {})
+        check("v2.2 president titles for a 4-player finish",
+              president_titles_for_finish(4)
+              == ["President", "Citizen", "Citizen", "Peasant"])
+        check("v2.2 president titles for a 5-player finish",
+              president_titles_for_finish(5)
+              == ["President", "Vice President", "Citizen",
+                  "Vice Peasant", "Peasant"])
+
         # --- Unit: UNO deck / matching / bot strategy ---
         _deck = build_uno_deck()
         check("v2 UNO: 108-card deck", len(_deck) == 108, f"{len(_deck)}")
@@ -961,14 +1380,147 @@ async def main():
         check("v2 UNO: wild always matches", uno_match("Wwild", "R5", "G"))
         check("v2 UNO: non-matching card rejected",
               not uno_match("B7", "R5", "G"))
-        check("v2 UNO: bot prefers a number card over a wild",
-              uno_bot_choice(["R5", "Wwild"], "R9", "R") == "R5")
+        # v2.2: uno_bot_choice now returns a LIST of cards to play
+        # (one card normally, two for a multi-play pair), or None.
+        check("v2.2 UNO: bot prefers a number card over a wild",
+              uno_bot_choice(["R5", "Wwild"], "R9", "R") == ["R5"])
         check("v2 UNO: bot with no match draws",
               uno_bot_choice(["B7"], "R5", "G") is None)
         check("v2 UNO: bot wild colour is its most common colour",
               uno_best_colour(["R5", "R7", "B3"]) == "R")
         check("v2 UNO: value parsing",
               uno_value("Gdraw2") == "draw2" and uno_value("Wwild") == "wild")
+        # v2.2 §5: stacking — Hard always stacks a same-type card.
+        check("v2.2 UNO: bot stacks a +2 on a pending +2 (Hard)",
+              uno_bot_choice(["Gdraw2", "R5"], "R9", "R",
+                             pending_type="draw2", difficulty="Hard")
+              == ["Gdraw2"])
+        check("v2.2 UNO: bot cannot stack a +4 on a pending +2",
+              uno_bot_choice(["Wdraw4", "R5"], "R9", "R",
+                             pending_type="draw2", difficulty="Hard") is None)
+        check("v2.2 UNO: bot with no stackable card draws the pile",
+              uno_bot_choice(["R5", "B3"], "R9", "R",
+                             pending_type="draw2", difficulty="Hard") is None)
+        # v2.2 §5: multi-play — a same-value pair, both cards matching
+        # the top by value (B9 + G9 on R9; seeded: the Hard pair
+        # probability is 0.7 and random.seed(42) draws 0.639…).
+        _state = random.getstate()
+        random.seed(42)
+        _pair = uno_bot_choice(["B9", "G9", "R5"], "R9", "R",
+                               multi_play=True, difficulty="Hard")
+        random.setstate(_state)
+        check("v2.2 UNO: bot multi-play returns a same-value pair",
+              _pair == ["B9", "G9"], str(_pair))
+
+        # --- v2.2 §5: UNO house-rule validation (pure, deterministic) ---
+        check("v2.2 UNO validate: multi-play off rejects two cards",
+              uno_validate_play(["R5", "B5"], ["R5", "B5"], "R9", "R",
+                                multi_play=False) is not None)
+        check("v2.2 UNO validate: multi-play on accepts a same-value pair",
+              uno_validate_play(["R5", "B5"], ["R5", "B5"], "R9", "R",
+                                multi_play=True) is None)
+        check("v2.2 UNO validate: multi-play rejects mixed values",
+              uno_validate_play(["R5", "B6"], ["R5", "B6"], "R9", "R",
+                                multi_play=True) is not None)
+        check("v2.2 UNO validate: multi-play rejects a first card that "
+              "does not match the top card",
+              uno_validate_play(["B5", "G5"], ["B5", "G5"], "R9", "R",
+                                multi_play=True) is not None)
+        check("v2.2 UNO validate: stacking accepts a +2 on a pending +2",
+              uno_validate_play(["Gdraw2"], ["Gdraw2"], "R9", "R",
+                                pending_draw=2, pending_type="draw2") is None)
+        check("v2.2 UNO validate: stacking rejects a +4 on a pending +2",
+              uno_validate_play(["Wdraw4"], ["Wdraw4"], "R9", "R",
+                                pending_draw=2, pending_type="draw2") is not None)
+        check("v2.2 UNO validate: stacking rejects a non-draw card on "
+              "a pending draw",
+              uno_validate_play(["R5"], ["R5"], "R9", "R",
+                                pending_draw=2, pending_type="draw2") is not None)
+        check("v2.2 UNO validate: a card not in hand is rejected",
+              uno_validate_play(["R5"], ["B5"], "R9", "R") is not None)
+        check("v2.2 UNO validate: an empty play is rejected",
+              uno_validate_play(["R5"], [], "R9", "R") is not None)
+
+        # --- v2.2 §5: multi-play effects (all effects trigger) ---
+        def _uno_room(hand, top, colour, **kw):
+            r = Room(code="UNO01")
+            p1 = Player(id="u1", nickname="U1", colour="#fff")
+            p2 = Player(id="u2", nickname="U2", colour="#fff")
+            r.players = [p1, p2]
+            st = {"hands": {"u1": list(hand), "u2": ["R3"]},
+                  "draw": list(kw.get("draw", [])),
+                  "discard": [top], "current_colour": colour,
+                  "direction": 1, "order": ["u1", "u2"],
+                  "pending_draw": kw.get("pending_draw", 0),
+                  "pending_type": kw.get("pending_type"),
+                  "skip_count": 0}
+            r.round_state = st
+            return r, p1
+
+        _ru, _pu = _uno_room(["Rdraw2", "Gdraw2", "B5"], "R9", "R")
+        _uno_apply_play_multi(_ru, _pu, ["Rdraw2", "Gdraw2"])
+        check("v2.2 UNO multi-play: two +2s stack to a pending +4",
+              _ru.round_state["pending_draw"] == 4
+              and _ru.round_state["pending_type"] == "draw2"
+              and _ru.round_state["hands"]["u1"] == ["B5"]
+              and _ru.round_state["current_colour"] == "G",
+              str(_ru.round_state))
+        _ru, _pu = _uno_room(["Rskip", "Bskip", "G5"], "R9", "R")
+        _uno_apply_play_multi(_ru, _pu, ["Rskip", "Bskip"])
+        check("v2.2 UNO multi-play: two skips skip two players",
+              _ru.round_state["skip_count"] == 2
+              and _ru.round_state["current_colour"] == "B",
+              str(_ru.round_state))
+        _ru, _pu = _uno_room(["Rreverse", "Breverse", "G5"], "R9", "R")
+        _uno_apply_play_multi(_ru, _pu, ["Rreverse", "Breverse"])
+        check("v2.2 UNO multi-play: two reverses flip direction twice "
+              "(back to normal)",
+              _ru.round_state["direction"] == 1,
+              str(_ru.round_state["direction"]))
+        _ru, _pu = _uno_room(["Wwild", "R5"], "G9", "G")
+        _uno_apply_play_multi(_ru, _pu, ["Wwild"], "B")
+        check("v2.2 UNO multi-play: a Wild sets the colour once",
+              _ru.round_state["current_colour"] == "B"
+              and _ru.round_state["discard"][-1] == "Wwild",
+              str(_ru.round_state))
+
+        # --- v2.2 §5: draw rules (draw-until-playable / must-play) ---
+        # OFF + playable drawn -> drawn card is auto-played (hand size
+        # unchanged, top card becomes the drawn card).
+        _rd, _pd = _uno_room(["R5", "B3"], "R9", "R", draw=["R7"])
+        _uno_handle_draw(_rd, _pd)
+        check("v2.2 UNO draw OFF: a playable drawn card must be played",
+              len(_rd.round_state["hands"]["u1"]) == 2
+              and _rd.round_state["discard"][-1] == "R7"
+              and "R7" not in _rd.round_state["hands"]["u1"],
+              str(_rd.round_state))
+        # OFF + unplayable drawn -> kept, turn ends with one more card.
+        _rd, _pd = _uno_room(["R5", "B3"], "R9", "R", draw=["B8"])
+        _uno_handle_draw(_rd, _pd)
+        check("v2.2 UNO draw OFF: an unplayable drawn card is kept",
+              len(_rd.round_state["hands"]["u1"]) == 3
+              and _rd.round_state["discard"][-1] == "R9",
+              str(_rd.round_state))
+        # ON: draws until a playable card appears, then auto-plays it
+        # (draw pile pops from the end: B8 first, then R3).
+        _rd, _pd = _uno_room(["R5", "B3"], "R9", "R", draw=["R3", "B8"])
+        _rd.game_settings["uno"]["draw_until_playable"] = True
+        _uno_handle_draw(_rd, _pd)
+        check("v2.2 UNO draw ON: draws until playable, then auto-plays",
+              _rd.round_state["hands"]["u1"] == ["R5", "B3", "B8"]
+              and _rd.round_state["discard"][-1] == "R3",
+              str(_rd.round_state))
+        # Stacking take: a pending +4 draws the full total, then clears.
+        _rd, _pd = _uno_room(["R5", "B3"], "R9", "R",
+                             draw=["G1", "G2", "G3", "G4"],
+                             pending_draw=4, pending_type="draw4")
+        _uno_handle_draw(_rd, _pd)
+        check("v2.2 UNO stacking: taking a pending +4 draws all 4 and "
+              "clears the pending total",
+              len(_rd.round_state["hands"]["u1"]) == 6
+              and _rd.round_state["pending_draw"] == 0
+              and _rd.round_state["pending_type"] is None,
+              str(_rd.round_state))
 
         # --- Unit: Memory bot recall (seeded, statistical with wide margins) ---
         # v2.1 retune: per-digit error grows with length, so bots
@@ -1023,57 +1575,274 @@ async def main():
               "memory" not in [g for g in ELIM_POOL
                                if GAMES[g]["min_players"] <= 1])
 
-        # --- v2: Secret Word full game (2 humans + 2 bots) ---
-        hs = Client("secret-host"); await hs.connect()
-        await hs.send({"type": "create_room", "nickname": "SecretHost", "colour": "#e74c3c"})
-        js = await hs.wait_for("joined"); codes = js["code"]; hs_id = js["player_id"]
-        rs = Client("secret-p2"); await rs.connect()
-        await rs.send({"type": "join_room", "code": codes, "nickname": "SecretP2", "colour": "#3498db"})
-        jr = await rs.wait_for("joined"); rs_id = jr["player_id"]
-        await hs.send({"type": "add_bot"}); await hs.wait_lobby_count(3)
-        await hs.send({"type": "add_bot"}); await hs.wait_lobby_count(4)
-        await hs.send({"type": "update_settings", "game": "secret"})
-        await hs.wait_lobby()
+        # --- v2.2 §4: turn order (unit) ---
+        _rto = Room(code="TO01")
+        _rto.players = [Player(id=i, nickname=i, colour="#fff")
+                        for i in ["a", "b", "c", "d"]]
+        _rto.turn_order_mode = "manual"
+        _rto.manual_order = ["c", "a"]
+        check("v2.2 manual turn order: host list first, the rest "
+              "appended in join order",
+              compute_turn_order(_rto) == ["c", "a", "b", "d"],
+              str(compute_turn_order(_rto)))
+        _rto.manual_order = ["c", "a", "zzz", "b", "d"]
+        check("v2.2 manual turn order: unknown ids are dropped",
+              compute_turn_order(_rto) == ["c", "a", "b", "d"])
+        _rto.turn_order_mode = "random"
+        _orders = {tuple(compute_turn_order(_rto)) for _ in range(30)}
+        check("v2.2 random turn order: shuffles (several distinct orders "
+              "in 30 draws) and is always a permutation of the players",
+              len(_orders) >= 3
+              and all(sorted(o) == ["a", "b", "c", "d"] for o in _orders),
+              f"{len(_orders)} distinct orders")
+
+        # --- v2.2 §9: team scoring styles (unit) ---
+        def _team_room(scores, teams, style):
+            r = Room(code="TS01", mode="teams", team_count=2)
+            r.team_scoring = style
+            r.players = [Player(id=i, nickname=i, colour="#fff",
+                                score=s) for i, s in scores.items()]
+            r.teams = dict(teams)
+            return r
+
+        _rts = _team_room({"a": 100, "b": 300, "c": 50},
+                          {"a": 0, "b": 0, "c": 1}, "sum")
+        _sts = {t["team"]: t["score"] for t in team_standings(_rts)}
+        check("v2.2 team scoring sum: team totals are member sums",
+              _sts == {0: 400.0, 1: 50.0}, str(_sts))
+        _rts = _team_room({"a": 100, "b": 300, "c": 50},
+                          {"a": 0, "b": 0, "c": 1}, "best")
+        _sts = {t["team"]: t["score"] for t in team_standings(_rts)}
+        check("v2.2 team scoring best: team totals are the best member",
+              _sts == {0: 300.0, 1: 50.0}, str(_sts))
+        _rts = _team_room({"a": 100, "b": 300, "c": 50},
+                          {"a": 0, "b": 0, "c": 1}, "average")
+        _sts = {t["team"]: t["average"] for t in team_standings(_rts)}
+        check("v2.2 team scoring average: team totals are member means",
+              _sts == {0: 200.0, 1: 50.0}, str(_sts))
+        # An eliminated member (score 0) still counts in the average's
+        # denominator — the team is not flattered by losing a member.
+        _rts = _team_room({"a": 100, "b": 0, "c": 50},
+                          {"a": 0, "b": 0, "c": 1}, "average")
+        _sts = {t["team"]: t["average"] for t in team_standings(_rts)}
+        check("v2.2 team scoring: an eliminated (0-score) member counts "
+              "in the average denominator",
+              _sts[0] == 50.0, str(_sts))
+        _rts = _team_room({"a": 100, "b": 0, "c": 50},
+                          {"a": 0, "b": 0, "c": 1}, "sum")
+        _sts = {t["team"]: t["score"] for t in team_standings(_rts)}
+        check("v2.2 team scoring: an eliminated member contributes 0 "
+              "to the sum",
+              _sts[0] == 100.0, str(_sts))
+        _rts = _team_room({"a": 0, "b": 0, "c": 50},
+                          {"a": 0, "b": 0, "c": 1}, "best")
+        _sts = {t["team"]: t["score"] for t in team_standings(_rts)}
+        check("v2.2 team scoring: a team with no surviving members "
+              "totals 0 under best",
+              _sts[0] == 0.0, str(_sts))
+
+        # --- v2.2 §8: Secret Word multi-round game (5 humans) ---
+        # 5 humans, 1 impostor, MANUAL turn order (scrambled). The
+        # vote plan forces a round-1 tie (nobody out), a round-2
+        # citizen elimination (the game continues, the victim
+        # spectates), and a round-3 impostor catch. One game covers
+        # the whole loop: multi-round, tie, spectating, hidden points.
+        s_names = ["SecretHost", "SecretP2", "SecretP3", "SecretP4",
+                   "SecretP5"]
+        s_colours = ["#e74c3c", "#3498db", "#2ecc71", "#f1c40f", "#9b59b6"]
+        s_clients = []
+        s_ids = []
+        s_code = None
+        for i, (nm, col) in enumerate(zip(s_names, s_colours)):
+            c = Client(f"secret-{i}")
+            await c.connect()
+            if i == 0:
+                await c.send({"type": "create_room", "nickname": nm,
+                              "colour": col})
+            else:
+                await c.send({"type": "join_room", "code": s_code,
+                              "nickname": nm, "colour": col})
+            j = await c.wait_for("joined")
+            if i == 0:
+                s_code = j["code"]
+            s_ids.append(j["player_id"])
+            s_clients.append(c)
+        hs = s_clients[0]
+        # Manual turn order, scrambled (not join order).
+        s_manual = [s_ids[1], s_ids[4], s_ids[0], s_ids[3], s_ids[2]]
+        await hs.send({"type": "update_settings", "game": "secret",
+                       "turn_order_mode": "manual",
+                       "turn_order": s_manual})
+        await hs.wait_lobby_where(
+            lambda r: r.get("turn_order_mode") == "manual"
+            and r.get("turn_order") == s_manual)
         await hs.send({"type": "start_game"})
         started = await hs.wait_for("game_started", timeout=5)
-        check("v2 Secret Word starts", started["game"] == "secret")
-        my_word = await hs.wait_for("secret_word", timeout=5)
-        check("v2 Secret Word: host gets a private word or impostor notice",
-              (my_word["is_impostor"] and my_word["word"] is None)
-              or (not my_word["is_impostor"] and my_word["word"] in SECRET_WORDS),
-              str(my_word))
+        check("v2.2 Secret Word starts with the manual turn order",
+              started["game"] == "secret"
+              and started.get("turn_order") == s_manual, str(started))
 
-        async def secret_driver(client, my_id, store):
-            while True:
-                msg = await wait_any(client, ("secret_clue_turn", "secret_vote_start"), timeout=45)
-                if msg["type"] == "secret_vote_start":
-                    target = next(p["player_id"] for p in msg["players"] if p["is_bot"])
-                    await client.send({"type": "secret_vote", "player_id": target})
-                    break
-                if msg["player_id"] == my_id:
-                    await client.send({"type": "secret_clue", "clue": "sweet"})
-            store["result"] = await client.wait_for("secret_result", timeout=40)
+        def s_vote_for(round_no, my_id, alive, clues):
+            if round_no == 1:
+                # 2-2-1 split for a tie: B gets 2, C gets 2, D gets 1;
+                # nobody votes for themselves.
+                _t1 = {s_ids[0]: s_ids[1], s_ids[1]: s_ids[2],
+                       s_ids[2]: s_ids[1], s_ids[3]: s_ids[2],
+                       s_ids[4]: s_ids[3]}
+                return _t1[my_id]
+            if round_no == 2:
+                # Vote for a KNOWN citizen: someone whose round-1 clue
+                # was a real (non-vague) clue. Skip self.
+                r1 = clues.get(1, {})
+                for pid in s_ids:
+                    if pid in alive and pid != my_id and r1.get(pid) \
+                            and r1[pid] not in VAGUE_CLUES_80:
+                        return pid
+                return next(pid for pid in alive if pid != my_id)
+            # Round 3+: vote for the vague-clue giver (the impostor).
+            rcur = clues.get(round_no, {}) or clues.get(1, {})
+            for pid in s_ids:
+                if pid in alive and pid != my_id \
+                        and rcur.get(pid) in VAGUE_CLUES_80:
+                    return pid
+            return next(pid for pid in alive if pid != my_id)
 
-        sstore = {}
+        s_stores = [{} for _ in s_clients]
         await asyncio.wait_for(asyncio.gather(
-            secret_driver(hs, hs_id, sstore),
-            secret_driver(rs, rs_id, sstore)), timeout=120)
-        sres = sstore["result"]
-        check("v2 Secret Word: result names the word and 1-2 impostors",
-              sres.get("word") in SECRET_WORDS
-              and len(sres.get("impostors", [])) in (1, 2)
-              and len(sres.get("winners", [])) >= 1, str(sres))
-        check("v2 Secret Word: winners are consistent with the vote",
-              (sres["word_team_won"] and sres["eliminated"] in sres["impostors"])
-              or (not sres["word_team_won"] and sres["eliminated"] not in sres["impostors"]),
-              str(sres))
+            *(secret_driver(c, pid, st, s_vote_for)
+              for c, pid, st in zip(s_clients, s_ids, s_stores))),
+            timeout=240)
+        sres = s_stores[0]["result"]
+        _words = {}
+        for st in s_stores:
+            _words.update(st["words"])
+        check("v2.2 Secret: exactly one impostor among the 5 humans",
+              sum(1 for m in _words.values() if m["is_impostor"]) == 1,
+              str([(m["role"], m["word"]) for m in _words.values()]))
+        check("v2.2 Secret: category is sent to BOTH roles, word only "
+              "to citizens",
+              all(m["category"] for m in _words.values())
+              and all((m["word"] in SECRET_WORDS)
+                      if not m["is_impostor"] else (m["word"] is None)
+                      for m in _words.values())
+              and all(m["category"] == SECRET_CATEGORY[sres["word"]]
+                      for m in _words.values()),
+              str(_words))
+        _clue_r1 = [pid for (rnd, pid) in s_stores[0]["clue_order"]
+                    if rnd == 1]
+        check("v2.2 Secret: clue order follows the manual turn order",
+              _clue_r1 == s_manual, str(_clue_r1))
+        _rr = s_stores[0]["round_results"]
+        check("v2.2 Secret: round 1 is a tie — nobody out, game continues",
+              len(_rr) >= 2 and _rr[0]["tie"] is True
+              and _rr[0]["eliminated"] is None, str(_rr))
+        check("v2.2 Secret: the game ran exactly 3 clue rounds",
+              len(_rr) == 3 and [r["round"] for r in _rr] == [1, 2, 3],
+              str([(r["round"], r["eliminated"], r["tie"]) for r in _rr]))
+        check("v2.2 Secret: round breaks hide the scores too",
+              all(vb.get("scores") == []
+                  for vb in s_stores[0]["vote_breaks"]),
+              str(s_stores[0]["vote_breaks"]))
+        _elim2 = _rr[1]["eliminated"]
+        _victim_store = s_stores[s_ids.index(_elim2)]
+        check("v2.2 Secret: the voted-out player spectates (no clue turn "
+              "or vote after elimination)",
+              _victim_store["violations"] == [],
+              str(_victim_store["violations"]))
+        check("v2.2 Secret: round 3 had no clue turn for the eliminated "
+              "player",
+              all(pid != _elim2
+                  for (rnd, pid) in s_stores[0]["clue_order"] if rnd == 3),
+              str(s_stores[0]["clue_order"]))
+        check("v2.2 Secret: round 2 eliminated a citizen, round 3 caught "
+              "the impostor",
+              _rr[1]["eliminated"] not in sres["impostors"]
+              and _rr[2]["eliminated"] in sres["impostors"],
+              str([(r["round"], r["eliminated"]) for r in _rr]))
+        check("v2.2 Secret: citizens win by catching the impostor",
+              sres["word_team_won"] is True
+              and sres["eliminated"] in sres["impostors"]
+              and sres.get("word") in SECRET_WORDS
+              and len(sres.get("winners", [])) == 4, str(sres))
         results = await hs.wait_for("results", timeout=10)
-        check("v2 Secret Word produces results for all 4 players",
-              len(results["rankings"]) == 4 and results["game"] == "secret",
-              str([(r["nickname"], r["score"]) for r in results["rankings"]]))
-        await hs.close(); await rs.close()
+        check("v2.2 Secret: results hide the points until end_choice",
+              results.get("scores_hidden") is True
+              and all("score" not in r for r in results["rankings"])
+              and len(results["rankings"]) == 5,
+              str(results["rankings"]))
+        check("v2.2 Secret: results still name the word and impostors",
+              results.get("word") in SECRET_WORDS
+              and len(results.get("impostors", [])) == 1, str(results))
+        # Expected per-round scores, recomputed from the round results:
+        # +200 per round survived; a citizen who voted for a wrongly
+        # eliminated citizen gets +100 instead of 200 that round.
+        _imp = set(sres["impostors"])
+        _exp = {pid: 0 for pid in s_ids}
+        for _r in _rr:
+            _elim = _r["eliminated"]
+            _wrong = _elim is not None and _elim not in _imp
+            for _pid in _r["alive"]:
+                if _wrong and _r["votes"].get(_pid) == _elim \
+                        and _pid not in _imp:
+                    _exp[_pid] += 100
+                else:
+                    _exp[_pid] += 200
+        end, _ = await drive_end_flow(hs, s_clients, choice="lobby",
+                                      count=5)
+        _got = {r["player_id"]: r["score"] for r in end["rankings"]}
+        check("v2.2 Secret: end_choice reveals the per-round points "
+              "(+200/round survived, +100 for a wrong citizen vote)",
+              _got == _exp, f"got={_got} expected={_exp}")
+        check("v2.2 Secret: the round-2 victim scored only for the "
+              "round they survived",
+              _got[_elim2] == 200, str(_got))
+        for c in s_clients:
+            await c.close()
 
-        # --- v2: President full game (2 humans + 2 bots) ---
+        # --- v2.2 §8: 2 impostors with <5 players ends immediately ---
+        ha = Client("secret2-host")
+        await ha.connect()
+        await ha.send({"type": "create_room", "nickname": "AbortHost",
+                       "colour": "#e74c3c"})
+        ja = await ha.wait_for("joined")
+        codea = ja["code"]
+        ra = Client("secret2-p2")
+        await ra.connect()
+        await ra.send({"type": "join_room", "code": codea,
+                       "nickname": "AbortP2", "colour": "#3498db"})
+        await ra.wait_for("joined")
+        await ha.send({"type": "add_bot"})
+        await ha.wait_lobby_count(3)
+        await ha.send({"type": "add_bot"})
+        await ha.wait_lobby_count(4)
+        await ha.send({"type": "update_settings", "game": "secret",
+                       "game_settings": {"secret": {"impostors": 2}}})
+        await ha.wait_lobby()
+        await ha.send({"type": "start_game"})
+        started = await ha.wait_for("game_started", timeout=5)
+        check("v2.2 Secret (2 impostors) starts", started["game"] == "secret")
+        ended = await ha.wait_for("secret_ended", timeout=10)
+        check("v2.2 Secret: 2 impostors with 4 players ends immediately",
+              ended.get("reason") == "too_few_for_two_impostors",
+              str(ended))
+        sres_a = await ha.wait_for("secret_result", timeout=10)
+        check("v2.2 Secret: aborted game names the word, no winners",
+              sres_a.get("word") in SECRET_WORDS
+              and sres_a.get("word_team_won") is False
+              and sres_a.get("winners") == [], str(sres_a))
+        results = await ha.wait_for("results", timeout=10)
+        check("v2.2 Secret: aborted results are flagged and hide points",
+              results.get("aborted") is True
+              and results.get("scores_hidden") is True
+              and len(results["rankings"]) == 4, str(results))
+        await drive_end_flow(ha, [ha, ra], choice="lobby", count=4)
+        await ha.close()
+        await ra.close()
+
+        # --- v2.2 §6: President full game (2 humans + 2 bots) ---
+        # Match 1 is all Citizens with the MANUAL turn order; the
+        # replay then starts match 2 with roles from the match-1
+        # finish order, the card exchange, and the President leading.
         hp = Client("pres-host"); await hp.connect()
         await hp.send({"type": "create_room", "nickname": "PresHost", "colour": "#e74c3c"})
         jp = await hp.wait_for("joined"); codep = jp["code"]; hp_id = jp["player_id"]
@@ -1081,21 +1850,33 @@ async def main():
         await rp.send({"type": "join_room", "code": codep, "nickname": "PresP2", "colour": "#3498db"})
         jr = await rp.wait_for("joined"); rp_id = jr["player_id"]
         await hp.send({"type": "add_bot"}); await hp.wait_lobby_count(3)
-        await hp.send({"type": "add_bot"}); await hp.wait_lobby_count(4)
+        await hp.send({"type": "add_bot"})
+        lobby = await hp.wait_lobby_count(4)
+        _pbots = [p["id"] for p in lobby["room"]["players"] if p["is_bot"]]
+        # Manual turn order, scrambled (not join order).
+        p_manual = [rp_id, _pbots[0], hp_id, _pbots[1]]
         await hp.send({"type": "update_settings", "game": "president",
-                       "game_settings": {"president": {"turn_seconds": 5}}})
-        await hp.wait_lobby()
+                       "game_settings": {"president": {"turn_seconds": 5}},
+                       "turn_order_mode": "manual",
+                       "turn_order": p_manual})
+        await hp.wait_lobby_where(
+            lambda r: r.get("turn_order_mode") == "manual"
+            and r.get("turn_order") == p_manual)
         await hp.send({"type": "start_game"})
         started = await hp.wait_for("game_started", timeout=5)
-        check("v2 President starts", started["game"] == "president")
+        check("v2.2 President starts with the manual turn order",
+              started["game"] == "president"
+              and started.get("turn_order") == p_manual, str(started))
 
-        async def pres_driver(client, my_id):
+        async def pres_driver(client, my_id, store=None):
             # On my turn, lead with ALL cards of the lowest rank (sheds
             # fast), or play the lowest legal set; otherwise pass.
             while True:
                 msg = await wait_any(client, ("president_state", "results"), timeout=60)
                 if msg["type"] == "results":
                     return msg
+                if store is not None and store.get("first_state") is None:
+                    store["first_state"] = msg
                 if msg["turn_id"] != my_id:
                     continue
                 hand = msg["hand"]
@@ -1113,8 +1894,9 @@ async def main():
                 else:
                     await client.send({"type": "president_pass"})
 
+        p_store = {}
         pres_done = await asyncio.wait_for(asyncio.gather(
-            pres_driver(hp, hp_id), pres_driver(rp, rp_id)), timeout=300)
+            pres_driver(hp, hp_id, p_store), pres_driver(rp, rp_id)), timeout=300)
         pres_res = pres_done[0]
         check("v2 President produces results with a finish order of 4",
               pres_res["game"] == "president" and len(pres_res["rankings"]) == 4,
@@ -1123,6 +1905,94 @@ async def main():
               pres_res["rankings"][0]["score"] == 1000
               and pres_res["rankings"][-1]["score"] == 0,
               str([(r["nickname"], r["score"]) for r in pres_res["rankings"]]))
+        check("v2.2 President match 1: everyone is a Citizen",
+              p_store["first_state"]["roles"]
+              == {pid: "Citizen" for pid in p_manual},
+              str(p_store["first_state"]["roles"]))
+        check("v2.2 President match 1: rotation is the manual order and "
+              "the first player in it leads",
+              p_store["first_state"]["turn_order"] == p_manual
+              and p_store["first_state"]["turn_id"] == p_manual[0],
+              str(p_store["first_state"]))
+        _finish = pres_res.get("finish_order", [])
+        check("v2 President: results carry the finish order",
+              len(_finish) == 4 and len(set(_finish)) == 4, str(_finish))
+
+        # --- v2.2 §6: match 2 (replay) — roles, exchange, President leads ---
+        end, started2 = await drive_end_flow(hp, [hp, rp], choice="again")
+        check("v2.2 President replay starts the same game again",
+              started2["game"] == "president", str(started2))
+        check("v2.2 President replay keeps the manual turn order",
+              started2.get("turn_order") == p_manual,
+              str(started2.get("turn_order")))
+
+        async def pres_match2_driver(client, my_id, store):
+            # Match 2: handle the card exchange (pick the lowest cards
+            # when I am the giver), record the roles / rotation / first
+            # turn, then keep playing legally.
+            while True:
+                msg = await wait_any(client, ("president_state", "results",
+                                              "president_notice"), timeout=90)
+                if msg["type"] == "results":
+                    store["results"] = msg
+                    return msg
+                if msg["type"] == "president_notice":
+                    continue
+                if store.get("roles") is None:
+                    store["roles"] = msg.get("roles")
+                    store["turn_order"] = msg.get("turn_order")
+                if msg.get("exchange"):
+                    store["exchange_seen"] = True
+                    if msg["exchange"]["giver_id"] == my_id:
+                        n = msg["exchange"]["count"]
+                        low = sorted(msg["hand"], key=pres_rank)[:n]
+                        await client.send({"type": "president_exchange",
+                                           "cards": low})
+                    continue
+                if store.get("first_turn") is None:
+                    store["first_turn"] = msg["turn_id"]
+                if msg["turn_id"] != my_id:
+                    continue
+                hand, trick = msg["hand"], msg["trick"]
+                if trick is None:
+                    by_rank = {}
+                    for c in hand:
+                        by_rank.setdefault(pres_rank(c), []).append(c)
+                    play = by_rank[min(by_rank)]
+                else:
+                    play = president_lowest_legal(
+                        hand, {"size": trick["size"], "rank": trick["rank"]})
+                if play:
+                    await client.send({"type": "president_play", "cards": play})
+                else:
+                    await client.send({"type": "president_pass"})
+
+        p2_store = {}
+        p2_tasks = [asyncio.create_task(pres_match2_driver(hp, hp_id, p2_store)),
+                    asyncio.create_task(pres_match2_driver(rp, rp_id, {}))]
+        _deadline = time.monotonic() + 60
+        while time.monotonic() < _deadline and not (
+                p2_store.get("roles") and p2_store.get("exchange_seen")
+                and p2_store.get("first_turn")):
+            await asyncio.sleep(0.2)
+        _expected_roles = dict(zip(
+            _finish, president_titles_for_finish(len(_finish))))
+        check("v2.2 President match 2: roles come from the match-1 "
+              "finish order",
+              p2_store.get("roles") == _expected_roles,
+              f"got={p2_store.get('roles')} expected={_expected_roles}")
+        check("v2.2 President match 2: rotation is the finish order, "
+              "strictly (President first … Peasant last)",
+              p2_store.get("turn_order") == _finish,
+              str(p2_store.get("turn_order")))
+        check("v2.2 President match 2: the card exchange ran",
+              p2_store.get("exchange_seen") is True)
+        check("v2.2 President match 2: the President leads",
+              p2_store.get("first_turn") == _finish[0],
+              f"first_turn={p2_store.get('first_turn')} finish={_finish}")
+        for _t in p2_tasks:
+            _t.cancel()
+        await asyncio.gather(*p2_tasks, return_exceptions=True)
         await hp.close(); await rp.close()
 
         # --- v2.1: President illegal plays + timeout auto-play notice ---
@@ -1135,17 +2005,31 @@ async def main():
         await rq.send({"type": "join_room", "code": codeq, "nickname": "Pres2P2", "colour": "#3498db"})
         jr = await rq.wait_for("joined"); rq_id = jr["player_id"]
         await hq.send({"type": "add_bot"}); await hq.wait_lobby_count(3)
-        await hq.send({"type": "add_bot"}); await hq.wait_lobby_count(4)
+        await hq.send({"type": "add_bot"})
+        _lq = await hq.wait_lobby_count(4)
+        _qbots = [p["id"] for p in _lq["room"]["players"] if p["is_bot"]]
+        # v2.2: manual order with rq leading first (turn_order[0]
+        # leads) so rq's pair lead reaches hq on the very next turn.
+        _qmanual = [rq_id, hq_id] + _qbots
         await hq.send({"type": "update_settings", "game": "president",
-                       "game_settings": {"president": {"turn_seconds": 4}}})
-        await hq.wait_lobby()
+                       "game_settings": {"president": {"turn_seconds": 4}},
+                       "turn_order_mode": "manual",
+                       "turn_order": _qmanual})
+        await hq.wait_lobby_where(
+            lambda r: r.get("turn_order_mode") == "manual"
+            and r.get("turn_order") == _qmanual)
         await hq.send({"type": "start_game"})
         started = await hq.wait_for("game_started", timeout=5)
         check("v2.1 President (probe game) starts", started["game"] == "president")
+        check("v2.2 President probe game uses the manual turn order",
+              started.get("turn_order") == _qmanual, str(started))
         probe = {"empty": False, "size": False, "notice": ""}
 
         async def pres_auto_driver(client, my_id):
-            # Play legally forever (used for the second human).
+            # Play legally forever (used for the second human). When
+            # leading, lead the lowest PAIR if one is held — that
+            # puts a multi-card trick in front of the host, which is
+            # what the size probe needs.
             while True:
                 msg = await wait_any(client, ("president_state", "results",
                                               "president_notice"), timeout=90)
@@ -1160,7 +2044,9 @@ async def main():
                     by_rank = {}
                     for c in hand:
                         by_rank.setdefault(pres_rank(c), []).append(c)
-                    play = by_rank[min(by_rank)]
+                    pairs = [g for g in by_rank.values() if len(g) >= 2]
+                    play = (min(pairs, key=lambda g: pres_rank(g[0]))
+                            if pairs else by_rank[min(by_rank)])
                 else:
                     play = president_lowest_legal(
                         hand, {"size": trick["size"], "rank": trick["rank"]})
@@ -1282,52 +2168,125 @@ async def main():
               and len(pres2_res[0]["rankings"]) == 4)
         await hq.close(); await rq.close()
 
-        # --- v2: UNO full game (2 humans + 1 bot) ---
+        # --- v2.2 §5: UNO full game (2 humans + 1 bot) ---
+        # v2.2: drawn cards are auto-played when playable (no more
+        # "drawn" offer to keep), uno_bot_choice returns a LIST, and
+        # scoring is purely the finishing-order scale by cards left.
         hu = Client("uno-host"); await hu.connect()
         await hu.send({"type": "create_room", "nickname": "UnoHost", "colour": "#e74c3c"})
         ju = await hu.wait_for("joined"); codeu = ju["code"]; hu_id = ju["player_id"]
         ru = Client("uno-p2"); await ru.connect()
         await ru.send({"type": "join_room", "code": codeu, "nickname": "UnoP2", "colour": "#3498db"})
         jr = await ru.wait_for("joined"); ru_id = jr["player_id"]
-        await hu.send({"type": "add_bot"}); await hu.wait_lobby_count(3)
+        await hu.send({"type": "add_bot"})
+        lobby = await hu.wait_lobby_count(3)
+        _ubot = [p["id"] for p in lobby["room"]["players"] if p["is_bot"]][0]
+        # Manual turn order, scrambled (not join order).
+        u_manual = [ru_id, _ubot, hu_id]
         await hu.send({"type": "update_settings", "game": "uno",
-                       "game_settings": {"uno": {"turn_seconds": 5}}})
-        await hu.wait_lobby()
+                       "game_settings": {"uno": {"turn_seconds": 5}},
+                       "turn_order_mode": "manual",
+                       "turn_order": u_manual})
+        await hu.wait_lobby_where(
+            lambda r: r.get("turn_order_mode") == "manual"
+            and r.get("turn_order") == u_manual)
         await hu.send({"type": "start_game"})
         started = await hu.wait_for("game_started", timeout=5)
-        check("v2 UNO starts", started["game"] == "uno")
+        check("v2.2 UNO starts with the manual turn order",
+              started["game"] == "uno"
+              and started.get("turn_order") == u_manual, str(started))
 
-        async def uno_driver(client, my_id):
+        async def uno_driver(client, my_id, store=None):
+            # v2.2: on my turn, play the bot's pick (a list — one card
+            # normally, a same-value pair with multi-play on) or draw.
+            # A drawn playable card is auto-played by the server, so
+            # there is no drawn-card offer to answer anymore.
             while True:
                 msg = await wait_any(client, ("uno_state", "results"), timeout=60)
                 if msg["type"] == "results":
                     return msg
+                if store is not None and store.get("first_turn") is None:
+                    store["first_turn"] = msg["turn_id"]
+                    # The opening discard can be a Draw 2: real UNO
+                    # makes the first player draw 2 and lose the turn,
+                    # so the first state then belongs to player #2.
+                    store["first_top"] = msg.get("top")
                 if msg["turn_id"] != my_id:
                     continue
-                if msg.get("drawn"):
-                    drawn = msg["drawn"]
-                    if uno_match(drawn, msg["top"], msg["current_colour"]):
-                        await client.send({"type": "uno_play", "card": drawn,
-                                           "colour": "R" if drawn.startswith("W") else None})
-                    else:
-                        await client.send({"type": "uno_end_turn"})
-                    continue
-                card = uno_bot_choice(msg["hand"], msg["top"], msg["current_colour"])
-                if card:
-                    await client.send({"type": "uno_play", "card": card,
-                                       "colour": "R" if card.startswith("W") else None})
+                choice = uno_bot_choice(
+                    msg["hand"], msg["top"], msg["current_colour"],
+                    pending_type=msg.get("pending_type"),
+                    multi_play=msg.get("multi_play", False))
+                if choice:
+                    colour = None
+                    if any(c.startswith("W") for c in choice):
+                        colour = uno_best_colour(
+                            [c for c in msg["hand"] if c not in choice]) or "R"
+                    await client.send({"type": "uno_play", "cards": choice,
+                                       "colour": colour})
                 else:
                     await client.send({"type": "uno_draw"})
 
+        u_store = {}
         uno_done = await asyncio.wait_for(asyncio.gather(
-            uno_driver(hu, hu_id), uno_driver(ru, ru_id)), timeout=300)
+            uno_driver(hu, hu_id, u_store), uno_driver(ru, ru_id)), timeout=300)
         uno_res = uno_done[0]
-        check("v2 UNO produces results: winner emptied their hand (+1000)",
-              uno_res["game"] == "uno" and uno_res["rankings"][0]["score"] == 1000
-              and uno_res["rankings"][0].get("cards_left") == 0,
+        _first_top = u_store.get("first_top")
+        _draw2_start = (_first_top is not None
+                        and uno_value(_first_top) == "draw2")
+        check("v2.2 UNO: the first player in the manual order starts "
+              "(or #2 if the opening card is a Draw 2, which skips #1)",
+              u_store.get("first_turn") == u_manual[0]
+              or (_draw2_start
+                  and u_store.get("first_turn") == u_manual[1]),
+              f"first_turn={u_store.get('first_turn')} top={_first_top}")
+        _uno_scale = president_scores_for(3)
+        check("v2.2 UNO produces results on the finishing-order scale "
+              "(winner 1000, 2nd 500, 3rd 0 — no winner bonus)",
+              uno_res["game"] == "uno"
+              and uno_res["rankings"][0].get("cards_left") == 0
+              and [r["score"] for r in uno_res["rankings"]] == _uno_scale
+              and [r.get("cards_left") for r in uno_res["rankings"]]
+              == sorted(r.get("cards_left") for r in uno_res["rankings"]),
               str([(r["nickname"], r["score"], r.get("cards_left"))
                    for r in uno_res["rankings"]]))
+        await drive_end_flow(hu, [hu, ru], choice="lobby", count=3)
         await hu.close(); await ru.close()
+
+        # --- v2.2 §5: UNO with all house rules ON (2 humans + 1 bot) ---
+        # Draw-until-playable + stacking + multi-play must flow through
+        # settings into a complete, correctly scored game.
+        hw = Client("unohouse-host"); await hw.connect()
+        await hw.send({"type": "create_room", "nickname": "UnoHouseHost", "colour": "#e74c3c"})
+        jw = await hw.wait_for("joined"); codew = jw["code"]; hw_id = jw["player_id"]
+        rw = Client("unohouse-p2"); await rw.connect()
+        await rw.send({"type": "join_room", "code": codew, "nickname": "UnoHouseP2", "colour": "#3498db"})
+        jr = await rw.wait_for("joined"); rw_id = jr["player_id"]
+        await hw.send({"type": "add_bot"}); await hw.wait_lobby_count(3)
+        await hw.send({"type": "update_settings", "game": "uno",
+                       "game_settings": {"uno": {"turn_seconds": 5,
+                                                 "draw_until_playable": True,
+                                                 "stacking": True,
+                                                 "multi_play": True}}})
+        await hw.wait_lobby()
+        await hw.send({"type": "start_game"})
+        started = await hw.wait_for("game_started", timeout=5)
+        check("v2.2 UNO house-rules game starts",
+              started["game"] == "uno"
+              and started["settings"].get("draw_until_playable") is True
+              and started["settings"].get("stacking") is True
+              and started["settings"].get("multi_play") is True,
+              str(started.get("settings")))
+        house_done = await asyncio.wait_for(asyncio.gather(
+            uno_driver(hw, hw_id), uno_driver(rw, rw_id)), timeout=300)
+        house_res = house_done[0]
+        check("v2.2 UNO house-rules game finishes on the same scale",
+              house_res["game"] == "uno"
+              and [r["score"] for r in house_res["rankings"]] == _uno_scale,
+              str([(r["nickname"], r["score"], r.get("cards_left"))
+                   for r in house_res["rankings"]]))
+        await drive_end_flow(hw, [hw, rw], choice="lobby", count=3)
+        await hw.close(); await rw.close()
 
         # --- v2: Memory game (3 humans; host answers right, others wrong) ---
         hm = Client("mem-host"); await hm.connect()
@@ -1350,7 +2309,8 @@ async def main():
             number = None
             while True:
                 msg = await wait_any(client, ("memory_show", "memory_recall",
-                                              "memory_round_result", "results"),
+                                              "memory_round_result",
+                                              "vote_break", "results"),
                                      timeout=30)
                 if msg["type"] == "memory_show":
                     number = msg["number"]
@@ -1362,6 +2322,10 @@ async def main():
                 elif msg["type"] == "memory_round_result":
                     if rounds_seen is not None:
                         rounds_seen.append(msg)
+                elif msg["type"] == "vote_break":
+                    # v2.2 §3: a NEXT vote follows each non-final round.
+                    await client.send({"type": "vote_next",
+                                       "index": msg["index"]})
                 elif msg["type"] == "results":
                     return msg
 
@@ -1396,7 +2360,8 @@ async def main():
             number = None
             while True:
                 msg = await wait_any(client, ("memory_show", "memory_recall",
-                                              "memory_round_result", "results"),
+                                              "memory_round_result",
+                                              "vote_break", "results"),
                                      timeout=30)
                 if msg["type"] == "memory_show":
                     number = msg["number"]
@@ -1408,6 +2373,12 @@ async def main():
                 elif msg["type"] == "memory_round_result":
                     if rounds_seen is not None:
                         rounds_seen.append(msg)
+                elif msg["type"] == "vote_break":
+                    # v2.2 §3: the tie redo is gated by a NEXT vote —
+                    # without this the test would wait out the 60s
+                    # default timeout after the tied round.
+                    await client.send({"type": "vote_next",
+                                       "index": msg["index"]})
                 elif msg["type"] == "results":
                     return msg
 
@@ -1495,14 +2466,24 @@ async def main():
                 elif t == "elimination_eliminated":
                     elim_state["eliminated"].append(msg["nickname"])
                 elif t == "results":
-                    elim_state["results"].append(msg)
+                    # Count each series ONCE (host only): both drivers
+                    # see the same broadcast, so appending from both
+                    # would make one series look like two.
+                    if client is he:
+                        elim_state["results"].append(msg)
                 elif t == "elimination_end_vote":
                     # First end vote -> Play Again (new series);
-                    # second end vote -> Return to Lobby.
+                    # second end vote -> Return to Lobby, forced by the
+                    # HOST's host_replay override (v2.2) instead of a
+                    # community vote.
                     my_end_votes += 1
-                    choice = "again" if my_end_votes == 1 else "lobby"
-                    await client.send({"type": "elimination_vote",
-                                       "choice": choice})
+                    if my_end_votes == 1:
+                        await client.send({"type": "elimination_vote",
+                                           "choice": "again"})
+                    elif client is he:
+                        elim_state["host_replay_used"] = True
+                        await client.send({"type": "host_replay",
+                                           "choice": "lobby"})
                 elif t == "lobby":
                     if msg["room"]["phase"] == "lobby" and elim_state["results"]:
                         elim_state["lobby"] = True
@@ -1539,6 +2520,9 @@ async def main():
               str([(r["nickname"], r["score"]) for r in first["finishing_order"]]))
         check("v2 Elimination: series ends back in the lobby",
               elim_state["lobby"])
+        check("v2.2 Elimination: the second end vote was forced by the "
+              "host's host_replay override (not a community vote)",
+              elim_state.get("host_replay_used") is True)
         # --- v2.1: pacing breaks + intros ---
         # At least one break per challenge in each series (regular
         # challenges + finale), each naming who was eliminated and
@@ -1571,6 +2555,596 @@ async def main():
         await asyncio.wait_for(asyncio.gather(ed1, ed2), timeout=30)
         await he.close(); await re_.close()
 
+        # ================= v2.2 tests: replay / end flow =================
+        # --- host_replay "again" replays the same game, scores reset ---
+        hr1 = Client("replay-host"); await hr1.connect()
+        await hr1.send({"type": "create_room", "nickname": "ReplayHost", "colour": "#e74c3c"})
+        j1 = await hr1.wait_for("joined"); code1 = j1["code"]
+        r1 = Client("replay-p2"); await r1.connect()
+        await r1.send({"type": "join_room", "code": code1, "nickname": "ReplayP2", "colour": "#3498db"})
+        await r1.wait_for("joined")
+        await hr1.send({"type": "update_settings", "game": "math",
+                        "game_settings": {"math": {"difficulty": "Easy", "questions": 2,
+                                                   "time_per_question": 5, "vote_timeout": 3}}})
+        await hr1.wait_lobby()
+        await hr1.send({"type": "start_game"})
+        await hr1.wait_for("game_started")
+        for qi in (1, 2):
+            mq = await hr1.wait_for("question", timeout=15)
+            aq = solve_math(mq["text"])
+            await hr1.send({"type": "answer", "answer": str(aq), "index": mq["index"]})
+            await r1.send({"type": "answer", "answer": str(aq + 1), "index": mq["index"]})
+            res = await hr1.wait_for("question_result", timeout=10)
+            if qi == 1:
+                await hr1.wait_for("vote_break", timeout=10)
+                await hr1.send({"type": "vote_next", "index": 1})
+        g1_final = {r["nickname"]: r["score"] for r in
+                    (await hr1.wait_for("results", timeout=10))["rankings"]}
+        check("v2.2 replay setup: host scored in game 1",
+              g1_final.get("ReplayHost", 0) > 0, str(g1_final))
+        # End-of-game vote, then the HOST overrides with host_replay.
+        vb = await hr1.wait_for("vote_break", timeout=10)
+        check("v2.2 end-of-game vote break is flagged end_of_game",
+              vb.get("end_of_game") is True, str(vb))
+        # Drive the end-of-game vote with host_skip, then host_replay "again".
+        await hr1.send({"type": "host_skip"})
+        end = await hr1.wait_for("end_choice", timeout=10)
+        check("v2.2 end_choice carries the final standings",
+              len(end["rankings"]) == 2
+              and all("score" in r for r in end["rankings"]),
+              str(end["rankings"]))
+        await hr1.send({"type": "host_replay", "choice": "again"})
+        started = await hr1.wait_for("game_started", timeout=10)
+        check("v2.2 host_replay 'again' replays the same game",
+              started["game"] == "math", str(started))
+        # Game 2, Q1: the host's score restarts from 0 (not the
+        # game-1 total) — scores reset on a non-championship replay.
+        mq = await hr1.wait_for("question", timeout=15)
+        aq = solve_math(mq["text"])
+        await hr1.send({"type": "answer", "answer": str(aq), "index": mq["index"]})
+        await r1.send({"type": "answer", "answer": str(aq + 1), "index": mq["index"]})
+        res = await hr1.wait_for("question_result", timeout=10)
+        _host_pts = next(p["points"] for p in res["points"]
+                         if p["player_id"] == j1["player_id"])
+        _host_score = next(s["score"] for s in res["scores"]
+                           if s["player_id"] == j1["player_id"])
+        check("v2.2 replay resets scores (game 2 score == Q1 points only, "
+              "not game 1 total + Q1 points)",
+              _host_score == _host_pts,
+              f"game2 score={_host_score} (Q1 points={_host_pts}) "
+              f"game1 final={g1_final.get('ReplayHost')}")
+        await hr1.wait_for("vote_break", timeout=10)
+        await hr1.send({"type": "vote_next", "index": 1})
+        mq = await hr1.wait_for("question", timeout=15)
+        aq = solve_math(mq["text"])
+        await hr1.send({"type": "answer", "answer": str(aq), "index": mq["index"]})
+        await r1.send({"type": "answer", "answer": str(aq + 1), "index": mq["index"]})
+        await hr1.wait_for("question_result", timeout=10)
+        await hr1.wait_for("results", timeout=10)
+        # host_replay "lobby" returns to the lobby.
+        await drive_end_flow(hr1, [hr1, r1], choice="lobby", count=2,
+                             method="skip")
+        await hr1.close(); await r1.close()
+
+        # --- host_replay "lobby" (host override, no community vote) ---
+        hl = Client("hreplay-host"); await hl.connect()
+        await hl.send({"type": "create_room", "nickname": "HLHost", "colour": "#e74c3c"})
+        jl = await hl.wait_for("joined"); codel = jl["code"]
+        rl = Client("hreplay-p2"); await rl.connect()
+        await rl.send({"type": "join_room", "code": codel, "nickname": "HLP2", "colour": "#3498db"})
+        await rl.wait_for("joined")
+        await hl.send({"type": "update_settings", "game": "math",
+                       "game_settings": {"math": {"difficulty": "Easy", "questions": 1,
+                                                  "time_per_question": 5, "vote_timeout": 3}}})
+        await hl.wait_lobby()
+        await hl.send({"type": "start_game"})
+        await hl.wait_for("game_started")
+        mq = await hl.wait_for("question", timeout=15)
+        aq = solve_math(mq["text"])
+        await hl.send({"type": "answer", "answer": str(aq), "index": mq["index"]})
+        await rl.send({"type": "answer", "answer": str(aq + 1), "index": mq["index"]})
+        await hl.wait_for("question_result", timeout=10)
+        await hl.wait_for("results", timeout=10)
+        vb = await hl.wait_for("vote_break", timeout=10)
+        check("v2.2 end-of-game vote break is flagged end_of_game (2)",
+              vb.get("end_of_game") is True, str(vb))
+        await hl.send({"type": "host_skip"})
+        await hl.wait_for("end_choice", timeout=10)
+        await hl.send({"type": "host_replay", "choice": "lobby"})
+        lobby = await hl.wait_lobby_phase("lobby", 2, timeout=10)
+        check("v2.2 host_replay 'lobby' returns to the lobby with no "
+              "community vote",
+              lobby["room"]["phase"] == "lobby")
+        await hl.close(); await rl.close()
+
+        # --- replay timeout defaults to the lobby (60s) ---
+        ht = Client("timeout-host"); await ht.connect()
+        await ht.send({"type": "create_room", "nickname": "TOHost", "colour": "#e74c3c"})
+        jt = await ht.wait_for("joined"); codet = jt["code"]
+        rt = Client("timeout-p2"); await rt.connect()
+        await rt.send({"type": "join_room", "code": codet, "nickname": "TOP2", "colour": "#3498db"})
+        await rt.wait_for("joined")
+        await ht.send({"type": "update_settings", "game": "math",
+                       "game_settings": {"math": {"difficulty": "Easy", "questions": 1,
+                                                  "time_per_question": 5, "vote_timeout": 3}}})
+        await ht.wait_lobby()
+        await ht.send({"type": "start_game"})
+        await ht.wait_for("game_started")
+        mq = await ht.wait_for("question", timeout=15)
+        aq = solve_math(mq["text"])
+        await ht.send({"type": "answer", "answer": str(aq), "index": mq["index"]})
+        await rt.send({"type": "answer", "answer": str(aq + 1), "index": mq["index"]})
+        await ht.wait_for("question_result", timeout=10)
+        await ht.wait_for("results", timeout=10)
+        await ht.wait_for("vote_break", timeout=10)
+        await ht.send({"type": "vote_next", "index": 1})
+        await ht.wait_for("end_choice", timeout=10)
+        # Nobody votes in the replay vote: the 60s timeout must
+        # return the room to the lobby. Drain the stale lobby
+        # broadcasts (join / settings) first, or the timed wait
+        # below would return at once on an old one.
+        await ht.drain("lobby")
+        t0 = time.monotonic()
+        lobby = await ht.wait_lobby_phase("lobby", 2, timeout=75)
+        elapsed = time.monotonic() - t0
+        check("v2.2 replay vote timeout returns to the lobby (~60s)",
+              lobby["room"]["phase"] == "lobby" and elapsed >= 55,
+              f"elapsed={elapsed:.1f}s")
+        await ht.close(); await rt.close()
+
+        # --- v2.2 §1: replay of a "random" game re-rolls a new game ---
+        hr_clients = []
+        hr_ids = []
+        hr_code = None
+        for i, (nm, col) in enumerate([("RandHost", "#e74c3c"),
+                                       ("RandP2", "#3498db"),
+                                       ("RandP3", "#2ecc71")]):
+            c = Client(f"rand-{i}")
+            await c.connect()
+            if i == 0:
+                await c.send({"type": "create_room", "nickname": nm,
+                              "colour": col})
+            else:
+                await c.send({"type": "join_room", "code": hr_code,
+                              "nickname": nm, "colour": col})
+            j = await c.wait_for("joined")
+            if i == 0:
+                hr_code = j["code"]
+            hr_ids.append(j["player_id"])
+            hr_clients.append(c)
+        hr = hr_clients[0]
+        await hr.send({"type": "update_settings", "game": "random",
+                       "game_settings": {
+                           "reaction": {"rounds": 1},
+                           "math": {"difficulty": "Easy", "questions": 1,
+                                    "time_per_question": 5, "vote_timeout": 3},
+                           "trivia": {"category": "Mixed", "difficulty": "Easy",
+                                      "questions": 1, "time_per_question": 5,
+                                      "vote_timeout": 3},
+                           "memory": {"memorize_seconds": 2,
+                                      "recall_seconds": 5},
+                           "uno": {"turn_seconds": 3},
+                           "president": {"turn_seconds": 3}}})
+        await hr.wait_lobby_where(lambda r: r.get("game") == "random")
+        # Start a RANDOM game; if the draw needs 4+ players (Secret /
+        # President) with only 3 in the room, start_game errors — retry
+        # until a playable game is drawn.
+        first_game = None
+        for _attempt in range(10):
+            await hr.send({"type": "start_game"})
+            msg = await wait_any(hr, ("game_started", "error"), timeout=5)
+            if msg["type"] == "game_started":
+                first_game = msg["game"]
+                break
+        check("v2.2 random game starts (a playable draw)",
+              first_game is not None, f"first_game={first_game}")
+        rand_state = {"games": [first_game], "want_again": True,
+                      "replays": 0, "lobby": False,
+                      "host_client": hr,
+                      "secret_target": hr_ids[1]}
+        rand_tasks = [asyncio.create_task(any_game_driver(
+                          c, pid, rand_state, mem_correct=(i == 0)))
+                      for i, (c, pid) in enumerate(zip(hr_clients, hr_ids))]
+        # Wait until a different game has been drawn (up to 3 replays),
+        # then let the current game finish and return to the lobby.
+        _deadline = time.monotonic() + 420
+        while time.monotonic() < _deadline and not rand_state["lobby"]:
+            if len(rand_state["games"]) >= 2 \
+                    and any(g != first_game
+                            for g in rand_state["games"][1:]):
+                rand_state["want_again"] = False
+            await asyncio.sleep(0.5)
+        await asyncio.wait_for(asyncio.gather(*rand_tasks), timeout=60)
+        check("v2.2 replay of a random game re-rolls a new game",
+              len(rand_state["games"]) >= 2
+              and any(g != first_game for g in rand_state["games"][1:]),
+              str(rand_state["games"]))
+        check("v2.2 every replayed game is a valid random pick",
+              all(g in ("reaction", "math", "trivia", "secret", "president",
+                        "uno", "memory") for g in rand_state["games"]),
+              str(rand_state["games"]))
+        check("v2.2 random replay series ends back in the lobby",
+              rand_state["lobby"] is True)
+        for c in hr_clients:
+            await c.close()
+
+        # --- v2.2 §9: Reaction scoring edge cases ---
+        # Solo game: a single player has one average, so best == worst
+        # and everyone scores 1000.
+        hsolo = Client("solo-host"); await hsolo.connect()
+        await hsolo.send({"type": "create_room", "nickname": "SoloHost", "colour": "#e74c3c"})
+        await hsolo.wait_for("joined")
+        await hsolo.send({"type": "update_settings", "game": "reaction",
+                          "game_settings": {"reaction": {"rounds": 2}}})
+        await hsolo.wait_lobby()
+        await hsolo.send({"type": "start_game"})
+        await hsolo.wait_for("game_started")
+        for rnd in range(1, 3):
+            await hsolo.wait_for("reaction_wait", timeout=10)
+            await hsolo.wait_for("reaction_go", timeout=10)
+            await hsolo.send({"type": "reaction_click"})
+            await hsolo.wait_for("reaction_round_result", timeout=10)
+            if rnd == 1:
+                await hsolo.wait_for("vote_break", timeout=10)
+                await hsolo.send({"type": "vote_next", "index": 1})
+        results = await hsolo.wait_for("results", timeout=10)
+        check("v2.2 Reaction: a solo player (best == worst average) "
+              "scores 1000",
+              len(results["rankings"]) == 1
+              and results["rankings"][0]["score"] == 1000,
+              str(results["rankings"]))
+        await drive_end_flow(hsolo, [hsolo], choice="lobby", count=1)
+        await hsolo.close()
+        # False starts only: a player with no valid time scores 0.
+        hf = Client("fs-host"); await hf.connect()
+        await hf.send({"type": "create_room", "nickname": "FSHost", "colour": "#e74c3c"})
+        jf = await hf.wait_for("joined")
+        rf = Client("fs-p2"); await rf.connect()
+        await rf.send({"type": "join_room", "code": jf["code"], "nickname": "FSP2", "colour": "#3498db"})
+        await rf.wait_for("joined")
+        await hf.send({"type": "add_bot"}); await hf.wait_lobby_count(3)
+        await hf.send({"type": "update_settings", "game": "reaction",
+                       "game_settings": {"reaction": {"rounds": 2}}})
+        await hf.wait_lobby()
+        await hf.send({"type": "start_game"})
+        await hf.wait_for("game_started")
+
+        async def fs_driver(client, my_id, false_start):
+            # False-start driver: click during the wait (before the
+            # green light) every round, never click on go.
+            while True:
+                msg = await wait_any(client, ("reaction_wait", "reaction_go",
+                                              "reaction_round_result",
+                                              "vote_break", "results"),
+                                     timeout=15)
+                if msg["type"] == "reaction_wait":
+                    if false_start:
+                        await client.send({"type": "reaction_click"})
+                elif msg["type"] == "reaction_go":
+                    if not false_start:
+                        await client.send({"type": "reaction_click"})
+                elif msg["type"] == "vote_break":
+                    await client.send({"type": "vote_next",
+                                       "index": msg["index"]})
+                elif msg["type"] == "results":
+                    return msg
+
+        fs_done = await asyncio.wait_for(asyncio.gather(
+            fs_driver(hf, jf["player_id"], True),
+            fs_driver(rf, None, False)), timeout=120)
+        fs_res = fs_done[0]
+        _fs_host = next(r for r in fs_res["rankings"]
+                        if r["nickname"] == "FSHost")
+        _fs_p2 = next(r for r in fs_res["rankings"]
+                      if r["nickname"] == "FSP2")
+        check("v2.2 Reaction: a player with no valid time (all false "
+              "starts) scores 0 and has no average",
+              _fs_host["score"] == 0 and _fs_host["avg_ms"] is None,
+              str(fs_res["rankings"]))
+        check("v2.2 Reaction: the clean player still scores 1000 (best)",
+              _fs_p2["score"] == 1000, str(fs_res["rankings"]))
+        await drive_end_flow(hf, [hf, rf], choice="lobby", count=3)
+        await hf.close(); await rf.close()
+
+        # --- v2.2 §9: team scoring styles live (sum, then best) ---
+        hts = Client("tsum-host"); await hts.connect()
+        await hts.send({"type": "create_room", "nickname": "TSHost", "colour": "#e74c3c"})
+        jts = await hts.wait_for("joined"); codets = jts["code"]; hts_id = jts["player_id"]
+        rts = Client("tsum-p2"); await rts.connect()
+        await rts.send({"type": "join_room", "code": codets, "nickname": "TSP2", "colour": "#3498db"})
+        jrts = await rts.wait_for("joined"); rts_id = jrts["player_id"]
+        await hts.send({"type": "add_bot"})
+        lobby = await hts.wait_lobby_count(3)
+        _tbot = [p["id"] for p in lobby["room"]["players"]
+                 if p["is_bot"]][0]
+        await hts.send({"type": "update_settings", "mode": "teams", "team_count": 2,
+                        "team_scoring": "sum", "game": "math",
+                        "game_settings": {"math": {"difficulty": "Easy", "questions": 1,
+                                                   "time_per_question": 5, "vote_timeout": 3}}})
+        await hts.wait_lobby()
+        # Deterministic teams: host + p2 on Team 1, the bot on Team 2.
+        await hts.send({"type": "assign_team", "player_id": hts_id, "team": 0})
+        await hts.wait_lobby()
+        await hts.send({"type": "assign_team", "player_id": rts_id, "team": 0})
+        await hts.wait_lobby()
+        await hts.send({"type": "assign_team", "player_id": _tbot, "team": 1})
+        await hts.wait_lobby_where(
+            lambda r: r["teams"].get(_tbot) == 1)
+        await hts.send({"type": "start_game"})
+        started = await hts.wait_for("game_started", timeout=5)
+        check("v2.2 team game starts in Teams mode with sum scoring",
+              started.get("party_mode") == "teams"
+              and started.get("team_scoring") == "sum", str(started))
+        mq = await hts.wait_for("question", timeout=15)
+        aq = solve_math(mq["text"])
+        await hts.send({"type": "answer", "answer": str(aq), "index": mq["index"]})
+        await rts.send({"type": "answer", "answer": str(aq + 1), "index": mq["index"]})
+        await hts.wait_for("question_result", timeout=10)
+        results = await hts.wait_for("results", timeout=10)
+        _sums = {t["team"]: t["score"] for t in results.get("teams", [])}
+        _members = {}
+        for t in results.get("teams", []):
+            _members[t["team"]] = [m["nickname"] for m in t["members"]]
+        _ok_sum = all(
+            abs(_sums[tm] - sum(
+                next(r["score"] for r in results["rankings"]
+                     if r["nickname"] == n) for n in _members[tm])) < 0.01
+            for tm in _sums)
+        check("v2.2 team scoring sum (live): team totals are member sums",
+              _ok_sum and len(_sums) == 2, str(results.get("teams")))
+        # Second game with "best": the team total is its best member.
+        await drive_end_flow(hts, [hts, rts], choice="lobby", count=3)
+        await hts.send({"type": "update_settings", "team_scoring": "best"})
+        await hts.wait_lobby_where(
+            lambda r: r.get("team_scoring") == "best")
+        await hts.send({"type": "start_game"})
+        await hts.wait_for("game_started", timeout=5)
+        mq = await hts.wait_for("question", timeout=15)
+        aq = solve_math(mq["text"])
+        await hts.send({"type": "answer", "answer": str(aq), "index": mq["index"]})
+        await rts.send({"type": "answer", "answer": str(aq + 1), "index": mq["index"]})
+        await hts.wait_for("question_result", timeout=10)
+        results = await hts.wait_for("results", timeout=10)
+        _best = {t["team"]: t["score"] for t in results.get("teams", [])}
+        _members = {}
+        for t in results.get("teams", []):
+            _members[t["team"]] = [m["nickname"] for m in t["members"]]
+        _ok_best = all(
+            abs(_best[tm] - max(
+                next(r["score"] for r in results["rankings"]
+                     if r["nickname"] == n) for n in _members[tm])) < 0.01
+            for tm in _best)
+        check("v2.2 team scoring best (live): team totals are the best "
+              "member's score",
+              _ok_best and len(_best) == 2, str(results.get("teams")))
+        await drive_end_flow(hts, [hts, rts], choice="lobby", count=3)
+        await hts.close(); await rts.close()
+
+        # --- v2.2 §9: Elimination honours Teams mode ---
+        het = Client("elimteams-host"); await het.connect()
+        await het.send({"type": "create_room", "nickname": "ElimTHost", "colour": "#e74c3c"})
+        jet = await het.wait_for("joined"); codeet = jet["code"]; het_id = jet["player_id"]
+        ret = Client("elimteams-p2"); await ret.connect()
+        await ret.send({"type": "join_room", "code": codeet, "nickname": "ElimTP2", "colour": "#3498db"})
+        await ret.wait_for("joined")
+        await het.send({"type": "add_bot"}); await het.wait_lobby_count(3)
+        await het.send({"type": "add_bot"}); await het.wait_lobby_count(4)
+        await het.send({"type": "update_settings", "mode": "teams", "team_count": 2,
+                        "game": "elimination",
+                        "game_settings": {"elimination": {"vote_timeout": 3}}})
+        await het.wait_lobby()
+        await het.send({"type": "randomize_teams"})
+        await het.wait_lobby()
+        await het.send({"type": "start_game"})
+        et_state = {"results": None, "party_modes": set(), "lobby": False}
+
+        async def elim_teams_driver(client, my_id):
+            number = None
+            while True:
+                msg = await wait_any(client, (
+                    "game_started", "question", "reaction_wait", "reaction_go",
+                    "memory_show", "memory_recall",
+                    "elimination_challenge", "elimination_eliminated",
+                    "vote_break", "results", "elimination_end_vote",
+                    "lobby"), timeout=120)
+                t = msg["type"]
+                if t == "game_started":
+                    et_state["party_modes"].add(msg.get("party_mode"))
+                elif t == "vote_break":
+                    await client.send({"type": "vote_next",
+                                       "index": msg["index"]})
+                elif t == "question":
+                    if msg.get("options"):
+                        await client.send({"type": "answer", "answer": 0,
+                                           "index": msg["index"]})
+                    else:
+                        ans = solve_math(msg["text"])
+                        await client.send({"type": "answer", "answer": str(ans),
+                                           "index": msg["index"]})
+                elif t == "reaction_go":
+                    await client.send({"type": "reaction_click"})
+                elif t == "memory_show":
+                    number = msg["number"]
+                elif t == "memory_recall":
+                    await client.send({"type": "memory_answer",
+                                       "answer": number or "0000"})
+                elif t == "results":
+                    et_state["results"] = msg
+                elif t == "elimination_end_vote":
+                    await client.send({"type": "elimination_vote",
+                                       "choice": "lobby"})
+                elif t == "lobby":
+                    if msg["room"]["phase"] == "lobby" and et_state["results"]:
+                        et_state["lobby"] = True
+                        return
+
+        et1 = asyncio.create_task(elim_teams_driver(het, het_id))
+        et2 = asyncio.create_task(elim_teams_driver(ret, None))
+        await asyncio.wait_for(asyncio.gather(et1, et2), timeout=420)
+        _etr = et_state["results"]
+        check("v2.2 Elimination in Teams mode: challenges run as Teams",
+              et_state["party_modes"] == {"teams"},
+              str(et_state["party_modes"]))
+        check("v2.2 Elimination in Teams mode: results carry team "
+              "standings (mode teams)",
+              _etr is not None and _etr.get("mode") == "teams"
+              and len(_etr.get("teams", [])) == 2,
+              str(_etr.get("teams") if _etr else None))
+        # Eliminated members contribute 0: each team's total must equal
+        # the style's value over member scores (eliminated members
+        # score 0 in the finishing order).
+        _tm = {}
+        for _t in _etr.get("teams", []):
+            _tm[_t["team"]] = [m["nickname"] for m in _t["members"]]
+        _ok_et = all(
+            abs(_t["average"] - round(sum(
+                next(r["score"] for r in _etr["rankings"]
+                     if r["nickname"] == n) for n in _tm[_t["team"]])
+                / len(_tm[_t["team"]]), 1)) < 0.01
+            for _t in _etr.get("teams", []))
+        check("v2.2 Elimination in Teams mode: team averages match "
+              "member scores with eliminated members at 0",
+              _ok_et, str(_etr.get("teams")))
+        check("v2.2 Elimination in Teams mode: series ends in the lobby",
+              et_state["lobby"] is True)
+        await het.close(); await ret.close()
+
+        # --- v2.2 §10: Championship mode ---
+        hc = Client("champ-host"); await hc.connect()
+        await hc.send({"type": "create_room", "nickname": "ChampHost", "colour": "#e74c3c"})
+        jc = await hc.wait_for("joined"); codec = jc["code"]; hc_id = jc["player_id"]
+        rc = Client("champ-p2"); await rc.connect()
+        await rc.send({"type": "join_room", "code": codec, "nickname": "ChampP2", "colour": "#3498db"})
+        jrc = await rc.wait_for("joined"); rc_id = jrc["player_id"]
+        await hc.send({"type": "add_bot"})
+        lobby = await hc.wait_lobby_count(3)
+        _cbot = [p["id"] for p in lobby["room"]["players"]
+                 if p["is_bot"]][0]
+        await hc.send({"type": "update_settings", "championship": True})
+        lb = await hc.wait_lobby_where(lambda r: r["championship"] is True)
+        check("v2.2 Championship: lobby shows the toggle on, no games yet",
+              lb["room"]["champ_games"] == 0
+              and lb["room"]["champ_history"] == [])
+
+        async def champ_math(host, p2):
+            """One 1-question Math game + end flow. Returns
+            (end_choice, host_points_this_game) — the host's actual
+            points (990-1000 by speed), used as the expected delta."""
+            await host.send({"type": "update_settings", "game": "math",
+                             "game_settings": {"math": {"difficulty": "Easy", "questions": 1,
+                                                        "time_per_question": 5, "vote_timeout": 3}}})
+            await host.wait_lobby_where(lambda r: r["phase"] == "lobby")
+            await host.send({"type": "start_game"})
+            await host.wait_for("game_started", timeout=5)
+            mq = await host.wait_for("question", timeout=15)
+            aq = solve_math(mq["text"])
+            await host.send({"type": "answer", "answer": str(aq), "index": mq["index"]})
+            await p2.send({"type": "answer", "answer": str(aq + 1), "index": mq["index"]})
+            res = await host.wait_for("question_result", timeout=10)
+            _pts = next((p["points"] for p in res["points"]
+                         if p["player_id"] == hc_id), 0)
+            await host.wait_for("results", timeout=10)
+            end, lobby = await drive_end_flow(host, [host, p2],
+                                              choice="lobby", count=3)
+            return end, _pts, lobby
+
+        def _row(hist, pid, team):
+            return next((r for r in hist
+                         if r["player_id"] == pid and r["team"] == team), None)
+
+        # Games 1-2 (FFA): scores persist, counter increments, one row
+        # per player keyed (player, None).
+        end1, d1, lb = await champ_math(hc, rc)
+        check("v2.2 Championship: game 1 recorded (counter 1)",
+              end1["champ_games"] == 1, str(end1["champ_games"]))
+        _h1 = _row(end1["champ_history"], hc_id, None)
+        _p1 = _row(end1["champ_history"], rc_id, None)
+        check("v2.2 Championship: game 1 rows hold the per-game deltas",
+              _h1 is not None and _h1["per_game"] == [d1]
+              and _h1["tally"] == d1
+              and _p1 is not None and _p1["per_game"] == [0]
+              and _p1["tally"] == 0,
+              str(end1["champ_history"]))
+        # (the lobby came back with champ_math's end flow — do NOT wait
+        # for a second one; the broadcast was already consumed.)
+        _scores = {p["nickname"]: p["score"]
+                   for p in lb["room"]["players"]}
+        check("v2.2 Championship: scores persist in the lobby after "
+              "game 1 (not reset)",
+              _scores.get("ChampHost") == d1
+              and _scores.get("ChampP2") == 0, str(_scores))
+        end2, d2, _ = await champ_math(hc, rc)
+        check("v2.2 Championship: game 2 recorded (counter 2, deltas "
+              "accumulate)",
+              end2["champ_games"] == 2
+              and _row(end2["champ_history"], hc_id, None)["per_game"]
+              == [d1, d2]
+              and _row(end2["champ_history"], hc_id, None)["tally"]
+              == d1 + d2,
+              str(end2["champ_history"]))
+        # Switch to Teams (host + p2 on Team 1, bot on Team 2). The
+        # switch alone creates NO new history rows.
+        await hc.send({"type": "update_settings", "mode": "teams", "team_count": 2})
+        await hc.wait_lobby()
+        await hc.send({"type": "assign_team", "player_id": hc_id, "team": 0})
+        await hc.wait_lobby()
+        await hc.send({"type": "assign_team", "player_id": rc_id, "team": 0})
+        await hc.wait_lobby()
+        await hc.send({"type": "assign_team", "player_id": _cbot, "team": 1})
+        lb = await hc.wait_lobby_where(lambda r: r["teams"].get(_cbot) == 1)
+        check("v2.2 Championship: switching teams creates no rows until "
+              "a game is played with that team",
+              len(lb["room"]["champ_history"]) == 3
+              and all(r["team"] is None for r in lb["room"]["champ_history"]),
+              str(lb["room"]["champ_history"]))
+        # Game 3 (teams): new rows for (host, 0), (p2, 0), (bot, 1),
+        # padded with 0s for the two FFA games.
+        end3, d3, _ = await champ_math(hc, rc)
+        _h3 = _row(end3["champ_history"], hc_id, 0)
+        _b3 = _row(end3["champ_history"], _cbot, 1)
+        check("v2.2 Championship: game 3 (teams) creates padded rows",
+              end3["champ_games"] == 3
+              and _h3 is not None and _h3["per_game"] == [0, 0, d3]
+              and _b3 is not None and len(_b3["per_game"]) == 3
+              and _b3["per_game"][:2] == [0, 0],
+              str(end3["champ_history"]))
+        # Game 4: host switches to Team 2 (with the bot). A new row
+        # (host, 1) is created, padded; the old (host, 0) row is kept.
+        await hc.send({"type": "assign_team", "player_id": hc_id, "team": 1})
+        await hc.wait_lobby_where(lambda r: r["teams"].get(hc_id) == 1)
+        end4, d4, _ = await champ_math(hc, rc)
+        check("v2.2 Championship: switching teams mid-championship "
+              "creates a new padded row for the new team",
+              end4["champ_games"] == 4
+              and _row(end4["champ_history"], hc_id, 1) is not None
+              and _row(end4["champ_history"], hc_id, 1)["per_game"]
+              == [0, 0, 0, d4],
+              str(end4["champ_history"]))
+        # Game 5: host switches BACK to Team 1 — the old (host, 0) row
+        # is REUSED (not a second row for the same team).
+        await hc.send({"type": "assign_team", "player_id": hc_id, "team": 0})
+        await hc.wait_lobby_where(lambda r: r["teams"].get(hc_id) == 0)
+        end5, d5, _ = await champ_math(hc, rc)
+        _h0_rows = [r for r in end5["champ_history"]
+                    if r["player_id"] == hc_id and r["team"] == 0]
+        check("v2.2 Championship: switching back reuses the old row",
+              len(_h0_rows) == 1
+              and _h0_rows[0]["per_game"] == [0, 0, d3, 0, d5]
+              and _h0_rows[0]["tally"] == d3 + d5,
+              str(end5["champ_history"]))
+        check("v2.2 Championship: counter reached 5 games",
+              end5["champ_games"] == 5, str(end5["champ_games"]))
+        # Turning championship OFF ends it: history + counter cleared.
+        await hc.send({"type": "update_settings", "championship": False})
+        lb = await hc.wait_lobby_where(
+            lambda r: r["championship"] is False)
+        check("v2.2 Championship: turning it OFF clears the history "
+              "and the counter",
+              lb["room"]["champ_games"] == 0
+              and lb["room"]["champ_history"] == [],
+              str(lb["room"]))
+        await hc.close(); await rc.close()
+
         await host.close(); await p2b.close(); await p2.close()
         print(f"\nALL CHECKS PASSED: {sum(PASS)}/{len(PASS)}")
     finally:
@@ -1579,6 +3153,11 @@ async def main():
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+
+def test_hub():
+    """pytest entry point: run the whole end-to-end suite."""
+    asyncio.run(main())
 
 
 if __name__ == "__main__":
