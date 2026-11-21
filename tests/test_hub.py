@@ -30,11 +30,22 @@ Starts the real server on port 8001, then over real WebSockets:
     extras / eliminated), the deterministic group pick / balance /
     rebalance helpers, a full 6-player Group series (worst team
     loses its worst player, merge at 5 into Black, Black phase
-    until 1 remains, winner 1000 / others 0), and a 7-player
+    until 1 remains, linear place scores — v2.5 item 2), and a 7-player
     6-vs-1 series whose first break rebalances with transfers,
     and Reaction challenges assign interpolated points (verified
     in-process with all bots, and live from the round results
     whenever a Reaction challenge comes up)
+  - covers the v2.5 contracts: the ceremony pile holds each
+    eliminated player exactly once at every stage (list/drop
+    without the victim, merge/transfer with them), linear
+    series-end standings ((challenges played) x 1000 down to 0
+    in finishing order — 7 players / 6 challenges -> 6000..0),
+    Reaction per-round breaks carry the native running
+    avg_ms/best_ms instead of the all-0 scores (reproduced
+    in-process first), and the ceremony ranking + break scores
+    show the team each player played as, not the post-transfer
+    team (a transferred player's rows keep the as-played team
+    while the transfer is still shown below)
   - covers the v2.4 contracts: no presCounts/unoCounts lists in
     the served HTML, turnStripHtml takes counts and the strip
     keeps the player colour border with the yellow ring as an
@@ -80,7 +91,9 @@ from server import (GAMES, ELIM_POOL, SECRET_WORDS, VAGUE_CLUES, secret_tally,  
                     memory_bot_correct, run_memory_game,  # noqa: E402
                     _reaction_points, run_reaction_game,  # noqa: E402
                     _elim_balance_groups, _elim_pick_worst_team,  # noqa: E402
-                    _elim_pick_worst_player, _elim_rebalance_groups)  # noqa: E402
+                    _elim_pick_worst_player, _elim_rebalance_groups,  # noqa: E402
+                    _elim_score_rows, _vote_phase)  # noqa: E402
+import server  # noqa: E402  (broadcast patching for the v2.5 item 3 repro)
 from fractions import Fraction  # noqa: E402
 
 PORT = 8001
@@ -938,21 +951,29 @@ def verify_group_series(tag, state, players, *, expect_full):
               "exactly when 5 players remain",
               b["merged_to_black"] is (b["remaining"] == 5),
               str(b))
-        # The break's score rows carry each surviving player's group.
+        # v2.5 item 4: the break's score rows carry each surviving
+        # player's team AS PLAYED — the challenge-start groups,
+        # before any merge / rebalance. A transferred player
+        # therefore still shows their old team here (Bot #6 played
+        # Blue, moved to Red -> the row shows Blue); the transfer
+        # itself is shown below the ranking, as before. The
+        # post-transfer balance is checked on the simulated map
+        # below, not on these rows — after a transfer the as-played
+        # rows are unbalanced by design, and after a merge they
+        # still show Red/Blue (the merge happens after the game).
         teams = {s["player_id"]: s["team"] for s in b["scores"]}
-        if b["merged_to_black"] or ch["elim_phase"] == "black":
-            check(f"v2.3 item 14 ({tag}): break {n} shows every "
-                  "survivor in the Black Team after the merge",
-                  teams and all(v == 2 for v in teams.values()),
-                  str(teams))
-        else:
-            sizes = {0: 0, 1: 0}
-            for v in teams.values():
-                sizes[v] = sizes.get(v, 0) + 1
-            check(f"v2.3 item 14 ({tag}): break {n} leaves the "
-                  "groups balanced (gap <= 1) after any rebalance",
-                  set(teams.values()) <= {0, 1}
-                  and abs(sizes.get(0, 0) - sizes.get(1, 0)) <= 1,
+        _as_played = {pid: g for pid, g in ch["groups"].items()
+                      if pid != elim["player_id"]}
+        check(f"v2.5 item 4 ({tag}): break {n} score rows show "
+              "each survivor's team as played (challenge groups, "
+              "not the post-transfer map)",
+              teams == _as_played, str(teams))
+        for _tr in b["transfers"]:
+            check(f"v2.5 item 4 ({tag}): break {n} transferred "
+                  f"{by_id.get(_tr['player_id'])} shows the "
+                  f"as-played team {_tr['from']} (moved to "
+                  f"{_tr['to']}), not the new team",
+                  teams.get(_tr["player_id"]) == _tr["from"],
                   str(teams))
         # Rebalance simulation: start from the challenge groups
         # minus the eliminated player, apply the reported transfers
@@ -963,6 +984,14 @@ def verify_group_series(tag, state, players, *, expect_full):
             check(f"v2.3 item 14 ({tag}): merge break {n} has no "
                   "rebalance transfers (the merge replaces them)",
                   b["transfers"] == [], str(b["transfers"]))
+            # The merge itself lands in the NEXT challenge's groups.
+            _nxt = next((c for c in state["challenges"]
+                         if c["n"] == n + 1), None)
+            if _nxt is not None:
+                check(f"v2.3 item 14 ({tag}): the challenge after "
+                      f"the merge ({n + 1}) is all Black Team",
+                      set(_nxt["groups"].values()) == {2},
+                      str(_nxt["groups"]))
         else:
             sim = {pid: g for pid, g in ch["groups"].items()
                    if pid != elim["player_id"]}
@@ -1085,6 +1114,56 @@ def verify_group_series(tag, state, players, *, expect_full):
         check(f"v2.4 item 4 ({tag}): challenge {n} ceremony runs "
               f"{' / '.join(_exp)} in order",
               _stages == _exp, str(_stages))
+        # --- v2.5 item 1: the pile holds each eliminated player
+        # exactly once at every stage. The victim only joins the
+        # pile when they drop, so the list and drop stages send
+        # the pile WITHOUT the victim (earlier victims only) and
+        # the merge / transfer stages send the full pile WITH the
+        # victim. Before the fix the list stage already carried
+        # the victim and the drop appended a second copy.
+        _elim_so_far = [e["player_id"]
+                        for e in state["eliminated"][:n]]
+        _victim = _elim_so_far[-1]
+        for _c in _cer:
+            if _c["n"] != n:
+                continue
+            _pile = _c.get("eliminated_pile") or []
+            _want = (_elim_so_far if _c["stage"] in ("merge", "transfer")
+                     else _elim_so_far[:-1])
+            check(f"v2.5 item 1 ({tag}): challenge {n} "
+                  f"{_c['stage']} stage pile is "
+                  f"{'the full pile (victim included)' if _c['stage'] in ('merge', 'transfer') else 'earlier victims only (victim not yet dropped)'}",
+                  _pile == _want
+                  and len(_pile) == len(set(_pile)),
+                  f"pile={_pile} want={_want}")
+        # --- v2.5 item 4: the ceremony ranking rows show the team
+        # each player played as (the challenge-start groups). The
+        # victim's row keeps their worst-team group (the pick-time
+        # value); every other row is that player's challenge group,
+        # even if the rebalance / merge moved them afterwards.
+        _ch_n = state["challenges"][n - 1]
+        _elim_n = state["eliminated"][n - 1]
+        for _c in _cer:
+            if _c["n"] != n:
+                continue
+            _rgroups = {r["player_id"]: r.get("group")
+                        for r in _c.get("ranking") or []}
+            _rank_ok = all(
+                _rgroups.get(_pid) == (
+                    _elim_n["group"] if _pid == _victim
+                    else _ch_n["groups"].get(_pid))
+                for _pid in _rgroups)
+            check(f"v2.5 item 4 ({tag}): challenge {n} "
+                  f"{_c['stage']} stage ranking rows show the "
+                  "as-played teams",
+                  _rank_ok, str(_rgroups))
+            for _tr in b["transfers"]:
+                check(f"v2.5 item 4 ({tag}): challenge {n} "
+                      f"{_c['stage']} stage ranking row for "
+                      f"transferred {by_id.get(_tr['player_id'])} "
+                      f"shows the as-played team {_tr['from']}",
+                      _rgroups.get(_tr["player_id"]) == _tr["from"],
+                      str(_rgroups))
     # --- v2.4 item 4: ceremony payload shape (drop stage) ---
     _drops = [c for c in _cer if c["stage"] == "drop"]
     check(f"v2.4 item 4 ({tag}): every ceremony drop carries the "
@@ -1094,8 +1173,11 @@ def verify_group_series(tag, state, players, *, expect_full):
                   and all("player_id" in r for r in c["ranking"])
                   and c["eliminated"].get("player_id")
                   and c["eliminated"].get("nickname")
+                  # v2.5 item 1: the drop-stage pile does NOT yet
+                  # contain the victim (they join the pile only
+                  # when they drop); the merge / transfer pile does.
                   and c["eliminated"]["player_id"]
-                  in (c["eliminated_pile"] or [])
+                  not in (c["eliminated_pile"] or [])
                   and c["remaining"] == len(c["alive"] or [])
                   and c["challenge"] == c["n"]
                   and c["elimination_mode"] == "group"
@@ -1126,15 +1208,24 @@ def verify_group_series(tag, state, players, *, expect_full):
         winner = fin[0]["player_id"] if fin else None
         expect_fin = [winner] + [e["player_id"]
                                  for e in reversed(state["eliminated"])]
-        check(f"v2.3 item 14 ({tag}): finishing order is the winner "
-              "then the eliminated in reverse order, winner 1000 / "
-              "everyone else 0",
+        # v2.5 item 2: linear series-end standings over the
+        # finishing order — 1st = (challenges played) x 1000, last
+        # = 0, equal steps in between. One elimination per
+        # challenge, so challenges played == players - 1 here
+        # (e.g. 7 players / 6 challenges -> 6000..0; 6 players /
+        # 5 challenges -> 5000..0). Replaces the old victor-only
+        # scoring (winner 1000, everyone else 0).
+        _n_ch = len(state["challenges"])
+        _expect_scores = [_n_ch * 1000 - 1000 * i
+                          for i in range(len(players))]
+        check(f"v2.5 item 2 ({tag}): finishing order is the winner "
+              "then the eliminated in reverse order, with linear "
+              f"place scores {_expect_scores}",
               len(fin) == len(players)
               and len({r["player_id"] for r in fin}) == len(players)
               and [r["player_id"] for r in fin] == expect_fin
               and res.get("victor") == winner
-              and fin[0]["score"] == 1000
-              and all(r["score"] == 0 for r in fin[1:]),
+              and [r["score"] for r in fin] == _expect_scores,
               str([(r["nickname"], r["score"]) for r in fin]))
     return verified, skipped
 
@@ -1218,6 +1309,50 @@ async def main():
                   and "transition" in _card_rule.group(1)
                   and "transform" in _card_rule.group(1),
                   _card_rule.group(0) if _card_rule else None)
+            # --- v2.5 item 1 (client): the ceremony drop append is
+            # idempotent — the drop stage must check the pile for an
+            # existing row for the victim (by pid) before appending
+            # one, so a second copy can never appear in the pile.
+            # The unguarded form (appendChild with no pile check)
+            # is the bug Matthew saw live (a second Bot #2 in the
+            # pile). Note a bare `if (victimId)` does NOT count —
+            # the guard must look the victim up in the pile.
+            _drop = r.text[r.text.find('msg.stage==="drop"'):
+                           r.text.find('msg.stage==="merge"')]
+            _pile_guard = re.search(
+                r"pileEl\.querySelector\([^)]*victimId|"
+                r"pileEl\.querySelectorAll\([\s\S]{0,200}?victimId|"
+                r"pileEl\.children[\s\S]{0,200}?victimId", _drop)
+            check("v2.5 item 1 (client): the ceremony drop stage "
+                  "checks the pile for an existing row for the "
+                  "victim before appending",
+                  _pile_guard is not None
+                  and _pile_guard.start() < _drop.find("appendChild"),
+                  _drop[:300])
+            # --- v2.5 item 3 (client): the per-round vote-break
+            # scoreboard renders native running scores via
+            # breakScoreText instead of the bare `score` — Reaction
+            # avg_ms (best best_ms), a dash for no time yet, Memory
+            # rounds survived — never a bare 0. The wire half is
+            # pinned in-process and live below; this pins the render.
+            _vb = r.text[r.text.find('if(msg.type==="vote_break")'):
+                         r.text.find('if(msg.type==="vote_update")')]
+            _bst = r.text[r.text.find("function breakScoreText("):
+                          r.text.find("function breakScoreSort(")]
+            check("v2.5 item 3 (client): the vote-break scoreboard "
+                  "renders via breakScoreText / breakScoreSort "
+                  "(native running scores, not the bare score)",
+                  "breakScoreText(" in _vb
+                  and "breakScoreSort" in _vb,
+                  _vb[:300])
+            check("v2.5 item 3 (client): breakScoreText renders "
+                  "Reaction avg_ms (best best_ms), a dash for no "
+                  "time yet, and Memory rounds survived — never a "
+                  "bare 0",
+                  "avg_ms" in _bst and "best_ms" in _bst
+                  and "no time yet" in _bst
+                  and "survived" in _bst,
+                  _bst[:400])
             check("health endpoint", (await http.get(f"{BASE}/api/health")).json().get("ok") is True)
 
         # --- create room + join 2nd human ---
@@ -1272,6 +1407,14 @@ async def main():
         await host.send({"type": "start_game"})
         started = await host.wait_for("game_started")
         check("Reaction Test starts", started["game"] == "reaction")
+        # v2.5 item 3 (repro): the per-round vote breaks used to
+        # show a score of 0 for everyone — Reaction only assigns
+        # points at the end — while the native running averages
+        # were already known. Capture every round's ms values and
+        # every break so the break rows can be checked against the
+        # running average / best so far.
+        _rx_rounds = []  # [{player_id: ms}] per round, in order
+        _rx_breaks = []  # vote_break payloads, in round order
         for rnd in range(1, 4):
             await host.wait_for("reaction_wait", timeout=10)
             await host.wait_for("reaction_go", timeout=10)
@@ -1281,9 +1424,13 @@ async def main():
             res = await host.wait_for("reaction_round_result", timeout=10)
             check(f"reaction round {rnd} result has all 4 players",
                   len(res["results"]) == 4)
+            _rx_rounds.append(
+                {r["player_id"]: r["ms"] for r in res["results"]
+                 if r.get("ms") is not None})
             if rnd < 3:
                 # v2: NEXT vote break between rounds (not after the last).
                 vb = await host.wait_for("vote_break", timeout=10)
+                _rx_breaks.append(vb)
                 check(f"reaction round {rnd} vote break shown",
                       vb["votes_needed"] == 1, str(vb))
                 if rnd == 1:
@@ -1325,6 +1472,63 @@ async def main():
               == sorted([r["avg_ms"] for r in results["rankings"]],
                         key=lambda a: (a is None, a or 0)),
               str([(r["nickname"], r["avg_ms"]) for r in results["rankings"]]))
+        # --- v2.5 item 3 (live): every per-round break row carries
+        # the native running avg_ms / best_ms — the running average
+        # and best of that player's clicks so far — and the rows are
+        # NOT all 0 in native terms, even though the `score` column
+        # itself is still 0 mid-game (points are only assigned at
+        # the end). A break row with no valid click yet carries
+        # avg_ms/best_ms None, never a fabricated 0 average.
+        check("v2.5 item 3 (live): two per-round Reaction breaks "
+              "were captured (rounds 1 and 2)",
+              len(_rx_breaks) == 2, str(len(_rx_breaks)))
+        for _bi, _vb in enumerate(_rx_breaks, start=1):
+            _rows = {s["player_id"]: s for s in _vb["scores"]}
+            check(f"v2.5 item 3 (live): round {_bi} break rows all "
+                  "carry avg_ms / best_ms fields",
+                  len(_rows) == 4
+                  and all("avg_ms" in s and "best_ms" in s
+                          for s in _vb["scores"]),
+                  str(_vb["scores"]))
+            check(f"v2.5 item 3 (live): round {_bi} break scores "
+                  "are the known all-0 mid-game scores (the 0s "
+                  "the fix replaces with native times)",
+                  all(s["score"] == 0 for s in _vb["scores"]),
+                  str([(s["nickname"], s["score"])
+                       for s in _vb["scores"]]))
+            _native_ok = True
+            for _pid in {pid for _rd in _rx_rounds for pid in _rd} \
+                    | {s["player_id"] for s in _vb["scores"]}:
+                _so_far = [rd[_pid] for rd in _rx_rounds[:_bi]
+                           if _pid in rd]
+                _row = _rows.get(_pid)
+                if not _so_far:
+                    if _row is None or _row.get("avg_ms") is not None \
+                            or _row.get("best_ms") is not None:
+                        _native_ok = False
+                elif _row is None \
+                        or _row.get("avg_ms") != round(
+                            sum(_so_far) / len(_so_far)) \
+                        or _row.get("best_ms") != min(_so_far):
+                    _native_ok = False
+            check(f"v2.5 item 3 (live): round {_bi} break avg_ms / "
+                  "best_ms are the running average / best so far",
+                  _native_ok, str(_vb["scores"]))
+            check(f"v2.5 item 3 (live): round {_bi} break native "
+                  "scores are not all 0 / missing (at least one "
+                  "player has a real average)",
+                  any(s.get("avg_ms") for s in _vb["scores"]),
+                  str(_vb["scores"]))
+        # The end results still render the native times (the
+        # display the per-round breaks now mirror).
+        check("v2.5 item 3 (live): the end results still carry "
+              "avg_ms / best_ms for every ranked player",
+              all("avg_ms" in r and "best_ms" in r
+                  for r in results["rankings"])
+              and any(r["avg_ms"] is not None
+                      for r in results["rankings"]),
+              str([(r["nickname"], r["avg_ms"], r["best_ms"])
+                   for r in results["rankings"]]))
 
         # --- back to lobby, Speed Math: 5 questions ---
         # v2.2: play_again is gone — results -> end-of-game NEXT vote
@@ -3831,11 +4035,13 @@ async def main():
               and len({r["player_id"] for r in first["finishing_order"]}) == 4
               and first["finishing_order"][0]["player_id"] == first["victor"],
               str(first.get("finishing_order")))
-        check("v2.3 item 15: only the last remaining player scores "
-              "(victor 1000, everyone else 0 — no finale places)",
-              first["finishing_order"][0]["score"] == 1000
-              and all(r["score"] == 0
-                      for r in first["finishing_order"][1:]),
+        # v2.5 item 2: linear series-end standings — 4 players,
+        # 3 challenges per series -> 3000, 2000, 1000, 0 in
+        # finishing order (replaces the old victor-only 1000/0).
+        check("v2.5 item 2: Normal-mode series-end standings are "
+              "linear (3000, 2000, 1000, 0 — no finale places)",
+              [r["score"] for r in first["finishing_order"]]
+              == [3000, 2000, 1000, 0],
               str([(r["nickname"], r["score"]) for r in first["finishing_order"]]))
         check("v2 Elimination: series ends back in the lobby",
               elim_state["lobby"])
@@ -3888,8 +4094,11 @@ async def main():
                   and all("player_id" in r for r in c["ranking"])
                   and c["eliminated"].get("player_id")
                   and c["eliminated"].get("nickname")
+                  # v2.5 item 1: the list/drop pile does NOT yet
+                  # contain the victim (they join the pile only
+                  # when they drop).
                   and c["eliminated"]["player_id"]
-                  in (c["eliminated_pile"] or [])
+                  not in (c["eliminated_pile"] or [])
                   and c["remaining"] == len(c["alive"] or [])
                   and c["challenge"] == c["n"]
                   and c["elimination_mode"] == "normal"
@@ -3898,6 +4107,34 @@ async def main():
                     ("series", "n", "stage", "challenge", "eliminated",
                      "remaining", "alive")}
                    for c in _ecer]))
+        # --- v2.5 item 1 (Normal mode): the pile holds each
+        # eliminated player exactly once at every stage — list and
+        # drop carry the earlier victims only (no victim yet, no
+        # duplicates); Normal mode has no merge/transfer stages.
+        # Victim order per series comes from the drop stages
+        # (host-recorded, in order).
+        _norm_victims = {}
+        for _c in _ecer:
+            if _c["stage"] == "drop":
+                _norm_victims.setdefault(_c["series"], []).append(
+                    _c["eliminated"]["player_id"])
+        # cur_game_n is NOT reset between series (it runs 1..6),
+        # so the within-series challenge index comes from the
+        # order the challenges appear in each series.
+        _norm_order = {}
+        for _c in _ecer:
+            _lst = _norm_order.setdefault(_c["series"], [])
+            if _c["n"] not in _lst:
+                _lst.append(_c["n"])
+        for _c in _ecer:
+            _j = _norm_order[_c["series"]].index(_c["n"])
+            _prior = _norm_victims[_c["series"]][:_j]
+            check(f"v2.5 item 1 (Normal): series {_c['series']} "
+                  f"challenge {_c['n']} {_c['stage']} stage pile "
+                  "is the earlier victims only, each exactly once",
+                  list(_c.get("eliminated_pile") or []) == _prior
+                  and len(_prior) == len(set(_prior)),
+                  f"pile={_c.get('eliminated_pile')} prior={_prior}")
         _ct = {}
         _ch = {}  # (series, n) -> whether an alive human could vote
         for c in _ecer:
@@ -4484,12 +4721,14 @@ async def main():
               et_state["lobby"] is True
               and et_state.get("lobby_room", {}).get("mode") == "ffa",
               str(et_state.get("lobby_room", {}).get("mode")))
-        check("v2.3 item 16: the FFA-forced series still runs to "
-              "one winner (no finale)",
+        check("v2.5 item 2: the FFA-forced series still runs to "
+              "one winner (no finale) with linear place scores "
+              "(3000, 2000, 1000, 0 for 4 players / 3 challenges)",
               _etr is not None
               and len(_etr.get("finishing_order", [])) == 4
               and _etr["finishing_order"][0]["player_id"] == _etr.get("victor")
-              and _etr["finishing_order"][0]["score"] == 1000,
+              and [r["score"] for r in _etr["finishing_order"]]
+              == [3000, 2000, 1000, 0],
               str(_etr.get("finishing_order") if _etr else None))
         await het.close(); await ret.close()
 
@@ -4784,6 +5023,146 @@ async def main():
               "matches the assigned scores (best average first)",
               _rscores == sorted(_rscores, reverse=True),
               str(list(zip(_rorder, _rscores))))
+        # --- v2.5 item 3 (internal): Reaction per-round breaks
+        # carry the native running avg_ms / best_ms. REPRO first
+        # (standalone script, 4 Hard bots, challenge): every
+        # per-round vote_break row had score 0 — p.score stays 0
+        # until the interpolated points are assigned at the
+        # challenge end — so a client rendering s.score showed 0s
+        # for everyone, while the native times were already known
+        # (round-1 break: (RB0, 0, 391, 391), (RB2, 0, 346, 346)
+        # ...). The fix is the avg_ms/best_ms fields on the rows,
+        # from _elim_score_rows (challenge breaks) and the
+        # _vote_phase defaults (standalone breaks). Audit of the
+        # other games (from the _vote_phase call sites): quiz
+        # scores grow per correct answer, Secret Word hides scores
+        # by design (scores=[]), President/UNO have no per-round
+        # vote break. Memory is the second 0s case the audit
+        # found: survivors' points are only banked at elimination
+        # / the end, so a per-round Memory break shows 0 for
+        # everyone still alive — the client renders their native
+        # running measure instead (rounds survived, tracked from
+        # memory_round_result; pinned by the served-HTML check
+        # above). Reaction is the only game that needs the server
+        # to send native values.
+        _rx_room = Room(code="UNITRX3")
+        _rx_room.phase = "playing"
+        _rx_room.game_settings["elimination"]["vote_timeout"] = 1
+        _rx_bots = [Player(id=f"x{i}", nickname=f"RX{i}",
+                           colour="#ffffff", is_bot=True,
+                           difficulty="Hard") for i in range(4)]
+        _rx_room.players = list(_rx_bots)
+        _rx_bots[0].reaction_times = [300, 400, 350]
+        _rx_bots[1].reaction_times = [500]
+        _rx_bots[2].score = 250  # a quiz-like player: real score,
+        # no reaction times.
+        _xrows = {r["player_id"]: r for r in
+                  _elim_score_rows(_rx_room, list(_rx_bots))}
+        check("v2.5 item 3 (internal): _elim_score_rows carries "
+              "avg_ms/best_ms = running average / best of "
+              "reaction_times",
+              _xrows["x0"]["avg_ms"] == 350
+              and _xrows["x0"]["best_ms"] == 300
+              and _xrows["x1"]["avg_ms"] == 500
+              and _xrows["x1"]["best_ms"] == 500,
+              str(_xrows))
+        check("v2.5 item 3 (internal): _elim_score_rows gives "
+              "avg_ms/best_ms None for players with no reaction "
+              "times (a quiz player keeps their real score)",
+              _xrows["x2"]["avg_ms"] is None
+              and _xrows["x2"]["best_ms"] is None
+              and _xrows["x2"]["score"] == 250
+              and _xrows["x3"]["avg_ms"] is None,
+              str(_xrows))
+        # The _vote_phase defaults (standalone Reaction breaks):
+        # capture the broadcast and check the same fields.
+        _rx_seen = []
+        _orig_broadcast = server.broadcast
+
+        async def _rx_spy(room, msg):
+            if msg.get("type") == "vote_break":
+                _rx_seen.append(msg)
+
+        server.broadcast = _rx_spy
+        try:
+            await _vote_phase(_rx_room, "reaction", 1, 3,
+                              eligible=list(_rx_bots))
+        finally:
+            server.broadcast = _orig_broadcast
+        check("v2.5 item 3 (internal): the standalone _vote_phase "
+              "default rows carry avg_ms/best_ms too",
+              len(_rx_seen) == 1
+              and {s["player_id"]: (s.get("avg_ms"), s.get("best_ms"))
+                   for s in _rx_seen[0]["scores"]}
+              == {"x0": (350, 300), "x1": (500, 500),
+                  "x2": (None, None), "x3": (None, None)},
+              str(_rx_seen[0]["scores"] if _rx_seen else None))
+        # Full in-process Reaction challenge, capturing the
+        # per-round vote_break payloads as they are sent: the 0s
+        # repro (every row's score is 0 mid-game) plus the fix
+        # (every row carries the running avg/best, matching the
+        # round results so far).
+        _rx_room2 = Room(code="UNITRX3B")
+        _rx_room2.phase = "playing"
+        _rx_room2.game_settings["elimination"]["vote_timeout"] = 1
+        _rx_bots2 = [Player(id=f"y{i}", nickname=f"RY{i}",
+                            colour="#ffffff", is_bot=True,
+                            difficulty="Hard") for i in range(4)]
+        _rx_room2.players = list(_rx_bots2)
+        _rx_caps = {"breaks": [], "rounds": []}
+        _orig_broadcast2 = server.broadcast
+
+        async def _rx_spy2(room, msg):
+            if msg.get("type") == "vote_break":
+                _rx_caps["breaks"].append(msg)
+            elif msg.get("type") == "reaction_round_result":
+                _rx_caps["rounds"].append(msg)
+
+        server.broadcast = _rx_spy2
+        try:
+            _rx_rank = await run_reaction_game(
+                _rx_room2, participants=list(_rx_bots2), challenge=True)
+        finally:
+            server.broadcast = _orig_broadcast2
+        check("v2.5 item 3 (internal): the in-process Reaction "
+              "challenge sends one vote break per round (3)",
+              len(_rx_caps["breaks"]) == 3
+              and [b["index"] for b in _rx_caps["breaks"]] == [1, 2, 3],
+              str([b.get("index") for b in _rx_caps["breaks"]]))
+        _rx_ok = len(_rx_caps["breaks"]) == 3
+        for _bi, _vb in enumerate(_rx_caps["breaks"], start=1):
+            # The 0s repro: scores are all 0 mid-game (points are
+            # only assigned at the challenge end).
+            if not all(s["score"] == 0 for s in _vb["scores"]):
+                _rx_ok = False
+            # The fix: avg/best are the running values so far.
+            for _pid in {s["player_id"] for s in _vb["scores"]}:
+                _so_far = [r["ms"] for _rd in _rx_caps["rounds"][:_bi]
+                           for r in _rd["results"]
+                           if r["player_id"] == _pid
+                           and r.get("ms") is not None]
+                _row = next(s for s in _vb["scores"]
+                            if s["player_id"] == _pid)
+                if not _so_far:
+                    if _row.get("avg_ms") is not None \
+                            or _row.get("best_ms") is not None:
+                        _rx_ok = False
+                elif _row.get("avg_ms") != round(
+                        sum(_so_far) / len(_so_far)) \
+                        or _row.get("best_ms") != min(_so_far):
+                    _rx_ok = False
+            if not any(s.get("avg_ms") for s in _vb["scores"]):
+                _rx_ok = False
+        check("v2.5 item 3 (internal): per-round challenge breaks "
+              "show score 0 (the repro) but carry the running "
+              "avg_ms / best_ms (the fix), never all-0 native",
+              _rx_ok, str(_rx_caps["breaks"]))
+        check("v2.5 item 3 (internal): the challenge ranking still "
+              "carries avg_ms (the end results render as before)",
+              _rx_rank is not None
+              and all("avg_ms" in r for r in _rx_rank)
+              and any(r["avg_ms"] is not None for r in _rx_rank),
+              str(_rx_rank))
         # --- internal (async): a Memory CHALLENGE scores every
         # survivor (v2.4 item 3 fix) — before the fix, survivors
         # other than the winner got 0 (eliminated players kept
@@ -5019,26 +5398,53 @@ async def main():
               and gstate_b["challenges"][2]["elim_phase"] == "black",
               f"breaks={gstate_b['breaks']} "
               f"challenges={gstate_b['challenges']}")
-        # Any Reaction challenge across GA/GB must carry real group
+        # --- live: full 7-player Group series, host-set 4v3 split
+        # (v2.5 item 2): the spec's own example — 7 players, 6
+        # challenges -> series-end standings 6000, 5000, 4000,
+        # 3000, 2000, 1000, 0 in finishing order (checked inside
+        # verify_group_series with expect_full=True). A 4v3 start
+        # also exercises transfers on the early breaks.
+        def _groups_c(players):
+            host_id = next(p["id"] for p in players if p["is_host"])
+            p2_id = next(p["id"] for p in players
+                         if not p["is_host"] and not p["is_bot"])
+            bots = [p["id"] for p in players if p["is_bot"]]
+            return {host_id: 0, p2_id: 0, bots[0]: 0, bots[1]: 0,
+                    bots[2]: 1, bots[3]: 1, bots[4]: 1}
+
+        gstate_c, gplayers_c = await run_group_series("GC", 5, _groups_c)
+        gverified_c, gskipped_c = verify_group_series(
+            "GC", gstate_c, gplayers_c, expect_full=True)
+        check("v2.5 item 2 (GC): the 7-player series played 6 "
+              "challenges and its finishing scores are exactly "
+              "6000, 5000, 4000, 3000, 2000, 1000, 0",
+              len(gstate_c["challenges"]) == 6
+              and [r["score"] for r in
+                   gstate_c["results"][0]["finishing_order"]]
+              == [6000, 5000, 4000, 3000, 2000, 1000, 0],
+              str([(r["nickname"], r["score"]) for r in
+                   gstate_c["results"][0]["finishing_order"]]))
+        # Any Reaction challenge across GA/GB/GC must carry real group
         # totals (not 0/0) — the Reaction challenge scores now
         # (v2.3 item 14 fix). Vacuous when no Reaction challenge
         # happened to come up; the in-process check above pins the
         # wiring deterministically either way.
         _reaction_breaks = [
-            b for st in (gstate_a, gstate_b) for b in st["breaks"]
+            b for st in (gstate_a, gstate_b, gstate_c) for b in st["breaks"]
             if st["challenges"][b["n"] - 1]["game"] == "reaction"]
-        check("v2.3 item 14 (GA+GB): every recorded Reaction break "
+        check("v2.3 item 14 (GA+GB+GC): every recorded Reaction break "
               "carries real group totals (not 0/0)",
               all(sum(int(v) for v in b["group_totals"].values()) > 0
                   for b in _reaction_breaks),
               f"reaction breaks={len(_reaction_breaks)} "
               f"totals={[b['group_totals'] for b in _reaction_breaks]}")
-        check("v2.3 item 14 (GA+GB): at least one challenge across "
-              "both series had a uniquely determined victim that "
+        check("v2.3 item 14 (GA+GB+GC): at least one challenge across "
+              "all three series had a uniquely determined victim that "
               "matched the server's pick",
-              gverified_a + gverified_b >= 1,
+              gverified_a + gverified_b + gverified_c >= 1,
               f"GA verified={gverified_a} skipped={gskipped_a}; "
-              f"GB verified={gverified_b} skipped={gskipped_b}")
+              f"GB verified={gverified_b} skipped={gskipped_b}; "
+              f"GC verified={gverified_c} skipped={gskipped_c}")
 
         await host.close(); await p2b.close(); await p2.close()
         print(f"\nALL CHECKS PASSED: {sum(PASS)}/{len(PASS)}")
