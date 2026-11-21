@@ -461,7 +461,24 @@ let expandedCardId=null, replayVoted=false, secretEliminated=false, presExchange
 // challenge intro / break group displays.
 let prevTeamsSetting=null;
 try{ prevTeamsSetting=JSON.parse(sessionStorage.getItem("pgh_prev_teams")||"null"); }catch(e){}
+// v2.6 (item 3): the Championship setting remembered when the host
+// picks Elimination, so it can be restored when they pick a normal
+// game again — the exact prevTeamsSetting pattern above. A forced
+// suspension, NOT the user turning Championship off: the server keeps
+// the championship history while suspended.
+let prevChampSetting=null;
+try{ prevChampSetting=JSON.parse(sessionStorage.getItem("pgh_prev_champ")||"null"); }catch(e){}
 let lastElimGroups=null, lastElimMode="normal", lastElimPhase=null, lastElimChallenge=null;
+// v2.6 (item 4): the Elimination banner must only be visible during
+// an Elimination series. A challenge's game_started carries the
+// challenge game (reaction/math/...) not "elimination", so the series
+// is detected from the room's selected game / the last challenge
+// seen, not from msg.game alone.
+function elimSeriesActive(){ return (room && room.game==="elimination") || lastElimChallenge!==null; }
+function hideElimBanner(){
+  $("elimBanner").classList.add("hidden"); $("elimBanner").innerHTML="";
+  lastElimGroups=null; lastElimMode="normal"; lastElimPhase=null; lastElimChallenge=null;
+}
 // v2.5 (item 3): Memory rounds survived per player, tracked from
 // memory_round_result — Memory's native running measure (survivors
 // have no banked score yet at a per-round break).
@@ -877,8 +894,17 @@ function refreshUnoHighlights(){
 function teamStandingsHtml(teams){
   if(!teams || !teams.length) return "";
   return "<h3>Team standings</h3><table>"+
-    teams.map(t=>"<tr><td><span class='team-badge' style='background:"+t.colour+"'>"+t.name+"</span></td><td>"+t.average+" pts</td><td class='muted'>"+
-      t.members.map(m=>nameHtml(m)).join(", ")+"</td></tr>").join("")+"</table>";
+    teams.map(t=>{
+      // v2.6 (item 1): the server marks Reaction mid-game team values
+      // as times (unit "ms": average of the members' running averages)
+      // vs points (unit "pts"). Times render as "312 ms", never as
+      // points; a team with no time yet (average null) renders "—".
+      const v=t.average;
+      const valHtml=(v===undefined||v===null||v==="")?"—":
+        (t.unit==="ms"?Math.round(v)+" ms":v+" pts");
+      return "<tr><td><span class='team-badge' style='background:"+t.colour+"'>"+t.name+"</span></td><td>"+valHtml+"</td><td class='muted'>"+
+        t.members.map(m=>nameHtml(m)).join(", ")+"</td></tr>";
+    }).join("")+"</table>";
 }
 // v2: display label for an UNO card string like "R5", "Gskip", "Wwild".
 function unoLabel(card){
@@ -1001,10 +1027,17 @@ function handle(msg){
     }catch(e){}
     history.replaceState(null,"",joinLink(room.code)); renderLobby(); show("lobby"); return; }
   if(msg.type==="lobby"){ room=msg.room; if(room.phase==="lobby"){ renderLobby(); show("lobby");
-    // v2.5 (item 4): the series is over — drop the stored challenge
-    // groups so a later series can never inherit a stale map.
-    lastElimGroups=null; lastElimChallenge=null; lastElimMode="normal"; lastElimPhase=null; } return; }
+    // v2.6 (item 4): the room is back in the lobby — the Elimination
+    // series is over, so the banner goes too (v2.5 item 4 already
+    // dropped the stored challenge groups so a later series can
+    // never inherit a stale map; hideElimBanner does both).
+    hideElimBanner(); } return; }
   if(msg.type==="game_started"){ room.current_game=msg.game; memorySurvived={};
+    // v2.6 (item 4): a normal game starting ends any banner — but
+    // NOT mid-series: an Elimination challenge's game_started
+    // carries the challenge game, so elimSeriesActive() (room game /
+    // last challenge seen) decides, never msg.game alone.
+    if(!elimSeriesActive()) hideElimBanner();
     if(msg.party_mode) room.mode=msg.party_mode;
     if(msg.teams) room.teams=msg.teams;
     $("gameTitle").textContent=GAME_NAMES[msg.game]+(msg.mode==="solo"?" — Solo practice":"");
@@ -1038,8 +1071,14 @@ function handle(msg){
     const me=msg.results.find(r=>r.player_id===myId);
     $("reactionResults").innerHTML = "<h3>Round "+msg.round+"/"+msg.total+"</h3><table>"+
       msg.results.map(r=>"<tr><td>"+nameHtml(r)+"</td><td>"+
-        (r.false_start?"Too soon! ❌":(r.ms==null?"—":r.ms+" ms"))+"</td></tr>").join("")+"</table>";
-    if(me && me.false_start) $("reactionArea").textContent="Too soon! That round doesn't count.";
+        // v2.6 (item 5): a false start now records 1000 ms instead of
+        // the round not counting — show the time with a too-soon
+        // label, not just "Too soon!" with no time. (A too-slow round
+        // likewise arrives as ms 1000 with false_start unset, and
+        // renders as a plain "1000 ms".) ms null stays "—" for edge
+        // cases (e.g. disconnect) with no recorded time at all.
+        (r.false_start?(r.ms==null?"Too soon! ❌":r.ms+" ms — too soon! ❌"):(r.ms==null?"—":r.ms+" ms"))+"</td></tr>").join("")+"</table>";
+    if(me && me.false_start) $("reactionArea").textContent="Too soon! 1000 ms penalty.";
     return; }
   if(msg.type==="question"){ quizAnswered=false; currentQIndex=msg.index; votedNext=false; voteIndex=null; $("voteBox").classList.add("hidden"); $("quizFeedback").textContent="";
     $("quizQ").textContent="Q"+msg.index+"/"+msg.total+": "+msg.text;
@@ -1423,6 +1462,9 @@ function handle(msg){
   // Earlier stages stay visible: the list stays, the pile grows.
   if(msg.type==="elimination_ceremony"){ show("ceremony"); renderCeremony(msg); return; }
   if(msg.type==="elimination_end_vote" || msg.type==="elimination_end_vote_update"){
+    // v2.6 (item 4): the series is over — the banner goes now, not
+    // whenever the next game happens to start.
+    hideElimBanner();
     $("elimEndVote").classList.remove("hidden");
     $("elimHostRow").classList.toggle("hidden", !isHost());
     $("elimVoteCount").textContent = msg.votes_again+"/"+msg.votes_needed+" voted Play Again · "+msg.votes_lobby+"/"+msg.votes_needed+" voted Return to Lobby"+
@@ -1458,6 +1500,10 @@ function handle(msg){
     return; }
   if(msg.type==="results"){
     clearInterval(quizTimerInt); clearInterval(presTimerInt); $("presTimer").textContent="";
+    // v2.6 (item 4): series-end results for the Elimination game —
+    // the series is over, so the banner goes. (Results for a
+    // challenge game mid-series must NOT hide it.)
+    if(msg.game==="elimination") hideElimBanner();
     clearVoteBox();
     const unit = msg.game==="reaction" ? " ms" : " pts";
     $("teamResults").innerHTML = msg.teams ? teamStandingsHtml(msg.teams) : "";
@@ -1552,6 +1598,14 @@ function renderLobby(){
   renderTurnOrderList();
   $("setTeamScoring").value=room.team_scoring||"average";
   $("setChampionship").checked=!!room.championship;
+  // v2.6 (item 3): the lobby payload also flags a suspended
+  // championship (Elimination) — remember it here too, so a client
+  // that joined mid-suspension (no in-memory / session value yet)
+  // still restores it when a normal game is picked again.
+  if(room.championship_suspended && !prevChampSetting){
+    prevChampSetting=true;
+    try{ sessionStorage.setItem("pgh_prev_champ", JSON.stringify(true)); }catch(e){}
+  }
   $("setUnoDrawUntil").checked=!!(gs.uno&&gs.uno.draw_until_playable);
   $("setUnoStacking").checked=!!(gs.uno&&gs.uno.stacking);
   $("setUnoMulti").checked=!!(gs.uno&&gs.uno.multi_play);
@@ -1710,6 +1764,23 @@ function pushSettings(){
     $("setMode").value="ffa";
     $("teamSettings").classList.add("hidden");
   }
+  // v2.6 (item 3): Elimination also forces Championship OFF — suspend
+  // + restore, mirroring the Teams force above. Remember the setting
+  // before unchecking, and flag the suspension so the server keeps
+  // the championship history instead of ending it (a plain
+  // championship:false with no flag would end it and wipe the
+  // history). While the suspension is active, every settings send
+  // keeps carrying the flag, so a later plain update can never be
+  // mistaken for the user turning Championship off.
+  let champSuspended=false;
+  if($("setGame").value==="elimination"){
+    if($("setChampionship").checked){
+      prevChampSetting=true;
+      try{ sessionStorage.setItem("pgh_prev_champ", JSON.stringify(true)); }catch(e){}
+      $("setChampionship").checked=false;
+    }
+    if(prevChampSetting) champSuspended=true;
+  }
   // v2.2: actually send the UNO + Secret settings (today it sent none
   // of them) plus turn order mode, team scoring and championship.
   const msg={type:"update_settings", room_name:$("setRoomName").value.trim(), max_players:parseInt($("setMaxPlayers").value),
@@ -1724,6 +1795,7 @@ function pushSettings(){
       president:{turn_seconds:30},
       memory:{memorize_seconds:parseInt($("setMemoryTime").value)} }};
   if($("setTurnOrderMode").value==="manual" && room && room.turn_order) msg.turn_order=room.turn_order;
+  if(champSuspended) msg.championship_suspended=true;
   send(msg);
 }
 ["setRoomName","setMaxPlayers","setGame","setReactionRounds","setMathDiff","setMathQ","setMathTime","setTriviaCat","setTriviaDiff","setTriviaQ","setTriviaTime","setMemoryTime","setMode","setTeamCount",
@@ -1748,18 +1820,42 @@ $("setGame").addEventListener("change", ()=>{
     if(room && room.game!=="elimination"){
       prevTeamsSetting={mode: room.mode||"ffa", team_count: room.team_count||2};
       try{ sessionStorage.setItem("pgh_prev_teams", JSON.stringify(prevTeamsSetting)); }catch(e){}
+      // v2.6 (item 3): remember the Championship setting too, from
+      // the last lobby echo — pushSettings (fired first by the
+      // change) normally already remembered it from the checkbox;
+      // this covers any path where it did not run first.
+      if(room.championship && !prevChampSetting){
+        prevChampSetting=true;
+        try{ sessionStorage.setItem("pgh_prev_champ", JSON.stringify(true)); }catch(e){}
+      }
     }
     $("setMode").value="ffa"; $("teamSettings").classList.add("hidden");
   } else if(room && room.game==="elimination"){
+    let restored=false;
     let prev=prevTeamsSetting;
     if(!prev){ try{ prev=JSON.parse(sessionStorage.getItem("pgh_prev_teams")||"null"); }catch(e){} }
     if(prev && prev.mode){
       $("setMode").value=prev.mode; $("setTeamCount").value=String(prev.team_count||2);
       $("teamSettings").classList.toggle("hidden", prev.mode!=="teams");
-      pushSettings();
       try{ sessionStorage.removeItem("pgh_prev_teams"); }catch(e){}
       prevTeamsSetting=null;
+      restored=true;
     }
+    // v2.6 (item 3): restore the Championship checkbox from the
+    // remembered setting (same place the Teams setting is restored)
+    // and send the restored value in the next settings update —
+    // pushSettings below carries championship:true, without the
+    // suspended flag. Restored independently of Teams, so a missing
+    // Teams value can never swallow the Championship restore.
+    let prevChamp=prevChampSetting;
+    if(!prevChamp){ try{ prevChamp=JSON.parse(sessionStorage.getItem("pgh_prev_champ")||"null"); }catch(e){} }
+    if(prevChamp){
+      $("setChampionship").checked=true;
+      try{ sessionStorage.removeItem("pgh_prev_champ"); }catch(e){}
+      prevChampSetting=null;
+      restored=true;
+    }
+    if(restored) pushSettings();
   }
 });
 // v2.3 (item 14): Elimination mode picker — sends elimination_mode via
