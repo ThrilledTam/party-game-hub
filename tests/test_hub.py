@@ -30,22 +30,47 @@ Starts the real server on port 8001, then over real WebSockets:
     extras / eliminated), the deterministic group pick / balance /
     rebalance helpers, a full 6-player Group series (worst team
     loses its worst player, merge at 5 into Black, Black phase
-    until 1 remains, linear place scores — v2.5 item 2), and a 7-player
+    until 1 remains, accumulated-tally series-end scores
+    (v2.6 item 2), and a 7-player
     6-vs-1 series whose first break rebalances with transfers,
     and Reaction challenges assign interpolated points (verified
     in-process with all bots, and live from the round results
     whenever a Reaction challenge comes up)
   - covers the v2.5 contracts: the ceremony pile holds each
     eliminated player exactly once at every stage (list/drop
-    without the victim, merge/transfer with them), linear
-    series-end standings ((challenges played) x 1000 down to 0
-    in finishing order — 7 players / 6 challenges -> 6000..0),
+    without the victim, merge/transfer with them), series-end
+    standings are the accumulated tallies in finishing order
+    (v2.6 item 2 — the v2.5 linear (challenges x 1000) standings
+    are reverted),
     Reaction per-round breaks carry the native running
     avg_ms/best_ms instead of the all-0 scores (reproduced
     in-process first), and the ceremony ranking + break scores
     show the team each player played as, not the post-transfer
     team (a transferred player's rows keep the as-played team
     while the transfer is still shown below)
+  - covers the v2.6 contracts: Reaction team standings are the
+    average of the members' running averages in ms (unit "ms",
+    fastest team first, members with no valid time excluded, a
+    team with no valid time has no value) while a Reaction game
+    is playing; series-end results show each player's ACCUMULATED
+    series tally in finishing order (no linear place scores — the
+    v2.5 linear standings are reverted, and the ranking follows
+    finishing order even when an early-eliminated player's tally
+    tops the survivor's); Championship is SUSPENDED (not ended)
+    while Elimination is on — history and counter survive — and
+    restored when a normal game is picked again, while an explicit
+    championship:false with no flag still ends it and clears the
+    history, and start_game for Elimination forces it off without
+    clearing history (no championship game is recorded for the
+    series); the Elimination banner is hidden when a normal game
+    starts, when the room returns to the lobby, and when the
+    series ends (served-HTML checks — the suite has no browser);
+    and the Reaction 1-second penalty — a false start or no click
+    within 1s records 1000ms, a later click in the round is
+    ignored, the running average includes the penalties (killing
+    the one-great-time exploit), the end-of-game interpolation is
+    unchanged, bots are unaffected (all bot times under 1s), and
+    the no-valid-time -> worst fallback stays for disconnects
   - covers the v2.4 contracts: no presCounts/unoCounts lists in
     the served HTML, turnStripHtml takes counts and the strip
     keeps the player colour border with the yellow ring as an
@@ -75,7 +100,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from questions import QUESTIONS  # noqa: E402
 from secret_clues import SECRET_CLUES, SECRET_CATEGORY, VAGUE_CLUES_80  # noqa: E402
-from server import make_math_question, record_answer, Room, Player, team_standings  # noqa: E402
+from server import make_math_question, record_answer, Room, Player, team_standings, BOT_REACTION  # noqa: E402
 from server import (GAMES, ELIM_POOL, SECRET_WORDS, VAGUE_CLUES, secret_tally,  # noqa: E402
                     build_president_deck, president_legal_play,  # noqa: E402
                     president_illegal_reason,  # noqa: E402
@@ -89,7 +114,7 @@ from server import (GAMES, ELIM_POOL, SECRET_WORDS, VAGUE_CLUES, secret_tally,  
                     uno_best_colour, uno_value, uno_validate_play,  # noqa: E402
                     _uno_handle_draw, _uno_apply_play_multi,  # noqa: E402
                     memory_bot_correct, run_memory_game,  # noqa: E402
-                    _reaction_points, run_reaction_game,  # noqa: E402
+                    _reaction_points, run_reaction_game, record_reaction,  # noqa: E402
                     _elim_balance_groups, _elim_pick_worst_team,  # noqa: E402
                     _elim_pick_worst_player, _elim_rebalance_groups,  # noqa: E402
                     _elim_score_rows, _vote_phase)  # noqa: E402
@@ -877,6 +902,27 @@ def verify_elim_tally(tag, breaks):
                 seen[pid] = row["tally"]
 
 
+def final_elim_tallies(state, series=None):
+    """v2.6 item 2: final per-player Elimination tallies from the
+    recorded ceremony rankings. Every ceremony ranking row carries
+    the player's tally AFTER that challenge (elim_tally is updated
+    before the ceremony runs), and the ranking includes the victim
+    — so a player's LAST appearance, in challenge order, is their
+    final tally: eliminated players earn nothing after their
+    elimination challenge, and the survivor's last appearance is
+    the final challenge. `series` filters to one Play-Again series
+    when the state recorded several (the Normal series driver tags
+    each ceremony stage with its series; Group / item-16 states
+    hold a single series, so no filter is needed there)."""
+    tallies = {}
+    for c in state.get("ceremony", []):
+        if series is not None and c.get("series") != series:
+            continue
+        for r in c.get("ranking") or []:
+            tallies[r["player_id"]] = r["tally"]
+    return tallies
+
+
 def verify_group_series(tag, state, players, *, expect_full):
     """v2.3 item 14: verify one recorded Group series from the data
     the server itself broadcast. Checks the challenge wire, the
@@ -1208,25 +1254,59 @@ def verify_group_series(tag, state, players, *, expect_full):
         winner = fin[0]["player_id"] if fin else None
         expect_fin = [winner] + [e["player_id"]
                                  for e in reversed(state["eliminated"])]
-        # v2.5 item 2: linear series-end standings over the
-        # finishing order — 1st = (challenges played) x 1000, last
-        # = 0, equal steps in between. One elimination per
-        # challenge, so challenges played == players - 1 here
-        # (e.g. 7 players / 6 challenges -> 6000..0; 6 players /
-        # 5 challenges -> 5000..0). Replaces the old victor-only
-        # scoring (winner 1000, everyone else 0).
+        # v2.6 item 2: REVERT of the v2.5 linear place scores — the
+        # series-end results are an ordered ranking only (winner
+        # first, then the eliminated in reverse order), with each
+        # row showing the player's ACCUMULATED series tally
+        # (room.elim_tally), not linear place points. The finishing
+        # order is unchanged; the scores are the final tallies
+        # reconstructed from the ceremony rankings (each row's tally
+        # after that challenge, victim included).
         _n_ch = len(state["challenges"])
-        _expect_scores = [_n_ch * 1000 - 1000 * i
-                          for i in range(len(players))]
-        check(f"v2.5 item 2 ({tag}): finishing order is the winner "
-              "then the eliminated in reverse order, with linear "
-              f"place scores {_expect_scores}",
+        _final = final_elim_tallies(state)
+        _linear = [_n_ch * 1000 - 1000 * i for i in range(len(players))]
+        check(f"v2.6 item 2 ({tag}): finishing order is the winner "
+              "then the eliminated in reverse order",
               len(fin) == len(players)
               and len({r["player_id"] for r in fin}) == len(players)
               and [r["player_id"] for r in fin] == expect_fin
-              and res.get("victor") == winner
-              and [r["score"] for r in fin] == _expect_scores,
+              and res.get("victor") == winner,
               str([(r["nickname"], r["score"]) for r in fin]))
+        check(f"v2.6 item 2 ({tag}): every series-end row shows "
+              "that player's ACCUMULATED series tally (not a place "
+              "score)",
+              len(fin) == len(players)
+              and all(r["player_id"] in _final for r in fin)
+              and [r["score"] for r in fin]
+              == [_final[r["player_id"]] for r in fin],
+              f"scores={[(r['nickname'], r['score']) for r in fin]} "
+              f"tallies={_final}")
+        if [_final[r["player_id"]] for r in fin] != _linear:
+            check(f"v2.6 item 2 ({tag}): the scores are NOT the "
+                  f"reverted linear place scores {_linear}",
+                  [r["score"] for r in fin] != _linear,
+                  str([(r["nickname"], r["score"]) for r in fin]))
+        # The ranking follows finishing order, NOT tally order: if
+        # an early-eliminated player out-tallied the survivor, they
+        # still rank below them. (Vacuous when no eliminated
+        # player's tally tops the survivor's — the order + tally
+        # checks above pin the rule either way.)
+        _surv_tally = _final.get(winner)
+        _diverged = [pid for pid, t in _final.items()
+                     if pid != winner and _surv_tally is not None
+                     and t > _surv_tally]
+        _fin_pos = {r["player_id"]: i for i, r in enumerate(fin)}
+        check(f"v2.6 item 2 ({tag}): ranking follows finishing "
+              "order, not tally order (an early-eliminated player "
+              "with a higher tally still ranks below the survivor)",
+              all(_fin_pos.get(pid, -1) > 0 for pid in _diverged),
+              f"diverged={[(by_id.get(pid), _final[pid])
+                           for pid in _diverged]} "
+              f"survivor tally={_surv_tally} "
+              f"finishing={[(r['nickname'], r['score'])
+                            for r in fin]}" if _diverged
+              else "no eliminated player out-tallied the survivor "
+                   "(vacuous here)")
     return verified, skipped
 
 
@@ -1353,6 +1433,55 @@ async def main():
                   and "no time yet" in _bst
                   and "survived" in _bst,
                   _bst[:400])
+            # --- v2.6 item 4 (client): the Elimination banner must
+            # only be visible during an Elimination series. This
+            # suite has no browser (HTTP + WebSocket only), so —
+            # like the v2.5 pile fix above — this pins the
+            # served-HTML wiring: a hideElimBanner() helper that
+            # hides + clears #elimBanner, called from the
+            # game_started handler for non-elimination games
+            # (guarded by elimSeriesActive(), because a mid-series
+            # challenge's game_started carries the challenge game,
+            # not "elimination"), from the lobby handler (the series
+            # is over, back in the lobby), and from the elimination
+            # end-vote / series-end results handlers.
+            check("v2.6 item 4 (client): hideElimBanner() hides + "
+                  "clears #elimBanner",
+                  "function hideElimBanner()" in r.text
+                  and '$("elimBanner").classList.add("hidden")' in r.text
+                  and '$("elimBanner").innerHTML=""' in r.text)
+            _gs = r.text[r.text.find('if(msg.type==="game_started")'):
+                         r.text.find('if(msg.type==="reaction_wait")')]
+            check("v2.6 item 4 (client): the game_started handler "
+                  "hides the banner for non-elimination games "
+                  "(guarded by elimSeriesActive, so a mid-series "
+                  "challenge start keeps it)",
+                  "hideElimBanner()" in _gs
+                  and "elimSeriesActive()" in _gs,
+                  _gs[:300])
+            _lbh = r.text[r.text.find('if(msg.type==="lobby")'):
+                          r.text.find('if(msg.type==="game_started")')]
+            check("v2.6 item 4 (client): the lobby handler hides "
+                  "the banner (series over, back in the lobby)",
+                  "hideElimBanner()" in _lbh,
+                  _lbh[:300])
+            _ev_at = r.text.find(
+                'if(msg.type==="elimination_end_vote"')
+            _ev_end = r.text.find('if(msg.type===', _ev_at + 10)
+            _ev_block = r.text[_ev_at:_ev_end]
+            check("v2.6 item 4 (client): the elimination end-vote "
+                  "handler hides the banner (the series is over)",
+                  "hideElimBanner()" in _ev_block,
+                  _ev_block[:300])
+            _rs_at = r.text.find('if(msg.type==="results")')
+            _rs_end = r.text.find('if(msg.type===', _rs_at + 10)
+            _rs_block = r.text[_rs_at:_rs_end]
+            check("v2.6 item 4 (client): the results handler hides "
+                  "the banner for a series-end (elimination) "
+                  "results screen",
+                  'if(msg.game==="elimination") hideElimBanner();'
+                  in _rs_block,
+                  _rs_block[:300])
             check("health endpoint", (await http.get(f"{BASE}/api/health")).json().get("ok") is True)
 
         # --- create room + join 2nd human ---
@@ -1530,10 +1659,248 @@ async def main():
               str([(r["nickname"], r["avg_ms"], r["best_ms"])
                    for r in results["rankings"]]))
 
-        # --- back to lobby, Speed Math: 5 questions ---
+        # --- back to lobby, v2.6 Reaction (Teams + 1s penalty) ---
         # v2.2: play_again is gone — results -> end-of-game NEXT vote
         # -> end_choice -> replay_vote "lobby" -> lobby.
+        _end_rxn, _lb_rxn = await drive_end_flow(
+            host, [host, p2], choice="lobby", count=4)
+        # --- v2.6 item 1 (live) + item 5 (live): standalone
+        # Reaction in Teams mode. Host + bot1 on Team 1 (0), p2 +
+        # bot2 on Team 2 (1). Round 1 both humans click on go;
+        # round 2 p2 false-starts (clicks during the wait, before
+        # the signal); round 3 p2 never clicks (the 1s auto-submit
+        # must record 1000ms). The per-round vote breaks carry the
+        # team standings as the average of the members' running
+        # averages in ms (unit "ms", fastest team first) — NOT 0
+        # and NOT points — and the per-player avg/best display from
+        # v2.5 still holds. The end results carry the
+        # penalty-averaged times and the unchanged interpolation.
+        _rx6_players = _lb_rxn["room"]["players"]
+        _rx6_bots = [p for p in _rx6_players if p["is_bot"]]
+        _rx6_host_id = next(p["id"] for p in _rx6_players
+                            if p["is_host"])
+        _rx6_p2_id = next(p["id"] for p in _rx6_players
+                          if p["nickname"] == "Cousin1")
+        await host.send({"type": "update_settings", "mode": "teams",
+                         "team_count": 2, "game": "reaction",
+                         "game_settings": {"reaction": {"rounds": 3}}})
+        await host.wait_lobby_where(
+            lambda r: r["mode"] == "teams" and r["game"] == "reaction")
+        await host.send({"type": "assign_team",
+                         "player_id": _rx6_host_id, "team": 0})
+        await host.wait_lobby()
+        await host.send({"type": "assign_team",
+                         "player_id": _rx6_bots[0]["id"], "team": 0})
+        await host.wait_lobby()
+        await host.send({"type": "assign_team",
+                         "player_id": _rx6_p2_id, "team": 1})
+        await host.wait_lobby()
+        await host.send({"type": "assign_team",
+                         "player_id": _rx6_bots[1]["id"], "team": 1})
+        _lb6 = await host.wait_lobby_where(
+            lambda r: r["teams"].get(_rx6_bots[1]["id"]) == 1)
+        _rx6_teams = dict(_lb6["room"]["teams"])
+
+        def _rx6_team_value(team, upto):
+            """Expected mid-game team value (v2.6 item 1): the
+            average of the members' running averages so far, from
+            the recorded round ms — mirroring the server's
+            round(mean) member average then round(mean, 1)."""
+            avgs = []
+            for pid, t in _rx6_teams.items():
+                if t != team:
+                    continue
+                ms = [_rx6_rounds[i][pid] for i in range(upto)
+                      if _rx6_rounds[i].get(pid) is not None]
+                if ms:
+                    avgs.append(round(sum(ms) / len(ms)))
+            if not avgs:
+                return None
+            return round(sum(avgs) / len(avgs), 1)
+
+        _rx6_rounds = []  # [{player_id: ms}] per round, in order
+        _rx6_breaks = []  # vote_break payloads, in round order
+        await host.send({"type": "start_game"})
+        started = await host.wait_for("game_started", timeout=5)
+        check("v2.6 item 1 (live): the Teams Reaction game starts "
+              "in Teams mode",
+              started["game"] == "reaction"
+              and started.get("party_mode") == "teams", str(started))
+        for rnd in (1, 2, 3):
+            await host.wait_for("reaction_wait", timeout=10)
+            if rnd == 2:
+                # v2.6 item 5: p2 false-starts — clicks during the
+                # wait, before the signal (the 1-4s wait delay means
+                # this reliably lands before the green light).
+                await p2.send({"type": "reaction_click"})
+            await host.wait_for("reaction_go", timeout=10)
+            await host.send({"type": "reaction_click"})
+            if rnd == 1:
+                await p2.send({"type": "reaction_click"})
+            # Round 3: p2 never clicks — the 1s auto-submit must
+            # record 1000ms for them (the round ends on it).
+            res = await host.wait_for("reaction_round_result",
+                                      timeout=10)
+            check(f"v2.6 Reaction round {rnd} result has all "
+                  "4 players",
+                  len(res["results"]) == 4)
+            _rx6_rounds.append(
+                {r["player_id"]: r["ms"] for r in res["results"]
+                 if r.get("ms") is not None})
+            _r2 = {r["player_id"]: r for r in res["results"]}
+            if rnd == 1:
+                check("v2.6 item 5 (live): round 1 — both humans "
+                      "clicked on go (real ms under 1s)",
+                      _r2[_rx6_host_id]["ms"] is not None
+                      and _r2[_rx6_host_id]["ms"] < 1000
+                      and _r2[_rx6_p2_id]["ms"] is not None
+                      and _r2[_rx6_p2_id]["ms"] < 1000
+                      and not _r2[_rx6_p2_id]["false_start"],
+                      str(res["results"]))
+            elif rnd == 2:
+                check("v2.6 item 5 (live, a): round 2 — p2's false "
+                      "start records 1000ms (the round still counts)",
+                      _r2[_rx6_p2_id]["ms"] == 1000
+                      and _r2[_rx6_p2_id]["false_start"] is True,
+                      str(res["results"]))
+            else:
+                check("v2.6 item 5 (live, b): round 3 — p2 never "
+                      "clicked, so 1000ms is auto-submitted (not a "
+                      "false start)",
+                      _r2[_rx6_p2_id]["ms"] == 1000
+                      and _r2[_rx6_p2_id]["false_start"] is False,
+                      str(res["results"]))
+            if rnd < 3:
+                vb = await host.wait_for("vote_break", timeout=10)
+                _rx6_breaks.append(vb)
+                # --- v2.6 item 1: the break's team standings are
+                # the average of the members' running averages, in
+                # ms, fastest team first — NOT 0, NOT points.
+                _teams = vb.get("teams") or []
+                _exp = {t: _rx6_team_value(t, rnd) for t in (0, 1)}
+                check(f"v2.6 item 1 (live): round {rnd} break team "
+                      "standings are the average of the members' "
+                      "running averages, in ms (unit ms)",
+                      vb.get("mode") == "teams"
+                      and len(_teams) == 2
+                      and all(t.get("unit") == "ms" for t in _teams)
+                      and {t["team"]: t["average"] for t in _teams}
+                      == _exp
+                      and all(t["average"] is not None
+                              and 0 < t["average"] <= 1000
+                              for t in _teams),
+                      f"teams={_teams} expected={_exp}")
+                check(f"v2.6 item 1 (live): round {rnd} break team "
+                      "standings are fastest team first",
+                      [t["average"] for t in _teams]
+                      == sorted(t["average"] for t in _teams),
+                      str([(t["team"], t["average"]) for t in _teams]))
+                # --- v2.5 item 3 still holds: the break rows carry
+                # the native running avg_ms / best_ms.
+                _rows = {s["player_id"]: s for s in vb["scores"]}
+                _native_ok = True
+                for _pid, _row in _rows.items():
+                    _so_far = [_rx6_rounds[i][_pid]
+                               for i in range(rnd)
+                               if _rx6_rounds[i].get(_pid) is not None]
+                    if not _so_far:
+                        if _row.get("avg_ms") is not None \
+                                or _row.get("best_ms") is not None:
+                            _native_ok = False
+                    elif _row.get("avg_ms") != round(
+                            sum(_so_far) / len(_so_far)) \
+                            or _row.get("best_ms") != min(_so_far):
+                        _native_ok = False
+                check(f"v2.6 item 1 (live): round {rnd} break rows "
+                      "still carry the running avg_ms / best_ms "
+                      "(v2.5 display)",
+                      _native_ok and len(_rows) == 4,
+                      str(vb["scores"]))
+                if rnd == 1:
+                    await host.send({"type": "vote_next", "index": rnd})
+                else:
+                    await host.send({"type": "host_skip"})
+        results = await host.wait_for("results", timeout=10)
+        check("v2.6 Reaction produces results",
+              len(results["rankings"]) == 4
+              and results["game"] == "reaction",
+              str([(r["nickname"], r["avg_ms"])
+                   for r in results["rankings"]]))
+        _r1 = _rx6_rounds[0][_rx6_p2_id]
+        _p2res = next(r for r in results["rankings"]
+                      if r["player_id"] == _rx6_p2_id)
+        check("v2.6 item 5 (live, d): p2's running average includes "
+              "the 1s penalties — one great time averaged with two "
+              "1000ms penalties is no great average (exploit dead)",
+              _p2res["avg_ms"] == round((_r1 + 1000 + 1000) / 3)
+              and _p2res["avg_ms"] != _r1
+              and _p2res["avg_ms"] >= 667
+              and _p2res["best_ms"] == _r1,
+              f"avg={_p2res['avg_ms']} best={_p2res['best_ms']} "
+              f"round-1 ms={_r1}")
+        check("v2.6 item 5 (live, a): p2's false start counted "
+              "(false_starts 1)",
+              _p2res["false_starts"] == 1,
+              str(_p2res))
+        # --- v2.6 item 5 (e): the end-of-game interpolation is
+        # unchanged — recompute it from the broadcast averages,
+        # penalties included.
+        _avgs = [r["avg_ms"] for r in results["rankings"]
+                 if r["avg_ms"] is not None]
+        _best, _worst = min(_avgs), max(_avgs)
+        _formula_ok = True
+        for r in results["rankings"]:
+            if r["avg_ms"] is None:
+                _exp = 0
+            elif _best == _worst:
+                _exp = 1000
+            else:
+                _exp = round(1000 * (_worst - r["avg_ms"])
+                             / (_worst - _best))
+            if r["score"] != _exp:
+                _formula_ok = False
+        check("v2.6 item 5 (live, e): end-of-game interpolation is "
+              "unchanged (best 1000 / worst 0, penalties included)",
+              _formula_ok and results["rankings"][0]["score"] == 1000,
+              str([(r["nickname"], r["avg_ms"], r["score"])
+                   for r in results["rankings"]]))
+        # --- v2.6 item 5 (f): the Hard bots all clicked under 1s
+        # (no penalty) in every round.
+        _bot_ids = {_rx6_bots[0]["id"], _rx6_bots[1]["id"]}
+        check("v2.6 item 5 (live, f): bots are unaffected — every "
+              "bot round time is under 1s",
+              all(_rx6_rounds[i][pid] is not None
+                  and _rx6_rounds[i][pid] < 1000
+                  for i in range(3) for pid in _bot_ids),
+              str(_rx6_rounds))
+        check("v2.6 item 5 (live, f): every bot's average is under "
+              "1s too",
+              all(r["avg_ms"] is not None and r["avg_ms"] < 1000
+                  for r in results["rankings"]
+                  if r["player_id"] in _bot_ids),
+              str([(r["nickname"], r["avg_ms"])
+                   for r in results["rankings"]]))
+        # --- v2.6 item 1: once the game ends (phase "results")
+        # Reaction points are assigned, so the results teams are
+        # points-based again (unit "pts", average style).
+        _rteams = results.get("teams") or []
+        _rexp_pts = {}
+        for t in _rteams:
+            _mem = [next(r["score"] for r in results["rankings"]
+                         if r["player_id"] == m["id"])
+                    for m in t["members"]]
+            _rexp_pts[t["team"]] = round(sum(_mem) / len(_mem), 1)
+        check("v2.6 item 1 (live): the end results teams are "
+              "points-based again (unit pts, average of member "
+              "scores)",
+              len(_rteams) == 2
+              and all(t.get("unit") == "pts" for t in _rteams)
+              and {t["team"]: t["average"] for t in _rteams}
+              == _rexp_pts,
+              f"teams={_rteams} expected={_rexp_pts}")
         await drive_end_flow(host, [host, p2], choice="lobby", count=4)
+
+        # --- back to lobby, Speed Math: 5 questions ---
         await host.send({"type": "update_settings", "game": "math",
                          "game_settings": {"math": {"difficulty": "Easy",
                                                     "questions": 5,
@@ -2770,6 +3137,94 @@ async def main():
         check("v2.2 team scoring: a team with no surviving members "
               "totals 0 under best",
               _sts[0] == 0.0, str(_sts))
+
+        # --- v2.6 item 1 (internal): Reaction team standings are
+        # the average of the members' running averages (ms), not
+        # points, while the Reaction game is still playing. Members
+        # with no valid time yet are excluded; a team with no valid
+        # times has no value (None) and sorts last; the
+        # host-picked team_scoring style still applies to the
+        # member averages (best = fastest member, sum = sum of the
+        # averages). Once the game ends (phase "results") Reaction
+        # points are assigned, so the normal points-based standings
+        # (unit "pts") apply again.
+        def _rx6_team_room(times, teams, style="average", phase="playing"):
+            r = Room(code="TS26", mode="teams", team_count=2)
+            r.team_scoring = style
+            r.current_game = "reaction"
+            r.phase = phase
+            r.players = [Player(id=i, nickname=i, colour="#fff",
+                                score=s, reaction_times=list(ts))
+                         for i, (s, ts) in times.items()]
+            r.teams = dict(teams)
+            return r
+
+        _r26 = _rx6_team_room(
+            {"a": (100, [300, 300]), "b": (300, [500]),
+             "c": (50, [400, 400, 400]), "d": (0, []),
+             "e": (25, [])},
+            {"a": 0, "b": 0, "c": 1, "d": 1, "e": None})
+        _s26 = {t["team"]: t for t in team_standings(_r26)}
+        check("v2.6 item 1 (internal): a Reaction team value is the "
+              "average of its members' running averages (ms), not "
+              "points — (300+500)/2 = 400, (400)/1 = 400",
+              _s26[0]["average"] == 400.0
+              and _s26[0]["score"] == 400.0
+              and _s26[0]["unit"] == "ms"
+              and _s26[1]["average"] == 400.0
+              and _s26[1]["unit"] == "ms",
+              str(_s26))
+        check("v2.6 item 1 (internal): a member with no valid time "
+              "yet is excluded from the team average (d's empty "
+              "times do not drag team 1 down)",
+              _s26[1]["average"] == 400.0, str(_s26[1]))
+        check("v2.6 item 1 (internal): an Alone player with no "
+              "valid time has no value (None, unit ms) and sorts last",
+              _s26[None]["average"] is None
+              and _s26[None]["unit"] == "ms"
+              and team_standings(_r26)[-1]["team"] is None,
+              str(_s26[None]))
+        _r26b = _rx6_team_room(
+            {"a": (100, [300, 300]), "b": (300, [500]),
+             "c": (50, [400]), "d": (0, [])},
+            {"a": 0, "b": 0, "c": 1, "d": 1}, style="best")
+        _s26b = {t["team"]: t for t in team_standings(_r26b)}
+        check("v2.6 item 1 (internal): best style still applies to "
+              "member averages — fastest member (300, not 400)",
+              _s26b[0]["average"] == 300.0
+              and _s26b[0]["unit"] == "ms", str(_s26b))
+        _r26c = _rx6_team_room(
+            {"a": (100, [300, 300]), "b": (300, [500]),
+             "c": (50, [400]), "d": (0, [])},
+            {"a": 0, "b": 0, "c": 1, "d": 1}, style="sum")
+        _s26c = {t["team"]: t for t in team_standings(_r26c)}
+        check("v2.6 item 1 (internal): sum style still applies to "
+              "member averages — 300+500 = 800",
+              _s26c[0]["average"] == 800.0
+              and _s26c[0]["unit"] == "ms", str(_s26c))
+        _r26d = _rx6_team_room(
+            {"a": (100, [300]), "b": (300, []), "c": (50, [])},
+            {"a": 0, "b": 1, "c": 1})
+        _s26d = {t["team"]: t for t in team_standings(_r26d)}
+        check("v2.6 item 1 (internal): a team with no valid times "
+              "at all has no value (None) and sorts last",
+              _s26d[1]["average"] is None
+              and _s26d[1]["unit"] == "ms"
+              and team_standings(_r26d)[-1]["team"] == 1,
+              str(_s26d))
+        _r26e = _rx6_team_room(
+            {"a": (100, [300, 300]), "b": (300, [500]),
+             "c": (50, [400, 400, 400]), "d": (0, [])},
+            {"a": 0, "b": 0, "c": 1, "d": 1}, phase="results")
+        _s26e = {t["team"]: t for t in team_standings(_r26e)}
+        check("v2.6 item 1 (internal): once the game ends the "
+              "standings are points-based again (unit pts, from "
+              "p.score — (100+300)/2 = 200)",
+              _s26e[0]["average"] == 200.0
+              and _s26e[0]["unit"] == "pts"
+              and _s26e[1]["average"] == 25.0
+              and _s26e[1]["unit"] == "pts",
+              str(_s26e))
 
         # --- v2.2 §8: Secret Word multi-round game (5 humans) ---
         # 5 humans, 1 impostor, MANUAL turn order (scrambled). The
@@ -4035,14 +4490,39 @@ async def main():
               and len({r["player_id"] for r in first["finishing_order"]}) == 4
               and first["finishing_order"][0]["player_id"] == first["victor"],
               str(first.get("finishing_order")))
-        # v2.5 item 2: linear series-end standings — 4 players,
-        # 3 challenges per series -> 3000, 2000, 1000, 0 in
-        # finishing order (replaces the old victor-only 1000/0).
-        check("v2.5 item 2: Normal-mode series-end standings are "
-              "linear (3000, 2000, 1000, 0 — no finale places)",
-              [r["score"] for r in first["finishing_order"]]
-              == [3000, 2000, 1000, 0],
-              str([(r["nickname"], r["score"]) for r in first["finishing_order"]]))
+        # v2.6 item 2: REVERT of the v2.5 linear place scores — the
+        # series-end rows show each player's ACCUMULATED series
+        # tally in finishing order (no 3000/2000/1000/0). Final
+        # tallies come from the series-0 ceremony rankings (each
+        # row's tally after that challenge, victim included).
+        _fin0 = first["finishing_order"]
+        _tally0 = final_elim_tallies(elim_state, series=0)
+        _linear0 = [3000, 2000, 1000, 0]
+        check("v2.6 item 2 (Normal): series-end rows show the "
+              "accumulated tallies in finishing order",
+              len(_fin0) == 4
+              and all(r["player_id"] in _tally0 for r in _fin0)
+              and [r["score"] for r in _fin0]
+              == [_tally0[r["player_id"]] for r in _fin0],
+              f"scores={[(r['nickname'], r['score']) for r in _fin0]} "
+              f"tallies={_tally0}")
+        if [_tally0[r["player_id"]] for r in _fin0] != _linear0:
+            check("v2.6 item 2 (Normal): the scores are NOT the "
+                  "reverted linear place scores (3000, 2000, 1000, 0)",
+                  [r["score"] for r in _fin0] != _linear0,
+                  str([(r["nickname"], r["score"]) for r in _fin0]))
+        _surv0 = _fin0[0]["player_id"]
+        _div0 = [pid for pid, t in _tally0.items()
+                 if pid != _surv0 and t > _tally0.get(_surv0, 0)]
+        _pos0 = {r["player_id"]: i for i, r in enumerate(_fin0)}
+        check("v2.6 item 2 (Normal): ranking follows finishing "
+              "order, not tally order (an early-eliminated player "
+              "with a higher tally still ranks below the survivor)",
+              all(_pos0.get(pid, -1) > 0 for pid in _div0),
+              f"diverged={[(pid, _tally0[pid]) for pid in _div0]} "
+              f"survivor tally={_tally0.get(_surv0)}" if _div0
+              else "no eliminated player out-tallied the survivor "
+                   "(vacuous here)")
         check("v2 Elimination: series ends back in the lobby",
               elim_state["lobby"])
         check("v2.2 Elimination: the second end vote was forced by the "
@@ -4511,7 +4991,11 @@ async def main():
               str(results["rankings"]))
         await drive_end_flow(hsolo, [hsolo], choice="lobby", count=1)
         await hsolo.close()
-        # False starts only: a player with no valid time scores 0.
+        # False starts only: v2.6 item 5 changed this — a false start
+        # now records 1000ms instead of leaving the player with no
+        # valid time, so the all-false-starts player HAS an average
+        # (1000) and still scores 0 (worst). The no-valid-time case
+        # now only arises on disconnect (pinned in-process).
         hf = Client("fs-host"); await hf.connect()
         await hf.send({"type": "create_room", "nickname": "FSHost", "colour": "#e74c3c"})
         jf = await hf.wait_for("joined")
@@ -4553,9 +5037,12 @@ async def main():
                         if r["nickname"] == "FSHost")
         _fs_p2 = next(r for r in fs_res["rankings"]
                       if r["nickname"] == "FSP2")
-        check("v2.2 Reaction: a player with no valid time (all false "
-              "starts) scores 0 and has no average",
-              _fs_host["score"] == 0 and _fs_host["avg_ms"] is None,
+        check("v2.6 item 5 (live): a player with all false starts "
+              "scores 0 (worst) but HAS an average of 1000ms — each "
+              "false start recorded 1000ms",
+              _fs_host["score"] == 0 and _fs_host["avg_ms"] == 1000
+              and _fs_host["best_ms"] == 1000
+              and _fs_host["false_starts"] == 2,
               str(fs_res["rankings"]))
         check("v2.2 Reaction: the clean player still scores 1000 (best)",
               _fs_p2["score"] == 1000, str(fs_res["rankings"]))
@@ -4653,13 +5140,38 @@ async def main():
         await het.send({"type": "add_bot"}); await het.wait_lobby_count(3)
         await het.send({"type": "add_bot"}); await het.wait_lobby_count(4)
         await het.send({"type": "update_settings", "mode": "teams", "team_count": 2,
-                        "game": "elimination",
-                        "game_settings": {"elimination": {"vote_timeout": 3}}})
-        await het.wait_lobby()
+                        "championship": True, "game": "math",
+                        "game_settings": {"math": {"difficulty": "Easy", "questions": 1,
+                                                  "time_per_question": 5, "vote_timeout": 3},
+                                          "elimination": {"vote_timeout": 3}}})
+        await het.wait_lobby_where(
+            lambda r: r["championship"] is True and r["mode"] == "teams")
         await het.send({"type": "randomize_teams"})
         await het.wait_lobby()
+        # v2.6 item 3 (d) setup: one championship Math game first,
+        # so there is history (counter 1) for Elimination to suspend.
         await het.send({"type": "start_game"})
-        et_state = {"results": None, "party_modes": set(), "lobby": False}
+        await het.wait_for("game_started", timeout=5)
+        mq = await het.wait_for("question", timeout=15)
+        aq = solve_math(mq["text"])
+        await het.send({"type": "answer", "answer": str(aq), "index": mq["index"]})
+        await ret.send({"type": "answer", "answer": str(aq + 1), "index": mq["index"]})
+        await het.wait_for("question_result", timeout=10)
+        _end16, _lb16 = await drive_end_flow(het, [het, ret],
+                                             choice="lobby", count=4)
+        check("v2.6 item 3 (d) setup: one championship Math game "
+              "recorded (counter 1, history non-empty)",
+              _end16["champ_games"] == 1
+              and len(_end16["champ_history"]) > 0,
+              str(_end16["champ_history"]))
+        _hist16 = _lb16["room"]["champ_history"]
+        # Now start Elimination: start_game must force Championship
+        # OFF (suspend, not end) — the history survives.
+        await het.send({"type": "update_settings", "game": "elimination"})
+        await het.wait_lobby_where(lambda r: r["game"] == "elimination")
+        await het.send({"type": "start_game"})
+        et_state = {"results": None, "party_modes": set(), "lobby": False,
+                    "ceremony": [], "started_championship": set()}
 
         async def elim_teams_driver(client, my_id):
             number = None
@@ -4668,11 +5180,22 @@ async def main():
                     "game_started", "question", "reaction_wait", "reaction_go",
                     "memory_show", "memory_recall",
                     "elimination_challenge", "elimination_eliminated",
+                    "elimination_ceremony",
                     "vote_break", "results", "elimination_end_vote",
                     "lobby"), timeout=120)
                 t = msg["type"]
                 if t == "game_started":
                     et_state["party_modes"].add(msg.get("party_mode"))
+                    et_state["started_championship"].add(
+                        msg.get("championship"))
+                elif t == "elimination_ceremony":
+                    # v2.6 item 2: the ceremony ranking rows carry
+                    # each player's tally after that challenge
+                    # (victim included) — the source for the final
+                    # tallies the series-end rows must show.
+                    et_state["ceremony"].append(
+                        {"stage": msg["stage"],
+                         "ranking": list(msg.get("ranking") or [])})
                 elif t == "vote_break":
                     await client.send({"type": "vote_next",
                                        "index": msg["index"]})
@@ -4721,15 +5244,62 @@ async def main():
               et_state["lobby"] is True
               and et_state.get("lobby_room", {}).get("mode") == "ffa",
               str(et_state.get("lobby_room", {}).get("mode")))
-        check("v2.5 item 2: the FFA-forced series still runs to "
-              "one winner (no finale) with linear place scores "
-              "(3000, 2000, 1000, 0 for 4 players / 3 challenges)",
+        check("v2.6 item 3 (d): starting Elimination while "
+              "Championship is on forces Championship OFF "
+              "(game_started says championship False)",
+              et_state["started_championship"] == {False},
+              str(et_state["started_championship"]))
+        check("v2.6 item 3 (d): the series end records NO "
+              "championship game while suspended (counter stays 1, "
+              "championship still off)",
+              _etr is not None and _etr.get("champ_games") == 1
+              and _etr.get("championship") is False,
+              str((_etr.get("champ_games"), _etr.get("championship"))
+                  if _etr else None))
+        check("v2.6 item 3 (d): the suspension kept the history "
+              "and counter (lobby after the series: suspended, "
+              "history intact)",
+              et_state.get("lobby_room", {}).get("championship") is False
+              and et_state.get("lobby_room", {}).get(
+                  "championship_suspended") is True
+              and et_state.get("lobby_room", {}).get("champ_games") == 1
+              and et_state.get("lobby_room", {}).get("champ_history")
+              == _hist16,
+              str({k: et_state.get("lobby_room", {}).get(k)
+                   for k in ("championship", "championship_suspended",
+                             "champ_games")}))
+        # v2.6 item 2: the FFA-forced series still runs to one
+        # winner (no finale) with the ACCUMULATED tallies in
+        # finishing order (reverts the v2.5 linear 3000/2000/1000/0).
+        _tally_et = final_elim_tallies(et_state)
+        _fin_et = _etr.get("finishing_order", []) if _etr else []
+        check("v2.6 item 2 (item 16): the FFA-forced series runs "
+              "to one winner (no finale) with accumulated tallies "
+              "in finishing order",
               _etr is not None
-              and len(_etr.get("finishing_order", [])) == 4
-              and _etr["finishing_order"][0]["player_id"] == _etr.get("victor")
-              and [r["score"] for r in _etr["finishing_order"]]
-              == [3000, 2000, 1000, 0],
-              str(_etr.get("finishing_order") if _etr else None))
+              and len(_fin_et) == 4
+              and _fin_et[0]["player_id"] == _etr.get("victor")
+              and all(r["player_id"] in _tally_et for r in _fin_et)
+              and [r["score"] for r in _fin_et]
+              == [_tally_et[r["player_id"]] for r in _fin_et],
+              f"scores={[(r['nickname'], r['score']) for r in _fin_et]} "
+              f"tallies={_tally_et}")
+        if [_tally_et[r["player_id"]] for r in _fin_et] != [3000, 2000, 1000, 0]:
+            check("v2.6 item 2 (item 16): the scores are NOT the "
+                  "reverted linear place scores (3000, 2000, 1000, 0)",
+                  [r["score"] for r in _fin_et] != [3000, 2000, 1000, 0],
+                  str([(r["nickname"], r["score"]) for r in _fin_et]))
+        _surv_et = _fin_et[0]["player_id"] if _fin_et else None
+        _div_et = [pid for pid, t in _tally_et.items()
+                   if pid != _surv_et
+                   and t > _tally_et.get(_surv_et, 0)]
+        _pos_et = {r["player_id"]: i for i, r in enumerate(_fin_et)}
+        check("v2.6 item 2 (item 16): ranking follows finishing "
+              "order, not tally order",
+              all(_pos_et.get(pid, -1) > 0 for pid in _div_et),
+              f"diverged={[(pid, _tally_et[pid]) for pid in _div_et]}"
+              if _div_et else "no eliminated player out-tallied "
+              "the survivor (vacuous here)")
         await het.close(); await ret.close()
 
         # --- v2.2 §10: Championship mode ---
@@ -4857,6 +5427,54 @@ async def main():
               str(end5["champ_history"]))
         check("v2.2 Championship: counter reached 5 games",
               end5["champ_games"] == 5, str(end5["champ_games"]))
+        # --- v2.6 item 3 (a): suspending Championship for
+        # Elimination keeps the history + counter (no wipe). The
+        # client sends championship:false WITH
+        # championship_suspended:true when Elimination is picked.
+        _hist5 = end5["champ_history"]
+        await hc.send({"type": "update_settings", "championship": False,
+                       "championship_suspended": True})
+        lb = await hc.wait_lobby_where(
+            lambda r: r["championship"] is False
+            and r.get("championship_suspended") is True)
+        check("v2.6 item 3 (a): suspending Championship for "
+              "Elimination keeps the history and the counter "
+              "(no wipe)",
+              lb["room"]["champ_games"] == 5
+              and lb["room"]["champ_history"] == _hist5,
+              str(lb["room"]))
+        # (a2): picking a normal game (no championship value in the
+        # message) auto-restores the suspended championship, with
+        # the history intact.
+        await hc.send({"type": "update_settings", "game": "math"})
+        lb = await hc.wait_lobby_where(
+            lambda r: r["championship"] is True)
+        check("v2.6 item 3 (a2): picking a normal game while "
+              "suspended restores Championship with history intact",
+              lb["room"]["champ_games"] == 5
+              and lb["room"]["champ_history"] == _hist5
+              and not lb["room"].get("championship_suspended"),
+              str(lb["room"]))
+        # Suspend again, then (b) restore it explicitly.
+        await hc.send({"type": "update_settings", "championship": False,
+                       "championship_suspended": True})
+        lb = await hc.wait_lobby_where(
+            lambda r: r["championship"] is False
+            and r.get("championship_suspended") is True)
+        check("v2.6 item 3 (a): suspending a second time still "
+              "keeps the history and the counter",
+              lb["room"]["champ_games"] == 5
+              and lb["room"]["champ_history"] == _hist5,
+              str(lb["room"]))
+        await hc.send({"type": "update_settings", "championship": True})
+        lb = await hc.wait_lobby_where(
+            lambda r: r["championship"] is True)
+        check("v2.6 item 3 (b): restoring (championship:true, no "
+              "flag) brings Championship back with history intact",
+              lb["room"]["champ_games"] == 5
+              and lb["room"]["champ_history"] == _hist5
+              and not lb["room"].get("championship_suspended"),
+              str(lb["room"]))
         # Turning championship OFF ends it: history + counter cleared.
         await hc.send({"type": "update_settings", "championship": False})
         lb = await hc.wait_lobby_where(
@@ -4976,6 +5594,154 @@ async def main():
               "all gives no points",
               _reaction_points([_mkreact("a", []), _mkreact("b", [])])
               == {})
+        # --- v2.6 item 5 (internal): false start OR too slow = 1s ---
+        # (a) a false start records 1000ms in the player's reaction
+        # times AND increments false_starts, and the round still
+        # counts (the player has a click entry, so the round no
+        # longer waits for them and the round result shows a time).
+        _rx5_room = Room(code="UNITRX5")
+        _rx5_room.phase = "playing"
+        _rx5_f = Player(id="f1", nickname="FS", colour="#ffffff")
+        _rx5_g = Player(id="g1", nickname="G", colour="#ffffff")
+        _rx5_h = Player(id="h1", nickname="H", colour="#ffffff")
+        _rx5_room.players = [_rx5_f, _rx5_g, _rx5_h]
+        _rx5_room.round_state = {"round": 1, "go_at": None, "clicks": {},
+                                 "participants": {"f1", "g1", "h1"}}
+        record_reaction(_rx5_room, _rx5_f, None, false_start=True)
+        check("v2.6 item 5 (internal, a): a false start records "
+              "1000ms in reaction_times and increments false_starts",
+              _rx5_f.reaction_times == [1000]
+              and _rx5_f.false_starts == 1,
+              str((_rx5_f.reaction_times, _rx5_f.false_starts)))
+        check("v2.6 item 5 (internal, a): the false-started round "
+              "still counts (a click entry with ms 1000)",
+              _rx5_room.round_state["clicks"].get("f1")
+              == {"ms": 1000, "false_start": True},
+              str(_rx5_room.round_state["clicks"]))
+        # (b) a later click in the same round is ignored — the first
+        # click per round wins, so the auto-submitted 1000ms (or a
+        # false start) cannot be overwritten by a late real click.
+        record_reaction(_rx5_room, _rx5_f, 250)
+        check("v2.6 item 5 (internal, b): a later click in the "
+              "round is ignored once a time is in",
+              _rx5_f.reaction_times == [1000]
+              and _rx5_room.round_state["clicks"]["f1"]["ms"] == 1000,
+              str(_rx5_f.reaction_times))
+        # (c) a normal click under 1000ms records the actual ms; a
+        # click more than 1s after the signal is capped at 1000ms
+        # (covers a player who rejoins after a disconnect and
+        # clicks late).
+        record_reaction(_rx5_room, _rx5_g, 250)
+        check("v2.6 item 5 (internal, c): a normal click under "
+              "1000ms records the actual ms",
+              _rx5_g.reaction_times == [250]
+              and _rx5_g.false_starts == 0,
+              str(_rx5_g.reaction_times))
+        record_reaction(_rx5_room, _rx5_h, 1500)
+        check("v2.6 item 5 (internal, c): a click over 1s after "
+              "the signal is capped at 1000ms",
+              _rx5_h.reaction_times == [1000],
+              str(_rx5_h.reaction_times))
+        # (d) the running average includes the 1s penalties: one
+        # great time (200) averaged with two penalties is 733, so
+        # the steady 400ms player wins the interpolation — the
+        # wait-for-the-last-round exploit is dead.
+        check("v2.6 item 5 (internal, d): the running average "
+              "includes the penalties — 200/1000/1000 averages 733 "
+              "and loses to a steady 400",
+              _reaction_points([_mkreact("a", [200, 1000, 1000]),
+                                _mkreact("b", [400, 400, 400])])
+              == {"a": 0, "b": 1000},
+              str(_reaction_points([_mkreact("a", [200, 1000, 1000]),
+                                    _mkreact("b", [400, 400, 400])])))
+        _rx5_rows = {r["player_id"]: r for r in
+                     _elim_score_rows(_rx5_room,
+                                      [_mkreact("a", [200, 1000, 1000]),
+                                       _mkreact("b", [400, 400, 400])])}
+        check("v2.6 item 5 (internal, d): the scoreboard rows show "
+              "the penalised running average (733) and the great "
+              "best time (200) side by side",
+              _rx5_rows["a"]["avg_ms"] == 733
+              and _rx5_rows["a"]["best_ms"] == 200
+              and _rx5_rows["b"]["avg_ms"] == 400,
+              str(_rx5_rows))
+        # (e) the interpolation itself is unchanged (the checks
+        # above already pin it); the no-valid-time fallback stays
+        # for the disconnect edge case — a player with no recorded
+        # time at all is worst (0).
+        check("v2.6 item 5 (internal, e): the no-valid-time "
+              "fallback stays — a disconnected player with no "
+              "recorded time is worst (0), the other best (1000)",
+              _reaction_points([_mkreact("a", [300]),
+                                _mkreact("b", [])])
+              == {"a": 1000, "b": 0},
+              str(_reaction_points([_mkreact("a", [300]),
+                                    _mkreact("b", [])])))
+        # (f) bots are unaffected: every bot reaction time is under
+        # 1s, so a bot's normal click never trips the too-slow
+        # penalty. (Bot false starts — Easy 0.15, Medium 0.05 —
+        # still record 1000ms like a human's; Hard never
+        # false-starts.)
+        check("v2.6 item 5 (internal, f): bot reaction times are "
+              "all under 1s (bots never trip the too-slow penalty)",
+              all(BOT_REACTION[d]["ms"][1] < 1000
+                  for d in BOT_REACTION),
+              str({d: BOT_REACTION[d]["ms"] for d in BOT_REACTION}))
+        # (b, in-process game): a connected player who never clicks
+        # gets 1000ms auto-submitted every round — the round ends
+        # on it, and the time is not a false start.
+        _rx5_room2 = Room(code="UNITRX5B")
+        _rx5_room2.phase = "playing"
+        _rx5_room2.game_settings["elimination"]["vote_timeout"] = 1
+        _rx5_human = Player(id="h5", nickname="SlowHuman",
+                            colour="#ffffff")
+        _rx5_bots5 = [Player(id=f"b{i}", nickname=f"B{i}",
+                             colour="#ffffff", is_bot=True,
+                             difficulty="Hard") for i in range(3)]
+        _rx5_room2.players = [_rx5_human] + list(_rx5_bots5)
+        _rx5_caps = {"rounds": []}
+        _orig_broadcast5 = server.broadcast
+
+        async def _rx_spy5(room, msg):
+            if msg.get("type") == "reaction_round_result":
+                _rx5_caps["rounds"].append(msg)
+
+        server.broadcast = _rx_spy5
+        try:
+            _rx5_rank = await run_reaction_game(
+                _rx5_room2, participants=list(_rx5_room2.players),
+                challenge=True)
+        finally:
+            server.broadcast = _orig_broadcast5
+        check("v2.6 item 5 (internal, b): a player who never clicks "
+              "gets 1000ms auto-submitted every round (3 rounds)",
+              len(_rx5_caps["rounds"]) == 3
+              and all(next(r["ms"] for r in rd["results"]
+                           if r["player_id"] == "h5") == 1000
+                      for rd in _rx5_caps["rounds"])
+              and _rx5_human.reaction_times == [1000, 1000, 1000],
+              str(_rx5_caps["rounds"]))
+        check("v2.6 item 5 (internal, b): the auto-submitted rounds "
+              "are not false starts (false_start False, "
+              "false_starts 0)",
+              all(next(r["false_start"] for r in rd["results"]
+                       if r["player_id"] == "h5") is False
+                  for rd in _rx5_caps["rounds"])
+              and _rx5_human.false_starts == 0,
+              str(_rx5_caps["rounds"]))
+        check("v2.6 item 5 (internal, f): the Hard bots in that "
+              "game all clicked under 1s (no penalty)",
+              all(r["ms"] is not None and r["ms"] < 1000
+                  for rd in _rx5_caps["rounds"]
+                  for r in rd["results"]
+                  if r["player_id"] != "h5"),
+              str(_rx5_caps["rounds"]))
+        check("v2.6 item 5 (internal, d): the never-clicking "
+              "player's challenge ranking average is 1000 (worst)",
+              _rx5_rank is not None
+              and next(r for r in _rx5_rank
+                       if r["player_id"] == "h5")["avg_ms"] == 1000,
+              str(_rx5_rank))
         # --- internal (async): a Reaction CHALLENGE assigns the
         # interpolated points to p.score (v2.3 item 14 fix) — before
         # the fix the challenge path returned the ranking without
@@ -5399,9 +6165,10 @@ async def main():
               f"breaks={gstate_b['breaks']} "
               f"challenges={gstate_b['challenges']}")
         # --- live: full 7-player Group series, host-set 4v3 split
-        # (v2.5 item 2): the spec's own example — 7 players, 6
-        # challenges -> series-end standings 6000, 5000, 4000,
-        # 3000, 2000, 1000, 0 in finishing order (checked inside
+        # (v2.6 item 2): the spec's own example — 7 players, 6
+        # challenges. The series-end rows show each player's
+        # ACCUMULATED series tally in finishing order (the v2.5
+        # linear 6000..0 is reverted — checked inside
         # verify_group_series with expect_full=True). A 4v3 start
         # also exercises transfers on the early breaks.
         def _groups_c(players):
@@ -5415,15 +6182,21 @@ async def main():
         gstate_c, gplayers_c = await run_group_series("GC", 5, _groups_c)
         gverified_c, gskipped_c = verify_group_series(
             "GC", gstate_c, gplayers_c, expect_full=True)
-        check("v2.5 item 2 (GC): the 7-player series played 6 "
-              "challenges and its finishing scores are exactly "
-              "6000, 5000, 4000, 3000, 2000, 1000, 0",
+        _tally_gc = final_elim_tallies(gstate_c)
+        _fin_gc = gstate_c["results"][0]["finishing_order"]
+        check("v2.6 item 2 (GC): the 7-player series played 6 "
+              "challenges and its finishing scores are exactly the "
+              "accumulated tallies",
               len(gstate_c["challenges"]) == 6
-              and [r["score"] for r in
-                   gstate_c["results"][0]["finishing_order"]]
-              == [6000, 5000, 4000, 3000, 2000, 1000, 0],
-              str([(r["nickname"], r["score"]) for r in
-                   gstate_c["results"][0]["finishing_order"]]))
+              and [r["score"] for r in _fin_gc]
+              == [_tally_gc[r["player_id"]] for r in _fin_gc],
+              str([(r["nickname"], r["score"]) for r in _fin_gc]))
+        if [_tally_gc[r["player_id"]] for r in _fin_gc] != [6000, 5000, 4000, 3000, 2000, 1000, 0]:
+            check("v2.6 item 2 (GC): the scores are NOT the reverted "
+                  "linear 6000, 5000, 4000, 3000, 2000, 1000, 0",
+                  [r["score"] for r in _fin_gc]
+                  != [6000, 5000, 4000, 3000, 2000, 1000, 0],
+                  str([(r["nickname"], r["score"]) for r in _fin_gc]))
         # Any Reaction challenge across GA/GB/GC must carry real group
         # totals (not 0/0) — the Reaction challenge scores now
         # (v2.3 item 14 fix). Vacuous when no Reaction challenge
