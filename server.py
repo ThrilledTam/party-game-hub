@@ -312,7 +312,7 @@ class Player:
     connected: bool = True
     disconnected_at: float | None = None   # monotonic time of last disconnect
     score: int = 0
-    reaction_times: list = field(default_factory=list)  # ms, successful rounds only
+    reaction_times: list = field(default_factory=list)  # ms, one entry per round played (1000 = false-start / too-slow penalty, v2.6 item 5)
     false_starts: int = 0
 
     def public(self):
@@ -344,6 +344,12 @@ class Room:
     turn_order: list = field(default_factory=list)    # order used this game
     team_scoring: str = "average"    # "average" | "sum" | "best"
     championship: bool = False
+    # v2.6 item 3: Championship forced OFF while Elimination is on
+    # is a SUSPENSION, not an end — the previous setting is
+    # remembered here and restored when a normal game is picked
+    # again. While set, room.championship is False but the champ
+    # history / game counter are untouched.
+    champ_suspended: bool = False
     champ_games: int = 0
     champ_history: list = field(default_factory=list)
     president_finish_order: list = field(default_factory=list)
@@ -388,6 +394,10 @@ class Room:
                 "turn_order": list(self.manual_order),
                 "team_scoring": self.team_scoring,
                 "championship": self.championship,
+                # v2.6 item 3: tells the client the championship is
+                # suspended (Elimination) rather than off, so it can
+                # restore it when a normal game is picked again.
+                "championship_suspended": self.champ_suspended,
                 "champ_games": self.champ_games,
                 "champ_history": self.champ_history,
                 # v2.3 item 14 / group protocol: the LOBBY payload
@@ -646,19 +656,55 @@ def team_standings(room: Room):
     Every 'Alone' player (no team assigned) is their own one-person
     team. Returns a list ranked by team score, highest first, of
     {"team": index|None, "name": str, "colour": str,
-     "average": float, "score": float, "style": str,
+     "average": float, "score": float, "style": str, "unit": str,
      "members": [player public dicts]}.
     In FFA mode this returns [] (individual rankings are used instead).
+
+    v2.6 item 1: during a Reaction game (phase "playing") points are
+    only assigned at game end, so a points-based standing would read
+    0 mid-game. While the game is still playing the standings are
+    instead computed from the members' running average reaction
+    times — the team value is the average of the members' averages
+    (Matthew, v2.6), shown as a time in ms, fastest team first.
+    Members with no valid reaction times yet are excluded from the
+    average; a team with no valid times at all has no value (None).
+    The host-picked team_scoring style still applies to the member
+    averages (sum = sum of the averages, best = fastest member
+    average). Each row carries "unit": "ms" for these time-based
+    standings vs "unit": "pts" for points-based ones, so the client
+    can render them correctly. Once the game ends (phase "results")
+    Reaction points are assigned, so the normal points-based
+    standings apply again. The mid-game vote_break carries these
+    standings via _vote_phase, which calls team_standings(room).
     """
     if room.mode != "teams":
         return []
     style = room.team_scoring or "average"
+    # v2.6 item 1: time-based Reaction standings while the game is
+    # still playing (Elimination challenges run FFA, so this only
+    # bites in standalone Reaction with Teams on).
+    time_based = room.current_game == "reaction" \
+        and room.phase == "playing"
     groups = {}
     for p in room.players:
         t = room.teams.get(p.id)
         groups.setdefault(t, []).append(p)
 
+    def member_avg(p):
+        return (round(sum(p.reaction_times) / len(p.reaction_times))
+                if p.reaction_times else None)
+
     def team_value(members):
+        if time_based:
+            avgs = [a for a in (member_avg(m) for m in members)
+                    if a is not None]
+            if not avgs:
+                return None
+            if style == "sum":
+                return float(sum(avgs))
+            if style == "best":
+                return float(min(avgs))
+            return round(sum(avgs) / len(avgs), 1)
         scores = [m.score for m in members]
         if style == "sum":
             return float(sum(scores))
@@ -673,16 +719,23 @@ def team_standings(room: Room):
             # Each Alone player is their own team; list them separately
             # so one Alone player's score is not averaged with another's.
             for m in members:
+                mv = member_avg(m) if time_based else float(m.score)
                 out.append({"team": None, "name": f"{m.nickname} (Alone)",
-                            "colour": "#95a5a6", "average": float(m.score),
-                            "score": float(m.score), "style": style,
+                            "colour": "#95a5a6", "average": mv,
+                            "score": mv, "style": style,
+                            "unit": "ms" if time_based else "pts",
                             "members": [m.public()]})
         else:
             out.append({"team": t, "name": TEAM_NAMES[t],
                         "colour": TEAM_COLOURS[t], "average": val,
                         "score": val, "style": style,
+                        "unit": "ms" if time_based else "pts",
                         "members": [m.public() for m in members]})
-    out.sort(key=lambda r: -r["average"])
+    if time_based:
+        # Fastest team first; teams with no valid time yet go last.
+        out.sort(key=lambda r: (r["average"] is None, r["average"] or 0))
+    else:
+        out.sort(key=lambda r: -r["average"])
     return out
 
 
@@ -1206,7 +1259,9 @@ def memory_bot_correct(difficulty: str, digits: int) -> bool:
 
 def _reaction_points(active):
     """v2.2 §9 interpolation: best average -> 1000, worst -> 0; a
-    player with no valid time (all false starts) -> 0; all-equal
+    player with no valid time (disconnected mid-round and never
+    recorded one — v2.6 item 5: false starts now record 1000ms, so
+    they no longer leave a player with no time) -> 0; all-equal
     averages -> 1000. Returns {player_id: points}; empty when
     nobody has a valid time."""
     avgs = {}
@@ -1279,8 +1334,28 @@ async def run_reaction_game(room: Room, participants=None, challenge=False):
             if room.phase != "playing":
                 return None
             room.round_state["go_at"] = time.monotonic()
+            room.round_state["reaction_open"] = True
             await broadcast(room, {"type": "reaction_go",
                                    "round": rnd, "total": total})
+            # v2.6 item 5: 1-second limit — any connected player who
+            # has not clicked within 1s of the signal gets 1000ms
+            # submitted automatically; a later click is ignored
+            # (record_reaction keeps only the first click per round).
+            # Bots always click in <600ms, so this only bites humans.
+            # The reaction_open flag is cleared when the round's wait
+            # ends, so a task waking late (e.g. during the vote break)
+            # can never submit for a closed round.
+            async def reaction_timeout():
+                await asyncio.sleep(1.0)
+                if (room.phase == "playing"
+                        and room.round_state.get("round") == rnd
+                        and room.round_state.get("reaction_open")):
+                    for p in active:
+                        if (p.connected
+                                and p.id not in room.round_state.get(
+                                    "clicks", {})):
+                            record_reaction(room, p, 1000)
+            asyncio.create_task(reaction_timeout())
             # Schedule bot (on-time) clicks.
             async def bot_click(bot, ms):
                 await asyncio.sleep(ms / 1000.0)
@@ -1306,6 +1381,9 @@ async def run_reaction_game(room: Room, participants=None, challenge=False):
                 if not remaining:
                     break
                 await asyncio.sleep(0.1)
+            # v2.6 item 5: the round is closed — the 1s auto-submit
+            # task must not fire for this round any more.
+            room.round_state["reaction_open"] = False
             results = []
             for p in active:
                 c = room.round_state["clicks"].get(p.id)
@@ -1349,7 +1427,8 @@ async def run_reaction_game(room: Room, participants=None, challenge=False):
         # v2.2 §9: Reaction now scores — points interpolated by
         # average time between the best average (1000) and the worst
         # (0). All-equal averages give everyone 1000; a player with
-        # no valid time (all false starts) counts as worst, i.e. 0.
+        # no valid time (disconnected, never recorded one) counts as
+        # worst, i.e. 0.
         avgs = {}
         for p in active:
             avgs[p.id] = (round(sum(p.reaction_times)
@@ -1389,17 +1468,28 @@ def reaction_rankings(players):
 
 
 def record_reaction(room: Room, player: Player, ms, false_start=False):
-    """Record one player's click for the current reaction round."""
+    """Record one player's click for the current reaction round.
+
+    v2.6 item 5: a false start records 1000ms (and still counts as a
+    false start); any real click more than 1s after the signal is
+    capped at 1000ms (covers a player who rejoins after a disconnect
+    and clicks late). The first click per round wins — later clicks
+    are ignored, so the round is closed for that player once a time
+    (real or penalty) is in."""
     clicks = room.round_state.setdefault("clicks", {})
     parts = room.round_state.get("participants")
     if parts is not None and player.id not in parts:
         return  # eliminated/spectating in an Elimination challenge
     if player.id in clicks:
         return  # only the first click per round counts
+    if false_start:
+        ms = 1000
+    elif ms is not None:
+        ms = min(ms, 1000)
     clicks[player.id] = {"ms": ms, "false_start": false_start}
     if false_start:
         player.false_starts += 1
-    elif ms is not None:
+    if ms is not None:
         player.reaction_times.append(ms)
 
 
@@ -3471,34 +3561,28 @@ async def run_elimination_game(room: Room):
             # v2.3 item 15: no finale — the last remaining player is
             # the victor; finishing order is winner first, then the
             # eliminated in reverse elimination order.
-            # v2.5 item 2: linear series-end standings over that
-            # order — 1st = (challenges played) x 1000, last = 0,
-            # equal steps in between (e.g. 7 players, 6 challenges
-            # -> 6000, 5000, 4000, 3000, 2000, 1000, 0). One
-            # elimination per challenge, so challenge_no == the
-            # number of challenges played in this series.
+            # v2.6 item 2: REVERT of the v2.5 linear place scores —
+            # the series-end results are an ordered ranking only
+            # (winner first, then eliminated most-recent-first), with
+            # each row showing the player's ACCUMULATED series tally
+            # (room.elim_tally), not linear place points. No place
+            # scores are assigned here and _assign_score is not
+            # called for place scores.
             finishing = [alive[0].id] + list(reversed(elim_order))
-            n_finish = len(finishing)
-            top_score = challenge_no * 1000
-            place_scores = {
-                pid: (top_score * (n_finish - 1 - i) // (n_finish - 1)
-                      if n_finish > 1 else top_score)
-                for i, pid in enumerate(finishing)}
-            for p in all_players:
-                # v2.2 §9/§10: eliminated players contribute 0; in
-                # championship mode the place score ADDS to the
-                # persisted score instead of replacing it.
-                _assign_score(room, p, place_scores.get(p.id, 0))
             order_rows = []
             for place, pid in enumerate(finishing, start=1):
                 pl = room.get_player(pid)
                 order_rows.append({"place": place, "player_id": pid,
                                    "nickname": pl.nickname,
                                    "colour": pl.colour, "is_bot": pl.is_bot,
-                                   "score": pl.score,
+                                   "score": room.elim_tally.get(pid, 0),
                                    "avg_ms": None, "best_ms": None,
                                    "false_starts": 0,
                                    "team": room.teams.get(pid)})
+            # v2.6 item 3: already guarded — with Championship forced
+            # off at Elimination start room.championship is False, so
+            # this does not fire for a series. Left as the guard in
+            # case a series ever runs with championship on.
             if room.championship:
                 _record_champ_game(room, "elimination")
             room.phase = "results"
@@ -3578,6 +3662,18 @@ async def start_game(room: Room, player: Player):
     # start leaves the lobby mode untouched).
     if game == "elimination":
         room.mode = "ffa"
+        # v2.6 item 3: Elimination also forces Championship OFF.
+        # Belt-and-braces — the client suspends it via settings, but
+        # a stale/older client may not. Suspend, don't end: stash
+        # the flag and switch off WITHOUT clearing the champ history
+        # (the v2.2 end-championship wipe does not run here); the
+        # client restores it via settings when a normal game is
+        # picked again. Do NOT auto-restore server-side on a normal
+        # game start. With championship off here, _begin_game resets
+        # scores per game, which is correct for Elimination.
+        if room.championship:
+            room.champ_suspended = True
+            room.championship = False
     await _begin_game(room, game)
 
 
@@ -3701,13 +3797,51 @@ async def handle_message(room: Room, player: Player, msg: dict):
         if msg.get("team_scoring") in ("average", "sum", "best"):
             room.team_scoring = msg["team_scoring"]
         if isinstance(msg.get("championship"), bool):
-            if room.championship and not msg["championship"]:
+            suspended = msg.get("championship_suspended") is True
+            if suspended and room.championship:
+                # v2.6 item 3: forced suspension for Elimination —
+                # the client sends championship: false with
+                # championship_suspended: true when Elimination is
+                # picked and Championship was on. Stash the flag and
+                # switch off WITHOUT running the v2.2 end-championship
+                # path below: the history and game counter survive,
+                # and the client restores it when a normal game is
+                # picked again.
+                room.champ_suspended = True
+                room.championship = False
+            elif room.championship and not msg["championship"]:
                 # v2.2 §10: turning championship OFF ends it — clear
                 # the history and the game counter; per-game scoring
-                # resumes at the next start_game.
+                # resumes at the next start_game. An explicit off
+                # (no suspended flag) also ends a suspension.
                 room.champ_history = []
                 room.champ_games = 0
-            room.championship = msg["championship"]
+                room.champ_suspended = False
+                room.championship = False
+            else:
+                # Turning it on (or re-confirming it off while it is
+                # already off): switching it back on clears any
+                # suspension flag — the championship is restored by
+                # the client's value.
+                if msg["championship"]:
+                    room.champ_suspended = False
+                room.championship = msg["championship"]
+        elif msg.get("championship_suspended") is True \
+                and room.championship:
+            # Bare suspended flag with no championship value: same
+            # suspension as above (client normally sends both).
+            room.champ_suspended = True
+            room.championship = False
+        # v2.6 item 3: picking a normal (non-Elimination) game while
+        # suspended restores the championship. The client normally
+        # sends championship: true with the game change (handled
+        # above); this covers a game-only message. An explicit
+        # championship value in this message wins (handled above),
+        # so this never overrides an explicit off.
+        if room.champ_suspended and room.game != "elimination" \
+                and not isinstance(msg.get("championship"), bool):
+            room.champ_suspended = False
+            room.championship = True
         # v2.3 item 14: Elimination Group mode (host only, lobby).
         if "elimination_mode" in msg:
             mode_val = msg["elimination_mode"]
