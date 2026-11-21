@@ -461,7 +461,11 @@ let expandedCardId=null, replayVoted=false, secretEliminated=false, presExchange
 // challenge intro / break group displays.
 let prevTeamsSetting=null;
 try{ prevTeamsSetting=JSON.parse(sessionStorage.getItem("pgh_prev_teams")||"null"); }catch(e){}
-let lastElimGroups=null, lastElimMode="normal", lastElimPhase=null;
+let lastElimGroups=null, lastElimMode="normal", lastElimPhase=null, lastElimChallenge=null;
+// v2.5 (item 3): Memory rounds survived per player, tracked from
+// memory_round_result — Memory's native running measure (survivors
+// have no banked score yet at a per-round break).
+let memorySurvived={};
 // v2.4 (item 4): ceremony vote state — one NEXT vote per stage.
 let ceremonyVoted=false, ceremonyTimeout=4;
 // ---- v2.1 President: client-side legality (mirrors the server rule) ----
@@ -703,10 +707,61 @@ function ceremonyListHtml(ranking, exclude){
   }).map(({r,i})=>ceremonyRowHtml(r,i)).join("");
 }
 function ceremonyPileHtml(pile){
-  return (pile&&pile.length) ? pile.map(id=>"<div class='ceremony-row pile-row'>💀 "+nameHtml(id)+"</div>").join("")
+  // v2.5 (item 1): each eliminated player exactly once, at every
+  // stage — dedupe defensively, and tag rows with data-pid so the
+  // drop append can check for the victim before appending.
+  const seen=new Set();
+  const ids=(pile||[]).filter(id=>{ if(seen.has(id)) return false; seen.add(id); return true; });
+  return ids.length ? ids.map(id=>"<div class='ceremony-row pile-row' data-pid='"+escHtml(id)+"'>💀 "+nameHtml(id)+"</div>").join("")
     : "<p class='muted'>Nobody yet — the first victim drops here.</p>";
 }
+// v2.5 (item 1): the victim id from a ceremony message —
+// msg.eliminated is {player_id, nickname} (a bare id/string is
+// accepted defensively, as the drop stage already did).
+function ceremonyVictimId(msg){
+  const e=msg.eliminated;
+  if(!e) return null;
+  if(typeof e==="string") return e;
+  return e.player_id||e.id||null;
+}
+// v2.5 (item 3): per-round break score display. Reaction computes
+// points only at the end, so a per-round break row carries the
+// native running average/best (avg_ms/best_ms) instead of a real
+// score — render those, never the 0 in `score`. Memory survivors
+// likewise have no banked score yet (points are assigned at
+// elimination): render rounds survived instead of 0. Every other
+// game has avg_ms null and a real per-round score, and keeps it.
+function breakScoreText(s, game){
+  if(s.avg_ms!==undefined&&s.avg_ms!==null) return s.avg_ms+" ms (best "+s.best_ms+")";
+  // Reaction with no successful round yet (all false starts): no
+  // average exists — show a dash, never the 0 in `score`.
+  if(game==="reaction") return "— (no time yet)";
+  if(game==="memory" && s.score===0){
+    const n=memorySurvived[s.player_id];
+    if(n!==undefined&&n!==null) return n+" round"+(n===1?"":"s")+" survived";
+  }
+  return String(s.score);
+}
+function breakScoreSort(a,b){
+  // Reaction: fastest running average first (no time yet sorts last);
+  // every other game: score desc, as before.
+  const aAvg=a.avg_ms!==undefined&&a.avg_ms!==null, bAvg=b.avg_ms!==undefined&&b.avg_ms!==null;
+  if(aAvg||bAvg){
+    if(aAvg&&!bAvg) return -1;
+    if(!aAvg&&bAvg) return 1;
+    return a.avg_ms-b.avg_ms;
+  }
+  return (b.score||0)-(a.score||0);
+}
 function renderCeremony(msg){
+  // v2.5 (item 4): if this ceremony is for a challenge we never saw
+  // the elimination_challenge broadcast for (e.g. rejoined
+  // mid-ceremony), the stored groups are not this challenge's —
+  // drop them so the break fallback cannot show a stale team.
+  // In the normal flow the challenge matches and nothing changes.
+  if(msg.challenge!==undefined&&msg.challenge!==null&&lastElimChallenge!==null&&msg.challenge!==lastElimChallenge){
+    lastElimGroups=null; lastElimChallenge=null;
+  }
   const listEl=$("ceremonyList"), pileEl=$("ceremonyPile"), banEl=$("ceremonyBanners");
   $("ceremonySub").textContent = "Challenge "+(msg.challenge||"")+" · "+
     (msg.elimination_mode==="group"?"Group Elimination":"Normal Elimination")+
@@ -723,12 +778,15 @@ function renderCeremony(msg){
   if(msg.stage==="list"){
     // Fresh page: the ordered list from the challenge result, the
     // pile of players eliminated in earlier challenges, banners
-    // cleared for this ceremony.
+    // cleared for this ceremony. The victim joins the pile only when
+    // they drop — filter them out of the list-stage pile
+    // defensively, even though the server now excludes them.
+    const victimId=ceremonyVictimId(msg);
     listEl.innerHTML = ceremonyListHtml(msg.ranking, null);
-    pileEl.innerHTML = ceremonyPileHtml(msg.eliminated_pile);
+    pileEl.innerHTML = ceremonyPileHtml((msg.eliminated_pile||[]).filter(id=>id!==victimId));
     banEl.innerHTML="";
   } else if(msg.stage==="drop"){
-    const victimId = msg.eliminated && (msg.eliminated.player_id||msg.eliminated.id||(typeof msg.eliminated==="string"?msg.eliminated:null));
+    const victimId = ceremonyVictimId(msg);
     // If we never saw the list stage (e.g. a reconnect), rebuild the
     // list from the ranking — victim included, so there is a row to
     // drop — and the pile from everyone already out except the victim.
@@ -744,10 +802,14 @@ function renderCeremony(msg){
         row.classList.add("dropping");
         setTimeout(()=>{
           row.remove();
+          // v2.5 (item 1): idempotent append — the pile must hold the
+          // victim exactly once even if this stage is re-delivered.
+          if([...pileEl.children].some(el=>el.dataset && el.dataset.pid===victimId)) return;
           const ph=pileEl.querySelector(".muted");
           if(ph) ph.remove();
           const pr=document.createElement("div");
           pr.className="ceremony-row pile-row";
+          pr.dataset.pid=victimId;
           pr.innerHTML="💀 "+nameHtml(victimId);
           pileEl.appendChild(pr);
         }, 850);
@@ -938,8 +1000,11 @@ function handle(msg){
         colour: me ? me.colour : (lastJoinMsg?lastJoinMsg.colour:myColour)}));
     }catch(e){}
     history.replaceState(null,"",joinLink(room.code)); renderLobby(); show("lobby"); return; }
-  if(msg.type==="lobby"){ room=msg.room; if(room.phase==="lobby"){ renderLobby(); show("lobby"); } return; }
-  if(msg.type==="game_started"){ room.current_game=msg.game;
+  if(msg.type==="lobby"){ room=msg.room; if(room.phase==="lobby"){ renderLobby(); show("lobby");
+    // v2.5 (item 4): the series is over — drop the stored challenge
+    // groups so a later series can never inherit a stale map.
+    lastElimGroups=null; lastElimChallenge=null; lastElimMode="normal"; lastElimPhase=null; } return; }
+  if(msg.type==="game_started"){ room.current_game=msg.game; memorySurvived={};
     if(msg.party_mode) room.mode=msg.party_mode;
     if(msg.teams) room.teams=msg.teams;
     $("gameTitle").textContent=GAME_NAMES[msg.game]+(msg.mode==="solo"?" — Solo practice":"");
@@ -1006,7 +1071,13 @@ function handle(msg){
         const p=playerByNick(nick);
         if(!p) return null;
         if(msg.scores){ const row=msg.scores.find(s=>s.player_id===p.id); if(row && row.team!=null&&row.team!==undefined) return row.team; }
-        if(lastElimGroups && lastElimGroups[p.id]!=null&&lastElimGroups[p.id]!==undefined) return lastElimGroups[p.id];
+        // v2.5 (item 4): the fallback is the challenge-start teams —
+        // only trust it when it is from THIS challenge (msg.index is
+        // the challenge number on an elim break). A stale map (an
+        // earlier challenge, or a previous series) must never stand
+        // in for the as-played team; no chip beats a wrong chip.
+        if(lastElimGroups && lastElimChallenge!==null && msg.index===lastElimChallenge &&
+           lastElimGroups[p.id]!=null&&lastElimGroups[p.id]!==undefined) return lastElimGroups[p.id];
         return null;
       };
       const rankRows=(msg.ranking||[]).map((n,i)=>{ const g=groupOfNick(n);
@@ -1055,8 +1126,8 @@ function handle(msg){
       // challenge score when the server sends it.
       const hasTally = msg.scores && msg.scores.some(s=>s.tally!==undefined&&s.tally!==null);
       $("voteScores").innerHTML = msg.scores ? "<table>"+
-        [...msg.scores].sort((a,b)=>b.score-a.score)
-          .map(s=>"<tr><td>"+nameHtml(s)+teamBadge(s)+"</td><td>"+s.score+"</td>"+(hasTally?"<td class='muted'>"+(s.tally!==undefined&&s.tally!==null?"tally "+s.tally:"")+"</td>":"")+"</tr>").join("")+"</table>" : "";
+        [...msg.scores].sort(breakScoreSort)
+          .map(s=>"<tr><td>"+nameHtml(s)+teamBadge(s)+"</td><td>"+breakScoreText(s, room&&room.current_game)+"</td>"+(hasTally?"<td class='muted'>"+(s.tally!==undefined&&s.tally!==null?"tally "+s.tally:"")+"</td>":"")+"</tr>").join("")+"</table>" : "";
     }
     $("voteLabel").textContent = msg.label ? "Round: "+msg.label : (msg.end_of_game ? "End-of-game vote" : "");
     $("voteTeams").innerHTML = msg.teams ? teamStandingsHtml(msg.teams) : "";
@@ -1076,8 +1147,8 @@ function handle(msg){
     const corr = msg.correct_answer;
     $("quizFeedback").innerHTML = "Correct answer: <b>"+corr+"</b>" +
       (msg.points.find(p=>p.player_id===myId) ? " — you scored +"+msg.points.find(p=>p.player_id===myId).points+"!" : " — no points this round.");
-    $("scoreboard").innerHTML="<h3>Scores</h3><table>"+[...msg.scores].sort((a,b)=>b.score-a.score)
-      .map(s=>"<tr><td>"+nameHtml(s)+teamBadge(s)+"</td><td>"+s.score+"</td></tr>").join("")+"</table>" +
+    $("scoreboard").innerHTML="<h3>Scores</h3><table>"+[...msg.scores].sort(breakScoreSort)
+      .map(s=>"<tr><td>"+nameHtml(s)+teamBadge(s)+"</td><td>"+breakScoreText(s, room&&room.current_game)+"</td></tr>").join("")+"</table>" +
       (msg.teams ? teamStandingsHtml(msg.teams) : "");
     return; }
   // ---- v2.2: Secret Word (multi-round) ----
@@ -1299,6 +1370,9 @@ function handle(msg){
     return; }
   if(msg.type==="memory_round_result"){
     clearInterval(memoryTimerInt);
+    // v2.5 (item 3): track rounds survived per player — the native
+    // running measure the per-round break renders for survivors.
+    (msg.survivors||[]).forEach(id=>{ memorySurvived[id]=(memorySurvived[id]||0)+1; });
     const names = ids => ids.map(id=>nameHtml(id)).join(", ");
     $("memoryElim").innerHTML="<p>Round "+msg.round+" ("+msg.digits+" digits): "+
       (msg.survivors.length===1 && msg.survivors[0]===myId ? "🎉 You survived — you win!" :
@@ -1313,6 +1387,9 @@ function handle(msg){
     // / groups ({player_id: group}) on this broadcast. Remember them
     // for the break display; the intro shows each alive player's group.
     if(msg.groups) lastElimGroups=msg.groups;
+    // v2.5 (item 4): remember which challenge these groups are from,
+    // so the break fallback can only use this challenge's map.
+    if(msg.challenge!==undefined&&msg.challenge!==null) lastElimChallenge=msg.challenge;
     if(msg.elimination_mode) lastElimMode=msg.elimination_mode;
     if(msg.elim_phase) lastElimPhase=msg.elim_phase;
     $("elimBanner").classList.remove("hidden");
