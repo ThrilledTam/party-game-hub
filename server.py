@@ -354,6 +354,19 @@ class Room:
     # Group series ("groups" | "black").
     elim_groups: dict = field(default_factory=dict)
     elim_phase: str = "groups"
+    # v2.4 item 3: persistent per-series Elimination tally
+    # {player_id: total challenge points so far}. Challenge points
+    # live in p.score only until the next challenge resets it to 0,
+    # so the tally is the only record of where everyone stands
+    # between games. Reset at each series start, accumulated after
+    # each run_challenge returns. Display-only: the worst-team /
+    # worst-player picks keep using the just-finished challenge's
+    # p.score.
+    elim_tally: dict = field(default_factory=dict)
+    # v2.4 item 4: the latest elimination_ceremony stage message,
+    # kept so a reconnecting player can be re-sent it (the break
+    # that follows re-syncs everyone anyway).
+    last_ceremony: dict | None = None
     # Per-game transient state (reset at each game start)
     current_game: str | None = None
     round_state: dict = field(default_factory=dict)
@@ -1307,15 +1320,15 @@ async def run_reaction_game(room: Room, participants=None, challenge=False):
                 # v2.2 §3: Elimination challenges no longer skip the
                 # vote break — one after every round, including the
                 # last (the per-challenge _elimination_break stays too).
+                # v2.4 item 3: rows carry the running tally (still 0
+                # here — Reaction points are only assigned at the
+                # challenge end — but the field is present so the
+                # client can render it uniformly).
                 await _vote_phase(
                     room, "reaction", rnd, total, eligible=list(active),
                     timeout=int(room.game_settings["elimination"].get(
                         "vote_timeout", VOTE_TIMEOUT_DEFAULT)),
-                    scores=[{"player_id": pl.id, "nickname": pl.nickname,
-                             "colour": pl.colour, "is_bot": pl.is_bot,
-                             "score": pl.score,
-                             "team": room.teams.get(pl.id)}
-                            for pl in active])
+                    scores=_elim_score_rows(room, active))
             elif rnd < total:
                 # v2: NEXT vote break between rounds (not after last —
                 # the last round's vote is the end-of-game vote).
@@ -1682,15 +1695,12 @@ async def run_quiz_game(room: Room, game: str, participants=None,
                 # v2.2 §3: Elimination challenges no longer skip the
                 # vote break — one after every question, including
                 # the last (the per-challenge break stays too).
+                # v2.4 item 3: rows carry the running tally.
                 await _vote_phase(
                     room, game, idx, total, eligible=list(active),
                     timeout=int(room.game_settings["elimination"].get(
                         "vote_timeout", VOTE_TIMEOUT_DEFAULT)),
-                    scores=[{"player_id": pl.id, "nickname": pl.nickname,
-                             "colour": pl.colour, "is_bot": pl.is_bot,
-                             "score": pl.score,
-                             "team": room.teams.get(pl.id)}
-                            for pl in active])
+                    scores=_elim_score_rows(room, active))
             elif idx < total:
                 # v1.1 NEXT QUESTION vote break (not after the last
                 # question — that vote is the end-of-game vote).
@@ -1940,15 +1950,15 @@ async def run_memory_game(room: Room, participants=None, challenge=False,
             # stays too); in a normal game the deciding round's vote
             # is the end-of-game vote, so it is skipped here.
             if challenge:
+                # v2.4 item 3: rows carry the running tally. Only the
+                # still-alive players are listed (as before); the
+                # eliminated players' 100-per-round-survived scores
+                # are assigned at elimination and feed the tally.
                 await _vote_phase(
                     room, "memory", rnd, rnd, eligible=list(alive),
                     timeout=int(room.game_settings["elimination"].get(
                         "vote_timeout", VOTE_TIMEOUT_DEFAULT)),
-                    scores=[{"player_id": pl.id, "nickname": pl.nickname,
-                             "colour": pl.colour, "is_bot": pl.is_bot,
-                             "score": pl.score,
-                             "team": room.teams.get(pl.id)}
-                            for pl in alive])
+                    scores=_elim_score_rows(room, alive))
             elif len(alive) > 1:
                 await _vote_phase(room, "memory", rnd, rnd)
             else:
@@ -1975,6 +1985,17 @@ async def run_memory_game(room: Room, participants=None, challenge=False,
             by_time = sorted(alive, key=lambda p: recall_time.get(p.id, 0))
             ranking_ids = [p.id for p in by_time] + list(reversed(elim_order))
             winner = by_time[0]
+        if challenge:
+            # v2.4 item 3: survivors (other than the winner) earn
+            # 100 per round survived — previously they scored 0, so
+            # an Elimination break after a Memory challenge showed
+            # every survivor at 0. Eliminated players already got
+            # 100 x survived at elimination (above). The winner's
+            # 1000 below overrides the winner's survivor value.
+            # Challenge-only: a normal Memory game keeps its
+            # winner-1000 / everyone-else-0 scoring.
+            for p in alive:
+                _assign_score(room, p, 100 * survived[p.id])
         _assign_score(room, winner, 1000)
         if challenge:
             return ranking_ids, elim_order
@@ -2954,6 +2975,25 @@ def _elim_rebalance_groups(room: Room, alive, groups):
     return transfers
 
 
+def _elim_score_rows(room: Room, players, teams=None):
+    """v2.4 item 3: scoreboard rows for an Elimination break or a
+    per-round break inside a challenge. `score` is the just-finished
+    challenge's (or so-far-this-challenge's) points; `tally` is the
+    running per-series total from room.elim_tally. `teams` overrides
+    the team/group shown per row (Group mode passes the groups map,
+    {} for "no group" — the None the break used to send); when
+    omitted the room's teams map is used, as before."""
+    rows = []
+    for p in players:
+        rows.append({"player_id": p.id, "nickname": p.nickname,
+                     "colour": p.colour, "is_bot": p.is_bot,
+                     "score": p.score,
+                     "tally": room.elim_tally.get(p.id, 0),
+                     "team": (teams.get(p.id) if teams is not None
+                              else room.teams.get(p.id))})
+    return rows
+
+
 async def run_challenge(room: Room, game: str, alive):
     """Run one Elimination challenge and return its ranking (best
     first) as a list of {"player_id": ...} rows, or None if cancelled."""
@@ -3008,6 +3048,139 @@ async def elimination_end_vote(room: Room):
     return False
 
 
+async def _ceremony_stage(room: Room, payload: dict, eligible,
+                          timeout=4):
+    """v2.4 item 4: one elimination-ceremony stage. Broadcasts the
+    stage message, then waits up to `timeout` seconds, cut short by
+    the NEXT vote (>= half of the connected alive humans) or the
+    host skip — reusing room.round_state["votes"] / "vote_eligible"
+    / "host_skip" exactly like _vote_phase does, so the existing
+    vote_next / host_skip handlers drive it (the ceremony NEXT
+    button sends vote_next with NO index; the index check is
+    skipped when no index is sent). With NO eligible humans (an
+    all-bot series) the full timeout runs — unlike _vote_phase,
+    which returns at once, the ceremony must still pace. The vote
+    keys are cleaned up after each stage so the next stage and the
+    following _elimination_break start clean. round_state["vote_index"]
+    is set to the challenge number (display only)."""
+    room.round_state["votes"] = set()
+    room.round_state["vote_index"] = payload.get("challenge")
+    room.round_state["host_skip"] = False
+    room.round_state["ceremony"] = True
+    eligible_ids = {p.id for p in eligible}
+    room.round_state["vote_eligible"] = eligible_ids
+
+    def votes_needed():
+        alive_humans = [p for p in room.players
+                        if not p.is_bot and p.connected
+                        and p.id in eligible_ids]
+        return max(1, (len(alive_humans) + 1) // 2)
+
+    msg = dict(payload)
+    msg["votes"] = 0
+    msg["votes_needed"] = votes_needed()
+    msg["timeout"] = timeout
+    # Kept for the reconnect re-send path (below).
+    room.last_ceremony = dict(msg)
+    await broadcast(room, msg)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if room.round_state.get("host_skip"):
+            break
+        if len(room.round_state.get("votes", set())) >= votes_needed():
+            break
+        await asyncio.sleep(0.1)
+    room.round_state.pop("votes", None)
+    room.round_state.pop("vote_index", None)
+    room.round_state.pop("host_skip", None)
+    room.round_state.pop("vote_eligible", None)
+    room.round_state.pop("ceremony", None)
+
+
+async def _elimination_ceremony(room: Room, challenge_no: int, game: str,
+                                ranking, loser_p, alive, elim_order,
+                                group_info, is_group):
+    """v2.4 item 4: the staged elimination ceremony, run AFTER the
+    loser is picked and the merge / rebalance are computed, and
+    BEFORE _elimination_break. Presentation only — the elimination
+    logic itself (who is eliminated, merge, rebalance) is unchanged.
+    Stages, in order: "list" (ordered list by the previous game's
+    result, best first), "drop" (the eliminated player drops into
+    the eliminated pile), "merge" (Group only, when 5 remain and
+    the groups merged into the Black Team), "transfer" (Group only,
+    when the rebalance moved players). Merge and transfer are
+    mutually exclusive per challenge. Normal mode gets list + drop
+    only. 4 seconds per stage, skippable by the NEXT vote / host
+    skip (see _ceremony_stage)."""
+    if group_info:
+        groups = group_info["groups"]
+        group_totals = group_info["group_totals"]
+        worst_team = group_info["worst_team"]
+        transfers = group_info["transfers"]
+        merged = group_info["merged_to_black"]
+    else:
+        groups = {}
+        group_totals = {}
+        worst_team = None
+        transfers = []
+        merged = False
+    # The ordered list follows the challenge ranking (best first).
+    # Ranking rows differ per game (quiz rows carry score, reaction
+    # rows avg_ms, memory rows just the id), so the display values
+    # come from the players' just-finished challenge scores.
+    ranking_rows = []
+    for row in ranking:
+        pl = room.get_player(row["player_id"])
+        if pl is None:
+            continue
+        if pl.id in groups:
+            grp = groups.get(pl.id)
+        elif is_group and pl.id == loser_p.id:
+            # The eliminated player was already popped from the
+            # groups map; their group is the worst team (groups
+            # phase) or Black (black phase).
+            grp = group_info["worst_team"] if group_info else None
+        else:
+            grp = None
+        ranking_rows.append({
+            "player_id": pl.id, "nickname": pl.nickname,
+            "colour": pl.colour, "is_bot": pl.is_bot,
+            "score": pl.score,
+            "tally": room.elim_tally.get(pl.id, 0),
+            "group": grp})
+    base = {"type": "elimination_ceremony",
+            "challenge": challenge_no, "game": game,
+            "elimination_mode": "group" if is_group else "normal",
+            "elim_phase": room.elim_phase,
+            "ranking": ranking_rows,
+            "eliminated": {"player_id": loser_p.id,
+                           "nickname": loser_p.nickname},
+            "remaining": len(alive),
+            "alive": [p.id for p in alive],
+            "eliminated_pile": list(elim_order),
+            "groups": dict(groups) if is_group else {},
+            "group_totals": group_totals,
+            "worst_team": worst_team,
+            "merged_to_black": merged,
+            "transfers": transfers}
+    for stage in ("list", "drop"):
+        msg = dict(base)
+        msg["stage"] = stage
+        await _ceremony_stage(room, msg, eligible=list(alive))
+        if room.phase != "playing":
+            return
+    if is_group and merged:
+        msg = dict(base)
+        msg["stage"] = "merge"
+        await _ceremony_stage(room, msg, eligible=list(alive))
+        if room.phase != "playing":
+            return
+    elif is_group and transfers:
+        msg = dict(base)
+        msg["stage"] = "transfer"
+        await _ceremony_stage(room, msg, eligible=list(alive))
+
+
 async def _elimination_break(room: Room, challenge_no: int, alive,
                              ranking, eliminated_names, remaining,
                              finishing_names, group_info=None):
@@ -3029,13 +3202,9 @@ async def _elimination_break(room: Room, challenge_no: int, alive,
     the break extra gains `group_totals`, `worst_team`,
     `transfers` and `merged_to_black` (Group only).
     """
-    scores = []
-    for p in alive:
-        scores.append({"player_id": p.id, "nickname": p.nickname,
-                       "colour": p.colour, "is_bot": p.is_bot,
-                       "score": p.score,
-                       "team": (group_info["groups"].get(p.id)
-                                if group_info else None)})
+    scores = _elim_score_rows(
+        room, alive,
+        teams=(group_info["groups"] if group_info else {}))
     # The ranking order is the challenge order (best first); the
     # scoreboard sorts by score, so keep the ranking visible too.
     rank_names = []
@@ -3098,6 +3267,9 @@ async def run_elimination_game(room: Room):
             # v2.2 §10: the championship baseline for this series.
             room.score_at_game_start = {p.id: p.score
                                         for p in all_players}
+            # v2.4 item 3: a new series starts the running tally
+            # from zero (Play Again resets it).
+            room.elim_tally = {}
             alive = list(all_players)
             elim_order = []
             challenge_no = 0
@@ -3160,12 +3332,21 @@ async def run_elimination_game(room: Room):
                 ranking = await run_challenge(room, game, alive)
                 if ranking is None or room.phase != "playing":
                     return
+                # v2.4 item 3: fold this challenge's points into
+                # the persistent per-series tally BEFORE the next
+                # challenge resets p.score to 0. Every alive
+                # participant's challenge points count, including
+                # Memory survivors (100 x survived) and the winner
+                # (1000). The worst-team / worst-player picks below
+                # keep using the just-finished challenge's p.score.
+                for p in alive:
+                    room.elim_tally[p.id] = (
+                        room.elim_tally.get(p.id, 0) + p.score)
                 # --- pick the eliminated player (v2.3 item 14) ---
                 group_info = None
                 if is_group and room.elim_phase == "black":
                     # Black phase: worst player OVERALL.
                     loser_p = _elim_pick_worst_player(alive)
-                    loser_group = 2
                     worst_team = 2
                     group_totals = {2: sum(p.score for p in alive)}
                     transfers = []
@@ -3185,27 +3366,20 @@ async def run_elimination_game(room: Room):
                     worst_team = _elim_pick_worst_team(group_scores)
                     loser_p = _elim_pick_worst_player(
                         alive, group=worst_team, groups=groups)
-                    loser_group = worst_team
                     transfers = []
                     merged = False
                 else:
                     # Normal mode (v2.3 item 15): last place goes out.
                     last = ranking[-1]
                     loser_p = room.get_player(last["player_id"])
-                    loser_group = None
                 elim_order.append(loser_p.id)
                 alive = [p for p in alive if p.id != loser_p.id]
                 if is_group:
                     groups.pop(loser_p.id, None)
-                await broadcast(room, {"type": "elimination_eliminated",
-                                       "player_id": loser_p.id,
-                                       "nickname": loser_p.nickname,
-                                       "remaining": len(alive),
-                                       # v2.3 item 14: group of the
-                                       # eliminated player (None in
-                                       # Normal mode).
-                                       "group": loser_group
-                                           if is_group else None})
+                # v2.4 item 4: the elimination_eliminated broadcast
+                # is gone from the series flow — the staged ceremony
+                # below replaces it (the client handler stays as a
+                # harmless fallback).
                 if is_group:
                     if room.elim_phase == "groups":
                         if len(alive) == 5:
@@ -3226,6 +3400,15 @@ async def run_elimination_game(room: Room):
                                   "worst_team": worst_team,
                                   "transfers": transfers,
                                   "merged_to_black": merged}
+                # v2.4 item 4: the staged elimination ceremony —
+                # ordered list, the drop, then (Group only) the
+                # merge / transfer — runs BEFORE the pacing break,
+                # which follows it as before. Presentation only.
+                await _elimination_ceremony(
+                    room, challenge_no, game, ranking, loser_p, alive,
+                    elim_order, group_info, is_group)
+                if room.phase != "playing":
+                    return
                 # v2.1: pacing break — ranking, who went out, who is
                 # left — with a NEXT vote. Nothing advances until the
                 # vote passes, the host skips, or the timeout hits.
@@ -4179,6 +4362,20 @@ async def ws_endpoint(ws: WebSocket):
                                     "text": st["question"]["text"],
                                     "options": st["question"]["options"],
                                     "time_limit": remaining})
+            if st.get("ceremony") and room.last_ceremony is not None:
+                # v2.4 item 4: an elimination-ceremony stage is in
+                # progress — re-send the latest stage (with live
+                # vote counts) so the rejoiner lands on the ceremony
+                # page instead of the stale challenge state above.
+                # The break that follows re-syncs everyone anyway.
+                _cer = dict(room.last_ceremony)
+                _elig = st.get("vote_eligible") or set()
+                _cer["votes"] = len(st.get("votes", set()))
+                _cer_humans = [p for p in room.players
+                               if not p.is_bot and p.connected
+                               and p.id in _elig]
+                _cer["votes_needed"] = max(1, (len(_cer_humans) + 1) // 2)
+                await send(player, _cer)
 
         elif room.phase == "results" and room.current_game:
             # v2.3 item 11: resync for a player rejoining on the
