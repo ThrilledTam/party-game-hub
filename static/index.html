@@ -104,6 +104,27 @@
   .champ-table td, .champ-table th { padding: 5px; }
   #memoryCanvas { display: block; margin: 0 auto; max-width: 100%; }
   .role-badge { background: #8e44ad; color: #fff; font-size: .7rem; font-weight: 800; padding: 2px 6px; border-radius: 6px; }
+  /* v2.3: turn-order strip — small coloured player cards in rotation
+     order, current player highlighted. Compact for phones; no
+     customization controls mid-game. */
+  .turn-strip { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .turn-card { display: inline-flex; align-items: center; gap: 5px; padding: 4px 9px; border-radius: 16px; background: #1e1e2e; border: 2px solid transparent; font-size: .85rem; font-weight: 700; white-space: nowrap; }
+  .turn-card .chip { width: 14px; height: 14px; }
+  .turn-card.current { border-color: #f1c40f; box-shadow: 0 0 0 1px #f1c40f; }
+  /* v2.3: UNO playable-card highlighting — same green edge as
+     President's playable highlight; unplayable cards dimmed. */
+  .uno-card.playable { border-color: #2ecc71; box-shadow: 0 0 0 2px #2ecc71; }
+  .uno-card.dim { opacity: .35; }
+  #secretResultsBanner { background: #1e1e2e; border-radius: 8px; padding: 12px; margin-bottom: 12px; text-align: center; }
+  #secretResultsBanner h3 { margin: 4px 0; }
+  /* v2.3 (item 14): Group Elimination + Teams tap-to-move columns. */
+  .group-cols { display: flex; gap: 8px; margin-top: 6px; }
+  .group-col { flex: 1; background: #1e1e2e; border-radius: 8px; padding: 8px; border: 2px solid #555; min-width: 0; }
+  .group-col h4 { margin: 2px 0 4px; font-size: .9rem; }
+  .group-chip { display: block; width: 100%; text-align: left; background: #3d3d5c; margin-top: 6px; padding: 8px; border-radius: 8px; cursor: pointer; border: none; color: #fff; font-weight: 700; font-size: .9rem; }
+  .group-chip:hover { background: #4a4a6e; }
+  .role-badge.role-empty { background: #555; color: #bbb; }
+  .elim-group-badge { font-size: .7rem; font-weight: 800; padding: 2px 6px; border-radius: 6px; color: #fff; white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -173,6 +194,7 @@
           <label>Team scoring</label>
           <select id="setTeamScoring"><option value="average">Average</option><option value="sum">Sum</option><option value="best">Best member</option></select>
           <button id="randomTeamsBtn" class="secondary">🎲 Randomize teams</button>
+          <div id="teamAssignCols"></div>
         </div>
         <label>Turn order</label>
         <select id="setTurnOrderMode"><option value="random">Random each game</option><option value="manual">Manual (host sets the order)</option></select>
@@ -221,7 +243,22 @@
           <p class="muted">Memory: memorize a 4-digit number, then type it back. Wrong and you're out! Survive and the number grows: 5 digits, 6, 7, 8… until one player remains. Recall time is 15 seconds.</p>
         </details>
         <details id="setElimination" class="gameSet hidden"><summary>Elimination options</summary>
-          <p class="muted">Elimination: a series of quick challenges (Reaction, Speed Math, Speed Trivia, Memory). Last place in each challenge is eliminated, until 3 remain — then a finale crowns the victor. At the end, everyone votes Play Again or Return to Lobby.</p>
+          <p class="muted">Elimination: a series of quick challenges (Reaction, Speed Math, Speed Trivia, Memory). One player is eliminated per challenge until 1 remains. Group mode splits players into Red and Blue teams — the worst player of the worst team goes out each match, merging into the Black Team at 5 players. At the end, everyone votes Play Again or Return to Lobby.</p>
+          <label>Elimination mode</label>
+          <select id="setElimMode">
+            <option value="normal">Normal — last place out each challenge</option>
+            <option value="group">Group — Red vs Blue teams</option>
+          </select>
+          <p class="muted" id="elimModeNote">Normal: last place in each challenge is out, until 1 remains.</p>
+          <div id="elimGroupAssign" class="hidden">
+            <p class="muted">Tap a player to move them to the other team.</p>
+            <div class="group-cols">
+              <div class="group-col" style="border-color:#e74c3c"><h4>🔴 Red Team</h4><div id="elimGroupRed"></div></div>
+              <div class="group-col" style="border-color:#3498db"><h4>🔵 Blue Team</h4><div id="elimGroupBlue"></div></div>
+            </div>
+            <div id="elimGroupUnassigned"></div>
+            <button id="randomElimGroupsBtn" class="secondary">🎲 Randomize groups</button>
+          </div>
         </details>
         <button id="addBotBtn">+ Add BOT</button>
       </div>
@@ -260,6 +297,7 @@
     <div id="secretBox" class="hidden">
       <p id="secretPrivate" style="font-size:1.2rem;font-weight:800;text-align:center"></p>
       <p id="secretStatus" class="muted"></p>
+      <div id="secretTurnOrder" class="turn-strip"></div>
       <div id="secretLists" class="muted"></div>
       <div id="secretRoundResults"></div>
       <div id="secretClueArea" class="hidden">
@@ -275,6 +313,7 @@
     </div>
     <div id="presidentBox" class="hidden">
       <p id="presTurn" style="font-weight:800"></p>
+      <div id="presTurnOrder" class="turn-strip"></div>
       <p id="presTimer" class="pres-timer"></p>
       <p id="presTrick" class="muted"></p>
       <p id="presHint" class="pres-hint"></p>
@@ -291,6 +330,7 @@
     </div>
     <div id="unoBox" class="hidden">
       <p id="unoTurn" style="font-weight:800"></p>
+      <div id="unoTurnOrder" class="turn-strip"></div>
       <p>Top card: <b id="unoTop"></b> · Colour in play: <b id="unoColour"></b> <span id="unoDir" class="muted"></span></p>
       <p id="unoPending" style="font-weight:800;color:#f1c40f"></p>
       <div id="unoHand" class="hand"></div>
@@ -334,6 +374,7 @@
   <!-- RESULTS -->
   <div id="results" class="card hidden">
     <h2>🏆 Results</h2>
+    <div id="secretResultsBanner" class="hidden"></div>
     <div id="teamResults"></div>
     <div id="resultsTable"></div>
     <div id="elimEndVote" class="hidden" style="background:#1e1e2e;border-radius:8px;padding:12px;margin-top:12px;text-align:center">
@@ -386,7 +427,16 @@ let presSelected=new Set(), memoryAnswered=false;
 let elimVoted=false, memoryTimerInt=null;
 // v2.2 state
 let unoSelectedIdx=new Set(), unoHandCards=[], unoColourChoice=null, unoPlayPending=null;
+let unoState=null, lastTurnOrder=null;
 let expandedCardId=null, replayVoted=false, secretEliminated=false, presExchange=null;
+// v2.3 (item 14): the Teams setting (mode + team count) remembered when
+// the host picks Elimination, so it can be restored when they pick a
+// normal game again. Persisted in sessionStorage so a reload does not
+// lose it. Also the last seen Group Elimination state, for the
+// challenge intro / break group displays.
+let prevTeamsSetting=null;
+try{ prevTeamsSetting=JSON.parse(sessionStorage.getItem("pgh_prev_teams")||"null"); }catch(e){}
+let lastElimGroups=null, lastElimMode="normal", lastElimPhase=null;
 // ---- v2.1 President: client-side legality (mirrors the server rule) ----
 // A single higher card does NOT beat a pair — the set must match the
 // trick's size AND be a higher rank. The UI explains that instead of
@@ -409,7 +459,7 @@ function presHintText(){
   const sel=[...presSelected];
   if(!presTrick) return "Lead with any set of the same rank (1–4 cards).";
   if(presTrick.rank>=15) return "Nothing beats "+PRES_SIZE_WORDS[presTrick.size]+" of 2s — you have to pass.";
-  const need="Beat "+PRES_SIZE_WORDS[presTrick.size]+" of "+presRankName(presTrick.rank)+"s — pick "+presTrick.size+" card"+(presTrick.size>1?"s":"")+" of the same rank, "+presRankName(presTrick.rank+1)+" or higher.";
+  const need="Beat "+PRES_SIZE_WORDS[presTrick.size]+" of "+presRankName(presTrick.rank)+"s — play "+presTrick.size+" card"+(presTrick.size>1?"s":"")+" of the same rank, higher than "+presRankName(presTrick.rank)+".";
   if(!sel.length) return need;
   const bad=presIllegalReason(sel, presTrick);
   if(bad) return bad;
@@ -467,11 +517,182 @@ function teamsValid(){
   for(let t=0;t<room.team_count;t++) if(!assigned.has(t)) return false;
   return true;
 }
+// v2.3: colour-coated player names — ONE helper, used everywhere a
+// player name appears in-game (scoreboards, standings, vote lists,
+// turn indicators, results, banners, clue/vote lists, elimination
+// banners, reaction results, quiz feedback, memory results). Accepts
+// a player object ({id|player_id, nickname, colour, is_bot}), a
+// player_id, or a nickname string (looked up in the room).
+function escHtml(s){ return String(s==null?"":s).replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+function playerById(id){ return room && room.players ? room.players.find(p=>p.id===id) : null; }
+function playerByNick(nick){ return room && room.players ? room.players.find(p=>p.nickname===nick) : null; }
+function nameHtml(p){
+  let pl=null;
+  if(p && typeof p==="object"){ const id=p.player_id||p.id; pl = id ? (playerById(id)||p) : p; }
+  else if(typeof p==="string"){ pl = playerById(p) || playerByNick(p); if(!pl) return escHtml(p); }
+  else return "";
+  const colour = pl.colour || "#95a5a6";
+  return "<span class='chip' style='display:inline-block;background:"+colour+"'></span> <span style='color:"+colour+";font-weight:700'>"+escHtml(pl.nickname||pl.name||"")+"</span>"+(pl.is_bot?" 🤖":"");
+}
+// v2.3: turn-order strip — small coloured player cards in rotation
+// order, current player highlighted. No customization controls.
+function turnStripHtml(order, turnId){
+  if(!order || !order.length) return "";
+  return order.map(id=>{ const p=playerById(id); if(!p) return "";
+    const cur = id===turnId;
+    return "<span class='turn-card"+(cur?" current":"")+"' style='border-color:"+(cur?"#f1c40f":p.colour)+"'><span class='chip' style='background:"+p.colour+"'></span><span style='color:"+p.colour+"'>"+escHtml(p.nickname)+"</span>"+(p.is_bot?" 🤖":"")+(cur?" 👉":"")+"</span>";
+  }).join("");
+}
+function renderTurnStrip(elId, order, turnId){
+  const el=$(elId); if(!el) return;
+  // Remember the last known order so messages that carry only the
+  // current player (e.g. secret_clue_turn on the pre-v2.3 server)
+  // can still show the strip.
+  if(order && order.length) lastTurnOrder = order.slice();
+  el.innerHTML = turnStripHtml(order || lastTurnOrder, turnId);
+}
+// v2.3 (item 14): Group Elimination helpers. Group ids: 0 = Red,
+// 1 = Blue, 2 = Black (final 5). The server sends elimination_mode /
+// elim_groups / elim_phase on the lobby payload and on the
+// elimination_challenge broadcast; read them defensively (older
+// server versions send none of them, and then everything falls back
+// to Normal with no group display).
+const ELIM_GROUP_NAMES=["Red","Blue","Black"];
+const ELIM_GROUP_EMOJIS=["🔴","🔵","⚫"];
+const ELIM_GROUP_COLOURS=["#e74c3c","#3498db","#111111"];
+function elimGroupLabel(g){ if(g==null||g===undefined) return ""; return ELIM_GROUP_EMOJIS[g]+" "+ELIM_GROUP_NAMES[g]+" Team"; }
+function elimGroupChipHtml(g){
+  if(g==null||g===undefined) return "";
+  return "<span class='elim-group-badge' style='background:"+ELIM_GROUP_COLOURS[g]+(g===2?";border:1px solid #888":"")+"'>"+elimGroupLabel(g)+"</span>";
+}
+function currentElimMode(){
+  return (room && room.elimination_mode) ||
+    (room && room.game_settings && room.game_settings.elimination && room.game_settings.elimination.mode) || "normal";
+}
+function currentElimGroups(){ return (room && room.elim_groups) ? Object.assign({}, room.elim_groups) : {}; }
+function updateElimModeNote(){
+  const note=$("elimModeNote"); if(!note||!room) return;
+  const n=room.players.length;
+  if(n<6) note.textContent="Group mode needs 6+ players ("+n+" in the room now).";
+  else if(currentElimMode()==="group") note.textContent="Group mode: Red vs Blue — the worst player of the worst team (lowest total points) is out each match. At 5 players, everyone merges into the Black Team.";
+  else note.textContent="Normal: last place in each challenge is out, until 1 remains.";
+}
+// v2.3 (item 14): Elimination group assignment UI (host only) — two
+// columns, tap a player chip to move them to the other column; players
+// with no group yet sit in an "unassigned" row (tap to put in Red).
+function renderElimGroups(){
+  const area=$("elimGroupAssign"); if(!area||!room) return;
+  const mode=currentElimMode();
+  const sel=$("setElimMode"); if(sel) sel.value=mode;
+  const optGroup=sel?sel.querySelector('option[value="group"]'):null;
+  if(optGroup) optGroup.disabled=room.players.length<6;
+  updateElimModeNote();
+  const show = mode==="group" && room.game==="elimination";
+  area.classList.toggle("hidden", !show);
+  const red=$("elimGroupRed"), blue=$("elimGroupBlue"), un=$("elimGroupUnassigned");
+  if(!show){ if(red) red.innerHTML=""; if(blue) blue.innerHTML=""; if(un) un.innerHTML=""; return; }
+  const groups=currentElimGroups();
+  const mkChip=(p,next)=>{
+    const b=document.createElement("button"); b.className="group-chip"; b.type="button";
+    b.innerHTML="<span class='chip' style='display:inline-block;background:"+p.colour+"'></span> "+escHtml(p.nickname)+(p.is_bot?" 🤖":"");
+    b.title="Tap to move to "+elimGroupLabel(next);
+    b.onclick=()=>{ const map=currentElimGroups(); map[p.id]=next; send({type:"update_settings", elimination_mode:"group", elim_groups:map}); };
+    return b;
+  };
+  red.innerHTML=""; blue.innerHTML=""; un.innerHTML="";
+  const unassigned=[];
+  room.players.forEach(p=>{
+    const g=groups[p.id];
+    if(g===0) red.appendChild(mkChip(p,1));
+    else if(g===1) blue.appendChild(mkChip(p,0));
+    else unassigned.push(p);
+  });
+  if(unassigned.length){
+    const t=document.createElement("p"); t.className="muted"; t.textContent="Not assigned yet — tap to put in Red Team:"; un.appendChild(t);
+    unassigned.forEach(p=>un.appendChild(mkChip(p,0)));
+  }
+}
+// v2.3 (item 14): general Teams assignment with the SAME tap-to-move
+// design — one column per team (2–4), tap a player chip to move them
+// to the NEXT team column (wrapping). Players with no team ("Alone")
+// sit in a row underneath; tapping one joins Team 1. Bots included.
+// Sends the full teams map via update_settings (the server accepts
+// the full map) plus the existing assign_team message for the moved
+// player, so the move lands through both paths.
+function renderTeamAssignCols(){
+  const box=$("teamAssignCols"); if(!box) return; box.innerHTML="";
+  if(!room || room.mode!=="teams" || !isHost()) return;
+  const tc=room.team_count||2;
+  const mkChip=(p,nextTeam)=>{
+    const b=document.createElement("button"); b.className="group-chip"; b.type="button";
+    b.innerHTML="<span class='chip' style='display:inline-block;background:"+p.colour+"'></span> "+escHtml(p.nickname)+(p.is_bot?" 🤖":"");
+    b.title="Tap to move to "+TEAM_NAMES[nextTeam];
+    b.onclick=()=>{
+      const map={}; room.players.forEach(q=>{ map[q.id]=(q.team==null?null:q.team); });
+      map[p.id]=nextTeam;
+      send({type:"update_settings", teams:map});
+      send({type:"assign_team", player_id:p.id, team:nextTeam});
+    };
+    return b;
+  };
+  const wrap=document.createElement("div"); wrap.className="group-cols";
+  for(let t=0;t<tc;t++){
+    const col=document.createElement("div"); col.className="group-col"; col.style.borderColor=TEAM_COLOURS[t];
+    col.innerHTML="<h4><span class='team-badge' style='background:"+TEAM_COLOURS[t]+"'>"+TEAM_NAMES[t]+"</span></h4>";
+    room.players.filter(p=>(p.team==null?null:p.team)===t).forEach(p=>col.appendChild(mkChip(p,(t+1)%tc)));
+    wrap.appendChild(col);
+  }
+  box.appendChild(wrap);
+  const alone=room.players.filter(p=>p.team==null);
+  if(alone.length){
+    const row=document.createElement("div"); row.style.marginTop="6px";
+    const t=document.createElement("span"); t.className="muted"; t.textContent="Alone (no team) — tap to join Team 1: ";
+    row.appendChild(t);
+    alone.forEach(p=>row.appendChild(mkChip(p,0)));
+    box.appendChild(row);
+  }
+}
+// v2.3 (item 10): reset the shared NEXT-vote box so no stale vote
+// count / denominator can display after a game ends.
+function clearVoteBox(){
+  $("voteBox").classList.add("hidden");
+  $("voteCount").textContent="0/0 voted NEXT";
+  $("voteScores").innerHTML=""; $("voteTeams").innerHTML=""; $("voteLabel").textContent="";
+  $("voteHeading").textContent="Take a breather — scores above ☝️";
+  votedNext=false; voteIndex=null;
+}
+// v2.3 (item 7): UNO playability, mirroring the server's uno_match /
+// uno_validate_play — wilds always playable; otherwise match the
+// colour in play or the top card's value; with a pending draw only
+// the same-type stack card (+2 on +2, +4 on +4) is playable.
+function unoValue(c){ if(!c) return ""; if(c.startsWith("W")) return c==="Wwild" ? "wild" : "draw4"; return c.slice(1); }
+function unoIsPlayable(card, st){
+  if(!card || !st) return false;
+  if(st.pending_draw && st.pending_draw>0) return unoValue(card)===st.pending_type;
+  if(card.startsWith("W")) return true;
+  if(st.current_colour && card[0]===st.current_colour) return true;
+  if(st.top && !st.top.startsWith("W")) return unoValue(card)===unoValue(st.top);
+  return false;
+}
+function refreshUnoHighlights(){
+  if(!unoState) return;
+  const me = unoState.turn_id===myId;
+  const selValues = new Set([...unoSelectedIdx].map(i=>unoValue(unoHandCards[i])));
+  [...$("unoHand").children].forEach((b,i)=>{
+    const c = unoHandCards[i];
+    // With multi-play on, a card sharing the value of a selected card
+    // is playable as part of that multi-play even if it doesn't match
+    // the top card itself.
+    const playable = unoIsPlayable(c, unoState) || (me && unoState.multi_play && unoSelectedIdx.size && selValues.has(unoValue(c)));
+    b.classList.toggle("playable", me && playable);
+    b.classList.toggle("dim", me && !playable);
+  });
+}
 function teamStandingsHtml(teams){
   if(!teams || !teams.length) return "";
   return "<h3>Team standings</h3><table>"+
     teams.map(t=>"<tr><td><span class='team-badge' style='background:"+t.colour+"'>"+t.name+"</span></td><td>"+t.average+" pts</td><td class='muted'>"+
-      t.members.map(m=>m.nickname).join(", ")+"</td></tr>").join("")+"</table>";
+      t.members.map(m=>nameHtml(m)).join(", ")+"</td></tr>").join("")+"</table>";
 }
 // v2: display label for an UNO card string like "R5", "Gskip", "Wwild".
 function unoLabel(card){
@@ -542,6 +763,23 @@ $("noRoomCreateBtn").onclick=()=>{ $("noRoomCreateBtn").classList.add("hidden");
 const params=new URLSearchParams(location.search);
 if(params.get("code")) $("joinCode").value=params.get("code").toUpperCase();
 
+// v2.3 (item 11): on page load, if a session was stored, auto-join
+// that room with the stored player_id so a reload reclaims the same
+// seat. A ?code= in the URL for a *different* room wins — the user
+// is following a fresh invite, not reloading.
+(function autoRejoin(){
+  let saved=null;
+  try{ saved=JSON.parse(sessionStorage.getItem("pgh_session")||"null"); }catch(e){}
+  if(!saved || !saved.code || !saved.player_id) return;
+  const urlCode=params.get("code");
+  if(urlCode && urlCode.toUpperCase()!==saved.code) return;
+  if(saved.nickname) $("nickname").value=saved.nickname;
+  if(saved.colour){ myColour=saved.colour; buildPalette($("palette"), c=>myColour=c, myColour); }
+  myId=saved.player_id;
+  lastJoinMsg={type:"join_room", code:saved.code, nickname:saved.nickname||"", colour:saved.colour||myColour, player_id:saved.player_id};
+  connect(lastJoinMsg);
+})();
+
 function send(m){ if(ws && ws.readyState===1) ws.send(JSON.stringify(m)); }
 function isHost(){ return room && room.players.find(p=>p.id===myId)?.is_host; }
 
@@ -551,6 +789,7 @@ function handle(msg){
     // server restarted and wiped in-memory rooms). Say so plainly
     // and offer a one-tap way to create a fresh room.
     if(msg.message.indexOf("No room with code")===0){
+      try{ sessionStorage.removeItem("pgh_session"); }catch(e){}
       (room?$("lobbyErr"):$("homeErr")).textContent="This room no longer exists — it may have been closed or the server restarted. Create a new room to start fresh.";
       $("noRoomCreateBtn").classList.remove("hidden");
     } else {
@@ -561,17 +800,28 @@ function handle(msg){
     }
     return; }
   if(msg.type==="kicked"){ // v1.2 host kick
+    try{ sessionStorage.removeItem("pgh_session"); }catch(e){}
     if(ws){ try{ ws.close(); }catch(e){} }
     room=null; $("homeErr").textContent=msg.message||"You were kicked from the room by the host.";
     show("home"); return; }
   if(msg.type==="joined"){ myId=msg.player_id; room=msg.room; if(lastJoinMsg){lastJoinMsg.code=room.code; lastJoinMsg.player_id=myId;}
+    // v2.3 (item 11): persist the session so a reload reclaims the
+    // same seat (same player_id) instead of joining as a new player.
+    try{
+      const me = room.players.find(p=>p.id===myId);
+      sessionStorage.setItem("pgh_session", JSON.stringify({code:room.code, player_id:myId,
+        nickname: me ? me.nickname : (lastJoinMsg?lastJoinMsg.nickname:""),
+        colour: me ? me.colour : (lastJoinMsg?lastJoinMsg.colour:myColour)}));
+    }catch(e){}
     history.replaceState(null,"",joinLink(room.code)); renderLobby(); show("lobby"); return; }
-  if(msg.type==="lobby"){ room=msg.room; if(room.phase==="lobby") renderLobby(); return; }
+  if(msg.type==="lobby"){ room=msg.room; if(room.phase==="lobby"){ renderLobby(); show("lobby"); } return; }
   if(msg.type==="game_started"){ room.current_game=msg.game;
     if(msg.party_mode) room.mode=msg.party_mode;
     if(msg.teams) room.teams=msg.teams;
     $("gameTitle").textContent=GAME_NAMES[msg.game]+(msg.mode==="solo"?" — Solo practice":"");
-    $("gameInfo").textContent = (msg.mode==="solo" ? "Just you — have fun, no pressure!" : "Fastest correct answers score the most points.") +
+    $("gameInfo").textContent = (msg.mode==="solo" ? "Just you — have fun, no pressure!" :
+      msg.game==="president" ? "President: shed all your cards first to become President. Play a set of the same rank that beats the trick, or pass." :
+      "Fastest correct answers score the most points.") +
       (msg.party_mode==="teams" ? " · Teams mode." : "") +
       (msg.championship ? " · 🏆 Championship — "+(msg.champ_games||0)+" game"+((msg.champ_games||0)===1?"":"s")+" completed so far." : "");
     $("reactionResults").innerHTML=""; $("quizFeedback").textContent=""; $("scoreboard").innerHTML=""; $("gameErr").textContent="";
@@ -582,7 +832,9 @@ function handle(msg){
     $("presRoles").innerHTML=""; $("presExchange").classList.add("hidden"); presExchange=null;
     $("unoHand").innerHTML=""; $("unoCounts").innerHTML=""; $("unoPending").textContent=""; unoSelectedIdx=new Set(); unoHandCards=[]; unoColourChoice=null; unoPlayPending=null; $("unoColourPick").classList.add("hidden");
     drawMemoryNumber(""); $("memoryElim").innerHTML=""; memoryAnswered=false; clearInterval(memoryTimerInt);
-    $("voteBox").classList.add("hidden");
+    $("voteBox").classList.add("hidden"); clearVoteBox();
+    $("secretResultsBanner").classList.add("hidden"); $("secretResultsBanner").innerHTML="";
+    if(msg.turn_order && msg.turn_order.length) lastTurnOrder=msg.turn_order.slice();
     $("endChoice").classList.add("hidden"); replayVoted=false;
     $("reactionBox").classList.toggle("hidden", msg.game!=="reaction");
     $("quizBox").classList.toggle("hidden", !(msg.game==="math"||msg.game==="trivia"));
@@ -596,7 +848,7 @@ function handle(msg){
   if(msg.type==="reaction_round_result"){
     const me=msg.results.find(r=>r.player_id===myId);
     $("reactionResults").innerHTML = "<h3>Round "+msg.round+"/"+msg.total+"</h3><table>"+
-      msg.results.map(r=>"<tr><td><span class='chip' style='display:inline-block;background:"+r.colour+"'></span> "+r.nickname+(r.is_bot?" 🤖":"")+"</td><td>"+
+      msg.results.map(r=>"<tr><td>"+nameHtml(r)+"</td><td>"+
         (r.false_start?"Too soon! ❌":(r.ms==null?"—":r.ms+" ms"))+"</td></tr>").join("")+"</table>";
     if(me && me.false_start) $("reactionArea").textContent="Too soon! That round doesn't count.";
     return; }
@@ -618,12 +870,37 @@ function handle(msg){
     // v2.1 Elimination break: show the challenge ranking, who was
     // eliminated, who is left, and the finishing order so far.
     if(msg.elim_break){
-      $("voteHeading").textContent = "💀 "+msg.eliminated.join(" & ")+" eliminated — "+msg.remaining+" player"+(msg.remaining===1?"":"s")+" remain";
+      $("voteHeading").innerHTML = "💀 "+msg.eliminated.map(n=>nameHtml(n)).join(" & ")+" eliminated — "+msg.remaining+" player"+(msg.remaining===1?"":"s")+" remain";
       $("nextBtn").textContent="NEXT CHALLENGE →";
       $("hostSkipBtn").textContent="HOST: Skip to next challenge →";
-      $("voteScores").innerHTML="<h3>Challenge ranking</h3><table>"+
-        msg.ranking.map((n,i)=>"<tr><td>"+(i+1)+"</td><td>"+n+"</td></tr>").join("")+"</table>"+
-        (msg.finishing && msg.finishing.length ? "<p class='muted'>Out so far: "+msg.finishing.join(" → ")+"</p>" : "");
+      // v2.3 (item 14): in a Group series the break shows each alive
+      // player's group (from the break scores' team field, falling
+      // back to the last challenge's groups), the group totals +
+      // worst team, any rebalance transfers, and the Black merge.
+      const groupOfNick=(nick)=>{
+        const p=playerByNick(nick);
+        if(!p) return null;
+        if(msg.scores){ const row=msg.scores.find(s=>s.player_id===p.id); if(row && row.team!=null&&row.team!==undefined) return row.team; }
+        if(lastElimGroups && lastElimGroups[p.id]!=null&&lastElimGroups[p.id]!==undefined) return lastElimGroups[p.id];
+        return null;
+      };
+      const rankRows=(msg.ranking||[]).map((n,i)=>{ const g=groupOfNick(n);
+        return "<tr><td>"+(i+1)+"</td><td>"+nameHtml(n)+(g!=null?" "+elimGroupChipHtml(g):"")+"</td></tr>"; }).join("");
+      let groupHtml="";
+      if(msg.group_totals){
+        const parts=Object.keys(msg.group_totals).sort().map(k=>elimGroupLabel(+k)+": "+msg.group_totals[k]+" pts");
+        groupHtml+="<p><b>Group totals:</b> "+parts.join(" · ")+
+          (msg.worst_team!=null&&msg.worst_team!==undefined?" — worst team: <b>"+elimGroupLabel(msg.worst_team)+"</b>":"")+"</p>";
+      }
+      if(msg.transfers && msg.transfers.length){
+        groupHtml+="<p>"+msg.transfers.map(t=>{
+          const nm=t.nickname||((playerById(t.player_id)||{}).nickname)||"?";
+          return "🔀 "+escHtml(nm)+" moved "+elimGroupLabel(t.from)+" → "+elimGroupLabel(t.to)+" to rebalance the groups";
+        }).join("<br>")+"</p>";
+      }
+      if(msg.merged_to_black) groupHtml+="<p><b>⚫ Final 5 — merged into the Black Team!</b></p>";
+      $("voteScores").innerHTML="<h3>Challenge ranking</h3><table>"+rankRows+"</table>"+groupHtml+
+        (msg.finishing && msg.finishing.length ? "<p class='muted'>Out so far: "+msg.finishing.map(n=>nameHtml(n)).join(" → ")+"</p>" : "");
     } else if(msg.end_of_game){
       // v2.2 end-of-game NEXT vote: a ready gate before the Play Again /
       // Return to Lobby choice. This voteBox lives outside #game so it
@@ -633,14 +910,14 @@ function handle(msg){
       $("hostSkipBtn").textContent="HOST: Skip to the choice →";
       $("voteScores").innerHTML = msg.scores ? "<table>"+
         [...msg.scores].sort((a,b)=>b.score-a.score)
-          .map(s=>"<tr><td><span class='chip' style='display:inline-block;background:"+s.colour+"'></span> "+s.nickname+(s.is_bot?" 🤖":"")+teamBadge(s)+"</td><td>"+(msg.scores_hidden?"hidden":s.score)+"</td></tr>").join("")+"</table>" : "";
+          .map(s=>"<tr><td>"+nameHtml(s)+teamBadge(s)+"</td><td>"+(msg.scores_hidden?"hidden":s.score)+"</td></tr>").join("")+"</table>" : "";
     } else {
       $("voteHeading").textContent="Take a breather — scores above ☝️";
       $("nextBtn").textContent="NEXT QUESTION →";
       $("hostSkipBtn").textContent="HOST: Skip to next question →";
       $("voteScores").innerHTML = msg.scores ? "<table>"+
         [...msg.scores].sort((a,b)=>b.score-a.score)
-          .map(s=>"<tr><td><span class='chip' style='display:inline-block;background:"+s.colour+"'></span> "+s.nickname+(s.is_bot?" 🤖":"")+teamBadge(s)+"</td><td>"+s.score+"</td></tr>").join("")+"</table>" : "";
+          .map(s=>"<tr><td>"+nameHtml(s)+teamBadge(s)+"</td><td>"+s.score+"</td></tr>").join("")+"</table>" : "";
     }
     $("voteLabel").textContent = msg.label ? "Round: "+msg.label : (msg.end_of_game ? "End-of-game vote" : "");
     $("voteTeams").innerHTML = msg.teams ? teamStandingsHtml(msg.teams) : "";
@@ -655,7 +932,7 @@ function handle(msg){
     $("quizFeedback").innerHTML = "Correct answer: <b>"+corr+"</b>" +
       (msg.points.find(p=>p.player_id===myId) ? " — you scored +"+msg.points.find(p=>p.player_id===myId).points+"!" : " — no points this round.");
     $("scoreboard").innerHTML="<h3>Scores</h3><table>"+[...msg.scores].sort((a,b)=>b.score-a.score)
-      .map(s=>"<tr><td><span class='chip' style='display:inline-block;background:"+s.colour+"'></span> "+s.nickname+(s.is_bot?" 🤖":"")+teamBadge(s)+"</td><td>"+s.score+"</td></tr>").join("")+"</table>" +
+      .map(s=>"<tr><td>"+nameHtml(s)+teamBadge(s)+"</td><td>"+s.score+"</td></tr>").join("")+"</table>" +
       (msg.teams ? teamStandingsHtml(msg.teams) : "");
     return; }
   // ---- v2.2: Secret Word (multi-round) ----
@@ -667,7 +944,6 @@ function handle(msg){
     // alive/eliminated lists, so only update those when present, or a
     // rejoin would wrongly clear the spectate state and the lists.
     if(msg.eliminated!==undefined) secretEliminated = msg.eliminated.includes(myId);
-    const nick = id=>{const p=room.players.find(q=>q.id===id); return p?p.nickname:id;};
     $("secretPrivate").textContent = secretEliminated ? "👻 You were voted out — spectating now." :
       isImp ? "🕵️ You are the IMPOSTOR — figure out the word from the clues, and don't get caught!"
       : "🤫 The secret word is: "+(msg.word||"—");
@@ -676,24 +952,25 @@ function handle(msg){
       ? "There "+(((msg.impostors||msg.impostor_count)||1)>1?"are "+(msg.impostors||msg.impostor_count)+" impostors":"is 1 impostor")+" among you. Give a vague clue that fits in."
       : "Give a one-word clue that helps the others guess the word — but don't just say the word itself!");
     if(msg.alive!==undefined){
-      $("secretLists").innerHTML = "<p>Round "+(msg.round||1)+" · Alive: "+msg.alive.map(nick).join(", ")+
-        ((msg.eliminated||[]).length ? " · Out: "+msg.eliminated.map(nick).join(", ") : "")+"</p>";
+      $("secretLists").innerHTML = "<p>Round "+(msg.round||1)+" · Alive: "+msg.alive.map(id=>nameHtml(id)).join(", ")+
+        ((msg.eliminated||[]).length ? " · Out: "+msg.eliminated.map(id=>nameHtml(id)).join(", ") : "")+"</p>";
+      renderTurnStrip("secretTurnOrder", msg.turn_order || msg.alive, null);
     }
     $("secretClueArea").classList.add("hidden"); $("secretVoteArea").classList.add("hidden");
     return; }
   if(msg.type==="secret_round_result"){
-    const nick=id=>{const p=room.players.find(q=>q.id===id); return p?p.nickname:id;};
     if(msg.eliminated===myId) secretEliminated=true;
     // The server never re-sends secret_word per round, so refresh the
     // alive/eliminated lists here from the round result.
     if(msg.alive!==undefined){
       const outIds = msg.eliminated_ids || (msg.eliminated ? [msg.eliminated] : []);
-      $("secretLists").innerHTML = "<p>Round "+msg.round+" · Alive: "+msg.alive.map(nick).join(", ")+
-        (outIds.length ? " · Out: "+outIds.map(nick).join(", ") : "")+"</p>";
+      $("secretLists").innerHTML = "<p>Round "+msg.round+" · Alive: "+msg.alive.map(id=>nameHtml(id)).join(", ")+
+        (outIds.length ? " · Out: "+outIds.map(id=>nameHtml(id)).join(", ") : "")+"</p>";
+      renderTurnStrip("secretTurnOrder", msg.turn_order || msg.alive, null);
     }
     const d=document.createElement("div");
     d.innerHTML="<p><b>Round "+msg.round+" result:</b> "+(msg.tie ? "Tie — nobody was voted out." :
-      (msg.eliminated ? "<b>"+nick(msg.eliminated)+"</b> was voted out." : "Nobody was voted out."))+
+      (msg.eliminated ? nameHtml(msg.eliminated)+" was voted out." : "Nobody was voted out."))+
       " Citizens left: "+msg.citizens_left+" · Impostors left: "+msg.impostors_left+"</p>";
     $("secretRoundResults").appendChild(d);
     $("secretStatus").textContent = secretEliminated ? "You were voted out — spectating." : "Round "+msg.round+" done — next clue round coming up…";
@@ -703,14 +980,16 @@ function handle(msg){
     return; }
   if(msg.type==="secret_notice"){ $("secretStatus").textContent=msg.message||""; return; }
   if(msg.type==="secret_clue_turn"){
-    $("secretStatus").textContent = msg.player_id===myId ? "Your turn — give a one-word clue!" : "Waiting for "+msg.nickname+" to give a clue…";
+    $("secretStatus").innerHTML = msg.player_id===myId ? "Your turn — give a one-word clue!" : "Waiting for "+nameHtml(msg.player_id)+" to give a clue…";
+    renderTurnStrip("secretTurnOrder", msg.turn_order || lastTurnOrder, msg.player_id);
     $("secretClueArea").classList.toggle("hidden", msg.player_id!==myId || secretEliminated);
     if(msg.player_id===myId && !secretEliminated){ $("secretClueInput").value=""; $("secretClueInput").focus(); }
     return; }
   if(msg.type==="secret_clue_shown"){
     const d=document.createElement("div");
-    d.innerHTML="<b>"+msg.nickname+":</b> "+msg.clue;
+    d.innerHTML=nameHtml(msg.player_id)+": "+escHtml(msg.clue);
     $("secretClues").appendChild(d);
+    renderTurnStrip("secretTurnOrder", msg.turn_order || lastTurnOrder, null);
     return; }
   if(msg.type==="secret_vote_start"){
     if(secretEliminated) return; // spectating — no vote input
@@ -718,8 +997,8 @@ function handle(msg){
     $("secretStatus").textContent="Vote for who you think the impostor is!";
     const box=$("secretVoteBtns"); box.innerHTML="";
     msg.players.filter(p=>p.player_id!==myId).forEach(p=>{
-      const b=document.createElement("button"); b.className="opt"; b.textContent=p.nickname+(p.is_bot?" 🤖":"");
-      b.onclick=()=>{ [...box.children].forEach(x=>x.disabled=true); send({type:"secret_vote", player_id:p.player_id}); $("secretStatus").textContent="You voted for "+p.nickname+" — waiting for the others…"; };
+      const b=document.createElement("button"); b.className="opt"; b.innerHTML=nameHtml(p);
+      b.onclick=()=>{ [...box.children].forEach(x=>x.disabled=true); send({type:"secret_vote", player_id:p.player_id}); $("secretStatus").innerHTML="You voted for "+nameHtml(p.player_id)+" — waiting for the others…"; };
       box.appendChild(b); });
     return; }
   if(msg.type==="secret_result"){
@@ -727,9 +1006,9 @@ function handle(msg){
     const iWon = msg.winners.includes(myId);
     // v2.2: no points are shown here — Secret Word points stay hidden
     // until the end_choice standings. Role + word are revealed at end.
-    $("secretReveal").innerHTML="<h3>Reveal!</h3><p>The secret word was <b>"+msg.word+"</b>.</p><p>Impostor"+(msg.impostors.length>1?"s":"")+": <b>"+
-      msg.impostors.map(id=>{const p=room.players.find(q=>q.id===id); return p?p.nickname:id;}).join(", ")+"</b></p><p>"+
-      (msg.eliminated ? "Voted out: <b>"+(room.players.find(q=>q.id===msg.eliminated)||{}).nickname+"</b>. " : "Nobody was voted out (tie). ") +
+    $("secretReveal").innerHTML="<h3>Reveal!</h3><p>The secret word was <b>"+escHtml(msg.word)+"</b>.</p><p>Impostor"+(msg.impostors.length>1?"s":"")+": "+
+      msg.impostors.map(id=>nameHtml(id)).join(", ")+"</p><p>"+
+      (msg.eliminated ? "Voted out: "+nameHtml(msg.eliminated)+". " : "Nobody was voted out (tie). ") +
       (msg.word_team_won ? "The word team caught an impostor!" : "The impostors survived!") +
       "</p><p>"+(iWon ? "🎉 You win!" : "The other side wins this one.")+"</p>";
     return; }
@@ -741,7 +1020,8 @@ function handle(msg){
     // successful play) — but keep the rest, so a rejected play can
     // be fixed instead of re-picked from scratch.
     presSelected=new Set([...presSelected].filter(c=>presHand.includes(c)));
-    $("presTurn").textContent = me ? "👉 Your turn!" : "Waiting for "+(room.players.find(p=>p.id===msg.turn_id)||{}).nickname+"…";
+    $("presTurn").innerHTML = me ? "👉 Your turn!" : "Waiting for "+nameHtml(msg.turn_id)+ "…";
+    renderTurnStrip("presTurnOrder", msg.turn_order, msg.turn_id);
     $("presTrick").textContent = msg.trick
       ? "Current trick: "+msg.trick.cards.join(" ") + " ("+msg.trick.size+" × "+msg.trick.cards[0].slice(0,-1)+")"
       : "New trick — lead with any set of the same rank (1–4 cards).";
@@ -764,18 +1044,17 @@ function handle(msg){
       b.onclick=()=>{ if(!(me || (presExchange && presExchange.giver_id===myId))) return; if(presSelected.has(c)) presSelected.delete(c); else presSelected.add(c); b.classList.toggle("sel"); refreshPresUI(); };
       hand.appendChild(b); });
     $("presCounts").innerHTML = "Cards left: " + Object.entries(msg.counts)
-      .map(([pid,n])=>{const p=room.players.find(q=>q.id===pid); return (p?p.nickname:pid)+" "+n;}).join(" · ");
+      .map(([pid,n])=>nameHtml(pid)+" "+n).join(" · ");
     // v2.2: role badges from the server, and finish titles from the
     // server (the old client titles array was wrong — deleted).
     $("presRoles").innerHTML = msg.roles ? Object.entries(msg.roles)
-      .map(([pid,role])=>{const p=room.players.find(q=>q.id===pid); return (p?p.nickname:pid)+": <b>"+role+"</b>";}).join(" · ") : "";
+      .map(([pid,role])=>nameHtml(pid)+": <b>"+escHtml(role)+"</b>").join(" · ") : "";
     $("presFinished").innerHTML = msg.finished.length ? "<p>Finished: "+msg.finished.map((f,i)=>{
       const pid = (f && typeof f==="object") ? (f.player_id||f.id) : f;
       // v2.2: titles come from the server as a separate {player_id:
       // title} dict (or, defensively, on the finish entry itself).
       const title = (msg.titles && msg.titles[pid]) || ((f && typeof f==="object" && f.title) ? f.title : "");
-      const p=room.players.find(q=>q.id===pid);
-      return (i+1)+". "+(title?title+" — ":"")+(p?p.nickname:pid);}).join(" · ")+"</p>" : "";
+      return (i+1)+". "+(title?escHtml(title)+" — ":"")+nameHtml(pid);}).join(" · ")+"</p>" : "";
     // v2.2: card exchange — the named giver clicks the required number
     // of cards, then confirms. Bots / other humans just wait.
     presExchange = msg.exchange||null;
@@ -785,9 +1064,9 @@ function handle(msg){
       const partner=room.players.find(q=>q.id===presExchange.partner_id);
       ex.classList.remove("hidden");
       if(presExchange.giver_id===myId){
-        $("presExchangeText").textContent="🔄 Exchange: pick "+presExchange.count+" card"+(presExchange.count>1?"s":"")+" to give to "+(partner?partner.nickname:"your partner")+" — click cards in your hand, then confirm.";
+        $("presExchangeText").innerHTML="🔄 Exchange: pick "+presExchange.count+" card"+(presExchange.count>1?"s":"")+" to give to "+nameHtml(partner?partner.id:presExchange.partner_id)+" — click cards in your hand, then confirm.";
       } else {
-        $("presExchangeText").textContent="🔄 Exchange: waiting for "+(giver?giver.nickname:"another player")+" to pick "+presExchange.count+" card"+(presExchange.count>1?"s":"")+".";
+        $("presExchangeText").innerHTML="🔄 Exchange: waiting for "+nameHtml(giver?giver.id:presExchange.giver_id)+" to pick "+presExchange.count+" card"+(presExchange.count>1?"s":"")+".";
       }
     } else ex.classList.add("hidden");
     refreshPresUI();
@@ -798,8 +1077,10 @@ function handle(msg){
     const me = msg.turn_id===myId;
     const oldHand = unoHandCards;
     unoHandCards = msg.hand||[];
+    unoState = msg;
     unoColourChoice=null; unoPlayPending=null; $("unoColourPick").classList.add("hidden");
-    $("unoTurn").textContent = me ? "👉 Your turn!" : "Waiting for "+(room.players.find(p=>p.id===msg.turn_id)||{}).nickname+"…";
+    $("unoTurn").innerHTML = me ? "👉 Your turn!" : "Waiting for "+nameHtml(msg.turn_id)+"…";
+    renderTurnStrip("unoTurnOrder", msg.turn_order || (room && room.turn_order) || null, msg.turn_id);
     $("unoTop").textContent = unoLabel(msg.top);
     $("unoTop").style.color = msg.top && msg.top.startsWith("W") ? "#fff" : (UNO_COLOUR_HEX[msg.top?msg.top[0]:"R"]||"#fff");
     $("unoColour").textContent = UNO_COLOUR_NAMES[msg.current_colour]||msg.current_colour;
@@ -831,10 +1112,12 @@ function handle(msg){
           unoSelectedIdx.add(i); b.classList.add("sel");
         }
         $("unoPlayBtn").disabled = !me || unoSelectedIdx.size===0;
+        refreshUnoHighlights();
       };
       hand.appendChild(b); });
+    refreshUnoHighlights();
     $("unoCounts").innerHTML = "Cards left: " + Object.entries(msg.counts)
-      .map(([pid,n])=>{const p=room.players.find(q=>q.id===pid); return (p?p.nickname:pid)+" "+n;}).join(" · ") +
+      .map(([pid,n])=>nameHtml(pid)+" "+n).join(" · ") +
       (msg.drawn ? " · You drew <b>"+unoLabel(msg.drawn)+"</b> — tap it to play it, or keep it and end your turn." : "");
     $("unoPlayBtn").disabled = !me || unoSelectedIdx.size===0;
     return; }
@@ -866,7 +1149,7 @@ function handle(msg){
     return; }
   if(msg.type==="memory_round_result"){
     clearInterval(memoryTimerInt);
-    const names = ids => ids.map(id=>{const p=room.players.find(q=>q.id===id); return p?p.nickname:id;}).join(", ");
+    const names = ids => ids.map(id=>nameHtml(id)).join(", ");
     $("memoryElim").innerHTML="<p>Round "+msg.round+" ("+msg.digits+" digits): "+
       (msg.survivors.length===1 && msg.survivors[0]===myId ? "🎉 You survived — you win!" :
        msg.eliminated.includes(myId) ? "❌ Wrong number — you're out! (The number was "+msg.numbers[myId]+")" :
@@ -876,9 +1159,28 @@ function handle(msg){
     return; }
   // ---- v2: Elimination ----
   if(msg.type==="elimination_challenge"){
+    // v2.3 (item 14): Group mode carries elimination_mode / elim_phase
+    // / groups ({player_id: group}) on this broadcast. Remember them
+    // for the break display; the intro shows each alive player's group.
+    if(msg.groups) lastElimGroups=msg.groups;
+    if(msg.elimination_mode) lastElimMode=msg.elimination_mode;
+    if(msg.elim_phase) lastElimPhase=msg.elim_phase;
     $("elimBanner").classList.remove("hidden");
-    $("elimBanner").textContent = (msg.finale?"🏁 FINALE — ":"⚔️ Elimination — Challenge "+msg.challenge+" — ") +
-      msg.game_name+" · "+msg.remaining+" players remain: "+msg.alive.join(", ");
+    let aliveHtml;
+    if(lastElimMode==="group" && lastElimGroups){
+      aliveHtml = msg.alive.map(n=>{
+        const p=playerByNick(n);
+        const g = p ? lastElimGroups[p.id] : null;
+        return nameHtml(n)+(g!=null?" "+elimGroupChipHtml(g):"");
+      }).join(", ");
+    } else {
+      aliveHtml = msg.alive.map(n=>nameHtml(n)).join(", ");
+    }
+    const modeTag = lastElimMode==="group"
+      ? " · Group mode: "+elimGroupLabel(0)+" vs "+elimGroupLabel(1)+(lastElimPhase==="black"?" · ⚫ Black Team":"")
+      : "";
+    $("elimBanner").innerHTML = (msg.finale?"🏁 FINALE — ":"⚔️ Elimination — Challenge "+msg.challenge+" — ") +
+      escHtml(msg.game_name)+" · "+msg.remaining+" players remain: "+aliveHtml+modeTag;
     // v2.1: show the game screen for the 4s intro — otherwise the
     // first challenge's intro is invisible (the lobby is still up).
     $("voteBox").classList.add("hidden");
@@ -886,7 +1188,8 @@ function handle(msg){
     return; }
   if(msg.type==="elimination_eliminated"){
     $("elimBanner").classList.remove("hidden");
-    $("elimBanner").textContent = "💀 "+msg.nickname+" is eliminated! "+msg.remaining+" players remain.";
+    $("elimBanner").innerHTML = "💀 "+nameHtml(msg.player_id||msg.nickname)+" is eliminated! "+msg.remaining+" players remain."+
+      (msg.group!=null&&msg.group!==undefined?" ("+elimGroupLabel(msg.group)+")":"");
     return; }
   if(msg.type==="elimination_end_vote" || msg.type==="elimination_end_vote_update"){
     $("elimEndVote").classList.remove("hidden");
@@ -897,6 +1200,7 @@ function handle(msg){
   // ---- v2.2: end-of-game choice (after the end-of-game NEXT vote) ----
   if(msg.type==="end_choice"){
     $("voteBox").classList.add("hidden");
+    clearVoteBox();
     $("elimEndVote").classList.add("hidden");
     replayVoted=false; $("replayAgainBtn").disabled=false; $("replayLobbyBtn").disabled=false;
     $("hostReplayRow").classList.toggle("hidden", !isHost());
@@ -904,11 +1208,18 @@ function handle(msg){
     $("endChoiceStandings").innerHTML =
       (msg.teams ? teamStandingsHtml(msg.teams) : "") +
       "<h3>Final standings</h3><table>"+
-      (msg.rankings||[]).map((r,i)=>"<tr><td>"+(i+1)+"</td><td><span class='chip' style='display:inline-block;background:"+r.colour+"'></span> "+r.nickname+(r.is_bot?" 🤖 BOT":"")+teamBadge(r)+"</td><td>"+(r.score!==undefined?r.score+" pts":"")+"</td></tr>").join("")+"</table>";
+      (msg.rankings||[]).map((r,i)=>"<tr><td>"+(i+1)+"</td><td>"+nameHtml(r)+teamBadge(r)+"</td><td>"+(r.score!==undefined?r.score+" pts":"")+"</td></tr>").join("")+"</table>";
     renderChampHistory($("champTableResults"), msg.champ_history, msg.champ_games);
     $("champDetailsResults").classList.toggle("hidden", !(msg.championship && msg.champ_history && msg.champ_history.length));
     $("champCounterResults").classList.toggle("hidden", !msg.championship);
     if(msg.championship) $("champCounterResults").textContent="🏆 Championship — "+(msg.champ_games||0)+" game"+((msg.champ_games||0)===1?"":"s")+" completed";
+    // v2.3 (item 1): un-hide the choice box — the v2.2 handler filled
+    // the buttons in but never removed "hidden", leaving a dead
+    // standings screen. Nothing re-hides it before the user can
+    // click: the only other hiders are the results handler (runs
+    // before this message) and game_started / renderLobby (a new
+    // game or lobby, after the choice is made).
+    $("endChoice").classList.remove("hidden");
     show("results"); return; }
   if(msg.type==="replay_vote_update"){
     $("replayVoteCount").textContent = msg.votes_again+"/"+msg.votes_needed+" voted Play Again · "+msg.votes_lobby+"/"+msg.votes_needed+" voted Return to Lobby"+
@@ -916,17 +1227,44 @@ function handle(msg){
     return; }
   if(msg.type==="results"){
     clearInterval(quizTimerInt); clearInterval(presTimerInt); $("presTimer").textContent="";
+    clearVoteBox();
     const unit = msg.game==="reaction" ? " ms" : " pts";
     $("teamResults").innerHTML = msg.teams ? teamStandingsHtml(msg.teams) : "";
+    // v2.3 (item 4): Secret Word outcome banner at the top of the
+    // results screen — the word, the impostors, who won, and whether
+    // the viewer won. Carried in results_extra (word, impostors,
+    // word_team_won, winners) via _end_of_game_flow.
+    const sb=$("secretResultsBanner");
+    if(msg.game==="secret" && msg.word){
+      const imps = (msg.impostors||[]).map(id=>nameHtml(id)).join(", ");
+      const iWon = (msg.winners||[]).includes(myId);
+      sb.innerHTML = "<h3>"+(msg.word_team_won ? ("🎉 Citizens win — "+((msg.impostors||[]).length>1 ? "both impostors caught!" : "the impostor was caught!")) : "🕵️ Impostors win!")+"</h3>"+
+        "<p>The secret word was <b>"+escHtml(msg.word)+"</b>"+(msg.category ? " ("+escHtml(msg.category)+")" : "")+"</p>"+
+        (imps ? "<p>Impostor"+((msg.impostors||[]).length>1?"s":"")+": "+imps+"</p>" : "")+
+        "<p><b>"+(iWon ? "🎉 You win!" : "The other side wins this one.")+"</b></p>";
+      sb.classList.remove("hidden");
+    } else { sb.classList.add("hidden"); sb.innerHTML=""; }
     // v2 Elimination: show the finishing order first, then individuals.
     let finishHtml = "";
     if(msg.finishing_order){
-      finishHtml = "<h3>Finishing order</h3><table><tr><th>#</th><th>Player</th><th>Score</th></tr>"+
-        msg.finishing_order.map((r,i)=>"<tr><td>"+(i+1)+"</td><td>"+(i===0?"👑 ":"")+"<span class='chip' style='display:inline-block;background:"+r.colour+"'></span> "+r.nickname+(r.is_bot?" 🤖 BOT":"")+"</td><td>"+r.score+" pts</td></tr>").join("")+"</table>";
+      // v2.3 (item 8): President titles from results_extra.titles.
+      const titles = msg.titles || {};
+      const titleOf = r => titles[r.player_id] || titles[r.id] || "";
+      finishHtml = "<h3>Finishing order</h3><table><tr><th>#</th><th>Player</th><th>Title</th><th>Score</th></tr>"+
+        msg.finishing_order.map((r,i)=>"<tr><td>"+(i+1)+"</td><td>"+(i===0?"👑 ":"")+nameHtml(r)+"</td><td>"+escHtml(titleOf(r))+"</td><td>"+r.score+" pts</td></tr>").join("")+"</table>";
+    } else if(msg.game==="president" && msg.finish_order){
+      // President's results_extra carries finish_order (player ids) +
+      // titles, not finishing_order rows — build the same table from
+      // the ids, with scores looked up in the rankings.
+      const titles = msg.titles || {};
+      const rowFor = pid => (msg.rankings||[]).find(r=>r.player_id===pid) || {player_id:pid, score:0};
+      finishHtml = "<h3>Finishing order</h3><table><tr><th>#</th><th>Player</th><th>Title</th><th>Score</th></tr>"+
+        msg.finish_order.map((pid,i)=>{ const r=rowFor(pid);
+          return "<tr><td>"+(i+1)+"</td><td>"+(i===0?"👑 ":"")+nameHtml(r)+"</td><td>"+escHtml(titles[pid]||"")+"</td><td>"+r.score+" pts</td></tr>"; }).join("")+"</table>";
     }
     $("resultsTable").innerHTML = finishHtml +
       "<h3>Individual scores</h3><table><tr><th>#</th><th>Player</th><th>"+(msg.game==="reaction"?"Avg reaction":"Score")+"</th></tr>"+
-      msg.rankings.map((r,i)=>"<tr><td>"+(i+1)+"</td><td><span class='chip' style='display:inline-block;background:"+r.colour+"'></span> "+r.nickname+(r.is_bot?" 🤖 BOT":"")+teamBadge(r)+"</td><td>"+
+      msg.rankings.map((r,i)=>"<tr><td>"+(i+1)+"</td><td>"+nameHtml(r)+teamBadge(r)+"</td><td>"+
         (msg.game==="reaction" ? (r.avg_ms==null?"— (all false starts)":r.avg_ms+unit+" (best "+r.best_ms+")") : (msg.scores_hidden ? "hidden until the end vote" : r.score+unit)) +
         (r.cards_left!==undefined ? " · "+r.cards_left+" cards left" : "") + "</td></tr>").join("")+"</table>";
     // v2: the Elimination end vote is shown by its own messages; hide
@@ -987,6 +1325,10 @@ function renderLobby(){
   $("setUnoStacking").checked=!!(gs.uno&&gs.uno.stacking);
   $("setUnoMulti").checked=!!(gs.uno&&gs.uno.multi_play);
   $("setSecretImpostors").value=String((gs.secret&&gs.secret.impostors)||1);
+  // v2.3 (item 14): Elimination group assignment + general Teams
+  // tap-to-move columns (both re-rendered from the lobby payload).
+  renderElimGroups();
+  renderTeamAssignCols();
   // v2.2: championship counter + collapsible history tab (everyone).
   const champOn=!!room.championship;
   $("champCounter").classList.toggle("hidden", !champOn);
@@ -1000,13 +1342,22 @@ function renderLobby(){
     const d=document.createElement("div"); d.className="player";
     d.style.borderColor=p.colour; d.style.background=p.colour+"22";
     const editable = p.id===myId || (p.is_bot && host);
-    const roleBadge = (room.game==="president" && room.president_roles && room.president_roles[p.id])
-      ? " <span class='role-badge'>"+room.president_roles[p.id]+"</span>" : "";
+    // v2.3 (item 14): lobby role badges — a SMALL slot on every card:
+    // filled with the player's President role when the room has one,
+    // otherwise a GREYED-OUT empty slot. Secret Word roles are never
+    // shown (they would reveal the impostor). When Elimination is the
+    // selected game, team affiliation AND role badges are hidden
+    // entirely until a normal game is picked again.
+    const isElimGame = room.game==="elimination";
+    const presRole = (!isElimGame && room.president_roles) ? room.president_roles[p.id] : null;
+    const roleBadgeHtml = isElimGame ? "" : (presRole
+      ? " <span class='role-badge'>"+escHtml(presRole)+"</span>"
+      : " <span class='role-badge role-empty' title='No role yet'>—</span>");
     const top=document.createElement("div"); top.className="pcard-top";
     top.innerHTML="<span class='chip' style='background:"+p.colour+"'></span><b>"+p.nickname+"</b>"+
       (p.is_host?" <span class='crown'>👑</span>":"")+(p.is_bot?" <span class='badge'>BOT</span>":"")+
       (p.is_bot?" <span class='muted'>"+p.difficulty+"</span>":"")+(p.connected===false?" <span class='muted'>(disconnected)</span>":"")+
-      teamBadge(p)+roleBadge;
+      (isElimGame ? "" : teamBadge(p))+roleBadgeHtml;
     d.appendChild(top);
     // v1.2: host can kick any human player (not themselves) from the lobby.
     if(host && !p.is_bot && p.id!==myId){
@@ -1014,16 +1365,9 @@ function renderLobby(){
       k.onclick=(e)=>{ e.stopPropagation(); if(confirm("Kick "+p.nickname+" from the room?")) send({type:"kick_player", player_id:p.id}); };
       d.appendChild(k);
     }
-    // v1.2: host assigns teams with a per-player dropdown (Teams mode).
-    if(host && room.mode==="teams"){
-      const s=document.createElement("select"); s.className="team-select";
-      const opt0=document.createElement("option"); opt0.value="alone"; opt0.textContent="Alone"; s.appendChild(opt0);
-      for(let t=0;t<room.team_count;t++){ const o=document.createElement("option"); o.value=String(t); o.textContent=TEAM_NAMES[t]; s.appendChild(o); }
-      s.value = (p.team==null||p.team===undefined) ? "alone" : String(p.team);
-      s.onchange=()=>send({type:"assign_team", player_id:p.id, team: s.value==="alone"?null:parseInt(s.value)});
-      s.onclick=(e)=>e.stopPropagation();
-      d.appendChild(s);
-    }
+    // v2.3 (item 14): the per-card team <select> is gone — team
+    // assignment is now the tap-to-move columns in the host settings
+    // area (renderTeamAssignCols), same design as the group columns.
     if(editable){
       d.style.cursor="pointer";
       d.onclick=()=>{ expandedCardId = expandedCardId===p.id ? null : p.id; renderLobby(); };
@@ -1128,11 +1472,19 @@ $("addBotBtn").onclick=()=>send({type:"add_bot"});
 $("settingsBtn").onclick=()=>{ $("settingsPanel").classList.toggle("hidden"); };
 $("startBtn").onclick=()=>{ pushSettings(); send({type:"start_game"}); };
 function pushSettings(){
+  // v2.3 (item 16): Elimination auto-switches Teams OFF — the mode
+  // select is flipped to FFA here (and by the game-picker listener
+  // below) so the update_settings message itself carries mode "ffa".
+  if($("setGame").value==="elimination" && $("setMode").value!=="ffa"){
+    $("setMode").value="ffa";
+    $("teamSettings").classList.add("hidden");
+  }
   // v2.2: actually send the UNO + Secret settings (today it sent none
   // of them) plus turn order mode, team scoring and championship.
   const msg={type:"update_settings", room_name:$("setRoomName").value.trim(), max_players:parseInt($("setMaxPlayers").value),
     game:$("setGame").value, mode:$("setMode").value, team_count:parseInt($("setTeamCount").value),
     turn_order_mode:$("setTurnOrderMode").value, team_scoring:$("setTeamScoring").value, championship:$("setChampionship").checked,
+    elimination_mode:$("setElimMode").value,
     game_settings:{ reaction:{rounds:parseInt($("setReactionRounds").value)},
       math:{difficulty:$("setMathDiff").value, questions:parseInt($("setMathQ").value), time_per_question:parseInt($("setMathTime").value)},
       trivia:{category:$("setTriviaCat").value, difficulty:$("setTriviaDiff").value, questions:parseInt($("setTriviaQ").value), time_per_question:parseInt($("setTriviaTime").value)},
@@ -1149,6 +1501,55 @@ function pushSettings(){
 // Switching to Manual shows the order editor at once (the server echo
 // re-renders the lobby too, but don't wait for it).
 $("setTurnOrderMode").addEventListener("change", ()=>{ $("turnOrderEditor").classList.toggle("hidden", $("setTurnOrderMode").value!=="manual"); renderTurnOrderList(); });
+// v2.3 (item 16): picking Elimination flips the party-mode UI to FFA
+// at once; pushSettings (also fired by this change) sends mode "ffa".
+// v2.3 (item 14): picking Elimination REMEMBERS the current Teams
+// setting (mode + team count, from the last lobby echo) so it can be
+// restored when the host picks a normal game again — the server keeps
+// room.teams intact throughout, and only the mode is forced to FFA.
+// Remember only on the transition INTO Elimination (room.game is still
+// the old game until the echo arrives); restore only on the transition
+// OUT of it. pushSettings fires before this listener, so the restore
+// sends a second update_settings with the restored mode.
+$("setGame").addEventListener("change", ()=>{
+  const newGame=$("setGame").value;
+  if(newGame==="elimination"){
+    if(room && room.game!=="elimination"){
+      prevTeamsSetting={mode: room.mode||"ffa", team_count: room.team_count||2};
+      try{ sessionStorage.setItem("pgh_prev_teams", JSON.stringify(prevTeamsSetting)); }catch(e){}
+    }
+    $("setMode").value="ffa"; $("teamSettings").classList.add("hidden");
+  } else if(room && room.game==="elimination"){
+    let prev=prevTeamsSetting;
+    if(!prev){ try{ prev=JSON.parse(sessionStorage.getItem("pgh_prev_teams")||"null"); }catch(e){} }
+    if(prev && prev.mode){
+      $("setMode").value=prev.mode; $("setTeamCount").value=String(prev.team_count||2);
+      $("teamSettings").classList.toggle("hidden", prev.mode!=="teams");
+      pushSettings();
+      try{ sessionStorage.removeItem("pgh_prev_teams"); }catch(e){}
+      prevTeamsSetting=null;
+    }
+  }
+});
+// v2.3 (item 14): Elimination mode picker — sends elimination_mode via
+// update_settings (plus the current groups map when switching to Group).
+$("setElimMode").addEventListener("change", ()=>{
+  const mode=$("setElimMode").value;
+  const m={type:"update_settings", elimination_mode:mode};
+  if(mode==="group") m.elim_groups=currentElimGroups();
+  send(m);
+  $("elimGroupAssign").classList.toggle("hidden", mode!=="group");
+  updateElimModeNote();
+});
+// v2.3 (item 14): balanced random split — shuffle, then alternate
+// Red/Blue so the groups differ by at most 1. Sends the full map.
+$("randomElimGroupsBtn").onclick=()=>{
+  if(!room) return;
+  const ids=room.players.map(p=>p.id);
+  for(let i=ids.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); const t=ids[i]; ids[i]=ids[j]; ids[j]=t; }
+  const map={}; ids.forEach((id,i)=>{ map[id]=i%2; });
+  send({type:"update_settings", elimination_mode:"group", elim_groups:map});
+};
 $("randomTeamsBtn").onclick=()=>send({type:"randomize_teams"});
 $("hostSkipBtn").onclick=()=>{ $("hostSkipBtn").disabled=true; send({type:"host_skip"}); };
 $("reactionArea").onclick=()=>{ if(reactionClicked)return; reactionClicked=true; send({type:"reaction_click"}); };
@@ -1196,7 +1597,9 @@ $("presExchangeBtn").onclick=()=>{ if(!presExchange || presExchange.giver_id!==m
 // selection opens the colour picker, picked once per play.
 $("unoPlayBtn").onclick=()=>{
   if(!unoSelectedIdx.size) return;
-  const cards=[...unoSelectedIdx].sort((a,b)=>a-b).map(i=>unoHandCards[i]);
+  // v2.3 (item 6): preserve CLICK order — do NOT sort by hand index.
+  // The server reorders so a top-matching card leads.
+  const cards=[...unoSelectedIdx].map(i=>unoHandCards[i]);
   if(cards.some(c=>c.startsWith("W")) && !unoColourChoice){
     unoPlayPending=cards; $("unoColourPick").classList.remove("hidden");
     $("gameErr").textContent="Pick a colour for the Wild card.";
