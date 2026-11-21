@@ -108,9 +108,20 @@
      order, current player highlighted. Compact for phones; no
      customization controls mid-game. */
   .turn-strip { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
-  .turn-card { display: inline-flex; align-items: center; gap: 5px; padding: 4px 9px; border-radius: 16px; background: #1e1e2e; border: 2px solid transparent; font-size: .85rem; font-weight: 700; white-space: nowrap; }
+  .turn-card { display: inline-flex; align-items: center; gap: 5px; padding: 4px 9px; border-radius: 16px; background: #1e1e2e; border: 2px solid transparent; font-size: .85rem; font-weight: 700; white-space: nowrap; transition: transform .15s ease, outline-color .15s ease; }
   .turn-card .chip { width: 14px; height: 14px; }
-  .turn-card.current { border-color: #f1c40f; box-shadow: 0 0 0 1px #f1c40f; }
+  .turn-card .turn-count { font-size: .8rem; color: #bbb; }
+  /* v2.4 (item 2): the turn indicator is a yellow ring OUTSIDE the
+     card (outline + slight scale) so the player's colour border
+     stays visible. */
+  .turn-card.current { outline: 3px solid #f1c40f; outline-offset: 3px; transform: scale(1.08); position: relative; z-index: 1; }
+  /* v2.4 (item 4): Elimination ceremony rows + drop animation. */
+  #ceremony h2 { text-align: center; letter-spacing: 2px; }
+  .ceremony-row { display: flex; align-items: center; gap: 8px; padding: 8px 10px; margin: 4px 0; background: #1e1e2e; border-radius: 8px; border: 2px solid #555; font-weight: 700; }
+  .ceremony-row.dropping { animation: ceremonyDrop .8s ease-in forwards; }
+  @keyframes ceremonyDrop { to { transform: translateY(48px) scale(.85); opacity: 0; } }
+  .ceremony-row.pile-row { border-color: #e74c3c; background: #2c1a1a; }
+  .ceremony-banner { background: #1e1e2e; border: 2px solid #f1c40f; border-radius: 8px; padding: 10px; margin: 10px 0; text-align: center; font-weight: 700; }
   /* v2.3: UNO playable-card highlighting — same green edge as
      President's playable highlight; unplayable cards dimmed. */
   .uno-card.playable { border-color: #2ecc71; box-shadow: 0 0 0 2px #2ecc71; }
@@ -325,7 +336,6 @@
         <p id="presExchangeText" style="font-weight:700"></p>
         <button id="presExchangeBtn" class="green">Give selected cards</button>
       </div>
-      <div id="presCounts" class="muted"></div>
       <div id="presFinished"></div>
     </div>
     <div id="unoBox" class="hidden">
@@ -344,7 +354,6 @@
           <button data-colour="Y" style="background:#b7950b">Yellow</button>
         </div>
       </div>
-      <div id="unoCounts" class="muted"></div>
     </div>
     <div id="memoryBox" class="hidden">
       <p id="memoryStatus" style="font-weight:800;text-align:center"></p>
@@ -407,6 +416,22 @@
       <p class="muted">At least half the players must agree. If nobody decides in 60s, we go back to the lobby.</p>
     </div>
   </div>
+
+  <!-- v2.4: Elimination ceremony — staged, dramatic elimination page.
+       Shown by elimination_ceremony messages; hidden again by the
+       next vote_break / game_started / results / lobby. No literal
+       Gordon Ramsay character — the drama is in the wording. -->
+  <div id="ceremony" class="card hidden">
+    <h2>💀 ELIMINATION</h2>
+    <p id="ceremonySub" class="muted" style="text-align:center"></p>
+    <div id="ceremonyList"></div>
+    <h3>💀 Eliminated pile</h3>
+    <div id="ceremonyPile"></div>
+    <div id="ceremonyBanners"></div>
+    <p id="ceremonyVoteCount" class="muted">0/0 voted NEXT</p>
+    <div class="row"><button id="ceremonyNextBtn" class="green">SKIP →</button>
+    <button id="ceremonyHostSkipBtn" class="hostskip hidden">HOST: Skip →</button></div>
+  </div>
 </div>
 
 <script>
@@ -437,6 +462,8 @@ let expandedCardId=null, replayVoted=false, secretEliminated=false, presExchange
 let prevTeamsSetting=null;
 try{ prevTeamsSetting=JSON.parse(sessionStorage.getItem("pgh_prev_teams")||"null"); }catch(e){}
 let lastElimGroups=null, lastElimMode="normal", lastElimPhase=null;
+// v2.4 (item 4): ceremony vote state — one NEXT vote per stage.
+let ceremonyVoted=false, ceremonyTimeout=4;
 // ---- v2.1 President: client-side legality (mirrors the server rule) ----
 // A single higher card does NOT beat a pair — the set must match the
 // trick's size AND be a higher rank. The UI explains that instead of
@@ -492,7 +519,7 @@ function refreshPresUI(){
 }
 
 function $(id){return document.getElementById(id);}
-function show(id){["home","lobby","game","results"].forEach(s=>$(s).classList.toggle("hidden", s!==id));}
+function show(id){["home","lobby","game","results","ceremony"].forEach(s=>$(s).classList.toggle("hidden", s!==id));}
 // v1.2: `disabled` is a Set of colours already taken in the room —
 // those swatches are greyed out and unclickable, so no two players
 // or bots can end up with the same colour.
@@ -536,20 +563,24 @@ function nameHtml(p){
 }
 // v2.3: turn-order strip — small coloured player cards in rotation
 // order, current player highlighted. No customization controls.
-function turnStripHtml(order, turnId){
+// v2.4 (item 1): optional `counts` ({player_id: cards in hand}) —
+// each card shows its count; v2.4 (item 2): the current card keeps
+// the player's colour border (the yellow ring is an outline in CSS).
+function turnStripHtml(order, turnId, counts){
   if(!order || !order.length) return "";
   return order.map(id=>{ const p=playerById(id); if(!p) return "";
     const cur = id===turnId;
-    return "<span class='turn-card"+(cur?" current":"")+"' style='border-color:"+(cur?"#f1c40f":p.colour)+"'><span class='chip' style='background:"+p.colour+"'></span><span style='color:"+p.colour+"'>"+escHtml(p.nickname)+"</span>"+(p.is_bot?" 🤖":"")+(cur?" 👉":"")+"</span>";
+    const cnt = (counts && counts[id]!=null && counts[id]!==undefined) ? "<span class='turn-count'>"+counts[id]+" 🃏</span>" : "";
+    return "<span class='turn-card"+(cur?" current":"")+"' style='border-color:"+p.colour+"'><span class='chip' style='background:"+p.colour+"'></span><span style='color:"+p.colour+"'>"+escHtml(p.nickname)+"</span>"+(p.is_bot?" 🤖":"")+cnt+(cur?" 👉":"")+"</span>";
   }).join("");
 }
-function renderTurnStrip(elId, order, turnId){
+function renderTurnStrip(elId, order, turnId, counts){
   const el=$(elId); if(!el) return;
   // Remember the last known order so messages that carry only the
   // current player (e.g. secret_clue_turn on the pre-v2.3 server)
   // can still show the strip.
   if(order && order.length) lastTurnOrder = order.slice();
-  el.innerHTML = turnStripHtml(order || lastTurnOrder, turnId);
+  el.innerHTML = turnStripHtml(order || lastTurnOrder, turnId, counts);
 }
 // v2.3 (item 14): Group Elimination helpers. Group ids: 0 = Red,
 // 1 = Blue, 2 = Black (final 5). The server sends elimination_mode /
@@ -650,6 +681,99 @@ function renderTeamAssignCols(){
     row.appendChild(t);
     alone.forEach(p=>row.appendChild(mkChip(p,0)));
     box.appendChild(row);
+  }
+}
+// v2.4 (item 4): Elimination ceremony rendering. One row per
+// player in the challenge ranking (best first), with challenge
+// points + running tally + group chip when the server sends them.
+// `exclude` is a set of player ids already in the eliminated pile
+// (used when rebuilding the list after a missed list stage).
+function ceremonyRowHtml(r, i){
+  const pid = (r && typeof r==="object") ? (r.player_id||r.id) : r;
+  const row = (r && typeof r==="object") ? r : {};
+  return "<div class='ceremony-row' data-pid='"+escHtml(pid)+"'><span>"+(i+1)+".</span>"+nameHtml(row.player_id?row:pid)+
+    (row.score!==undefined&&row.score!==null?" <span class='muted'>"+row.score+" pts</span>":"")+
+    (row.tally!==undefined&&row.tally!==null?" <span class='muted'>· tally "+row.tally+"</span>":"")+
+    (row.group!=null&&row.group!==undefined?" "+elimGroupChipHtml(row.group):"")+"</div>";
+}
+function ceremonyListHtml(ranking, exclude){
+  return (ranking||[]).map((r,i)=>({r,i})).filter(({r})=>{
+    const pid=(r&&typeof r==="object")?(r.player_id||r.id):r;
+    return !exclude || !exclude.has(pid);
+  }).map(({r,i})=>ceremonyRowHtml(r,i)).join("");
+}
+function ceremonyPileHtml(pile){
+  return (pile&&pile.length) ? pile.map(id=>"<div class='ceremony-row pile-row'>💀 "+nameHtml(id)+"</div>").join("")
+    : "<p class='muted'>Nobody yet — the first victim drops here.</p>";
+}
+function renderCeremony(msg){
+  const listEl=$("ceremonyList"), pileEl=$("ceremonyPile"), banEl=$("ceremonyBanners");
+  $("ceremonySub").textContent = "Challenge "+(msg.challenge||"")+" · "+
+    (msg.elimination_mode==="group"?"Group Elimination":"Normal Elimination")+
+    (msg.elim_phase ? " · "+msg.elim_phase : "");
+  // Each stage is a fresh NEXT vote (the server cleans the vote keys
+  // up after every stage), so re-arm the button per stage.
+  ceremonyVoted=false; $("ceremonyNextBtn").disabled=false;
+  $("ceremonyHostSkipBtn").classList.toggle("hidden", !isHost());
+  $("ceremonyHostSkipBtn").disabled=false;
+  if(msg.votes!==undefined && msg.votes_needed!==undefined){
+    ceremonyTimeout = msg.timeout||4;
+    $("ceremonyVoteCount").textContent = msg.votes+"/"+msg.votes_needed+" voted NEXT — auto-advances in "+ceremonyTimeout+"s";
+  }
+  if(msg.stage==="list"){
+    // Fresh page: the ordered list from the challenge result, the
+    // pile of players eliminated in earlier challenges, banners
+    // cleared for this ceremony.
+    listEl.innerHTML = ceremonyListHtml(msg.ranking, null);
+    pileEl.innerHTML = ceremonyPileHtml(msg.eliminated_pile);
+    banEl.innerHTML="";
+  } else if(msg.stage==="drop"){
+    const victimId = msg.eliminated && (msg.eliminated.player_id||msg.eliminated.id||(typeof msg.eliminated==="string"?msg.eliminated:null));
+    // If we never saw the list stage (e.g. a reconnect), rebuild the
+    // list from the ranking — victim included, so there is a row to
+    // drop — and the pile from everyone already out except the victim.
+    // (An empty ranking must not wipe a list we already rendered.)
+    if(!listEl.children.length && msg.ranking && msg.ranking.length){
+      listEl.innerHTML = ceremonyListHtml(msg.ranking, null);
+      pileEl.innerHTML = ceremonyPileHtml((msg.eliminated_pile||[]).filter(id=>id!==victimId));
+    }
+    if(victimId){
+      let row=null;
+      [...listEl.children].forEach(el=>{ if(el.dataset && el.dataset.pid===victimId) row=el; });
+      if(row){
+        row.classList.add("dropping");
+        setTimeout(()=>{
+          row.remove();
+          const ph=pileEl.querySelector(".muted");
+          if(ph) ph.remove();
+          const pr=document.createElement("div");
+          pr.className="ceremony-row pile-row";
+          pr.innerHTML="💀 "+nameHtml(victimId);
+          pileEl.appendChild(pr);
+        }, 850);
+      }
+    }
+  } else if(msg.stage==="merge"){
+    // Rebuild the list/pile if we joined mid-ceremony: the victim is
+    // already in the pile by now.
+    if(!listEl.children.length && msg.ranking && msg.ranking.length){
+      listEl.innerHTML = ceremonyListHtml(msg.ranking, new Set(msg.eliminated_pile||[]));
+      pileEl.innerHTML = ceremonyPileHtml(msg.eliminated_pile);
+    }
+    if(msg.merged_to_black){
+      banEl.innerHTML += "<p class='ceremony-banner'>⚫ <b>Final 5 — merged into the Black Team!</b><br>No more Red. No more Blue. One team now — survive or go home.</p>";
+    }
+  } else if(msg.stage==="transfer"){
+    if(!listEl.children.length && msg.ranking && msg.ranking.length){
+      listEl.innerHTML = ceremonyListHtml(msg.ranking, new Set(msg.eliminated_pile||[]));
+      pileEl.innerHTML = ceremonyPileHtml(msg.eliminated_pile);
+    }
+    if(msg.transfers && msg.transfers.length){
+      banEl.innerHTML += "<p class='ceremony-banner'>"+msg.transfers.map(t=>{
+        const nm=t.nickname||((playerById(t.player_id)||{}).nickname)||"?";
+        return "🔀 <b>"+escHtml(nm)+"</b> moved "+elimGroupLabel(t.from)+" → "+elimGroupLabel(t.to)+" to rebalance the groups";
+      }).join("<br>")+"</p>";
+    }
   }
 }
 // v2.3 (item 10): reset the shared NEXT-vote box so no stale vote
@@ -828,9 +952,9 @@ function handle(msg){
     $("secretClues").innerHTML=""; $("secretReveal").innerHTML=""; $("secretPrivate").textContent=""; $("secretStatus").textContent="";
     $("secretLists").innerHTML=""; $("secretRoundResults").innerHTML=""; secretEliminated=false;
     $("secretClueArea").classList.add("hidden"); $("secretVoteArea").classList.add("hidden");
-    $("presHand").innerHTML=""; $("presCounts").innerHTML=""; $("presFinished").innerHTML=""; presSelected=new Set(); $("presNotice").textContent=""; $("presHint").textContent=""; clearInterval(presTimerInt); $("presTimer").textContent="";
+    $("presHand").innerHTML=""; $("presFinished").innerHTML=""; presSelected=new Set(); $("presNotice").textContent=""; $("presHint").textContent=""; clearInterval(presTimerInt); $("presTimer").textContent="";
     $("presRoles").innerHTML=""; $("presExchange").classList.add("hidden"); presExchange=null;
-    $("unoHand").innerHTML=""; $("unoCounts").innerHTML=""; $("unoPending").textContent=""; unoSelectedIdx=new Set(); unoHandCards=[]; unoColourChoice=null; unoPlayPending=null; $("unoColourPick").classList.add("hidden");
+    $("unoHand").innerHTML=""; $("unoPending").textContent=""; unoSelectedIdx=new Set(); unoHandCards=[]; unoColourChoice=null; unoPlayPending=null; $("unoColourPick").classList.add("hidden");
     drawMemoryNumber(""); $("memoryElim").innerHTML=""; memoryAnswered=false; clearInterval(memoryTimerInt);
     $("voteBox").classList.add("hidden"); clearVoteBox();
     $("secretResultsBanner").classList.add("hidden"); $("secretResultsBanner").innerHTML="";
@@ -864,6 +988,7 @@ function handle(msg){
     return; }
   if(msg.type==="pong"){ return; }
   if(msg.type==="vote_break"){ votedNext=false; voteIndex=msg.index;
+    $("ceremony").classList.add("hidden"); // v2.4: the ceremony ends here
     $("voteBox").classList.remove("hidden"); $("nextBtn").disabled=false;
     $("hostSkipBtn").classList.toggle("hidden", !isHost());
     $("hostSkipBtn").disabled=false;
@@ -899,7 +1024,17 @@ function handle(msg){
         }).join("<br>")+"</p>";
       }
       if(msg.merged_to_black) groupHtml+="<p><b>⚫ Final 5 — merged into the Black Team!</b></p>";
-      $("voteScores").innerHTML="<h3>Challenge ranking</h3><table>"+rankRows+"</table>"+groupHtml+
+      // v2.4 (item 3): the running tally the server now sends on the
+      // break scores — alive players only, sorted by tally desc.
+      // The challenge ranking above stays exactly as it was.
+      let tallyHtml="";
+      if(msg.scores && msg.scores.some(s=>s.tally!==undefined&&s.tally!==null)){
+        const elimIds=new Set((msg.eliminated||[]).map(n=>{ const p=playerById(n)||playerByNick(n); return p?p.id:null; }).filter(Boolean));
+        const aliveRows=[...msg.scores].filter(s=>!elimIds.has(s.player_id));
+        const rows=(aliveRows.length?aliveRows:[...msg.scores]).sort((a,b)=>(b.tally||0)-(a.tally||0));
+        tallyHtml="<h3>Running tally</h3><table>"+rows.map(s=>"<tr><td>"+nameHtml(s)+"</td><td><b>"+s.tally+"</b> pts</td></tr>").join("")+"</table>";
+      }
+      $("voteScores").innerHTML="<h3>Challenge ranking</h3><table>"+rankRows+"</table>"+tallyHtml+groupHtml+
         (msg.finishing && msg.finishing.length ? "<p class='muted'>Out so far: "+msg.finishing.map(n=>nameHtml(n)).join(" → ")+"</p>" : "");
     } else if(msg.end_of_game){
       // v2.2 end-of-game NEXT vote: a ready gate before the Play Again /
@@ -915,16 +1050,26 @@ function handle(msg){
       $("voteHeading").textContent="Take a breather — scores above ☝️";
       $("nextBtn").textContent="NEXT QUESTION →";
       $("hostSkipBtn").textContent="HOST: Skip to next question →";
+      // v2.4 (item 3): during an Elimination challenge the per-round
+      // break rows carry a running `tally` — show it next to the
+      // challenge score when the server sends it.
+      const hasTally = msg.scores && msg.scores.some(s=>s.tally!==undefined&&s.tally!==null);
       $("voteScores").innerHTML = msg.scores ? "<table>"+
         [...msg.scores].sort((a,b)=>b.score-a.score)
-          .map(s=>"<tr><td>"+nameHtml(s)+teamBadge(s)+"</td><td>"+s.score+"</td></tr>").join("")+"</table>" : "";
+          .map(s=>"<tr><td>"+nameHtml(s)+teamBadge(s)+"</td><td>"+s.score+"</td>"+(hasTally?"<td class='muted'>"+(s.tally!==undefined&&s.tally!==null?"tally "+s.tally:"")+"</td>":"")+"</tr>").join("")+"</table>" : "";
     }
     $("voteLabel").textContent = msg.label ? "Round: "+msg.label : (msg.end_of_game ? "End-of-game vote" : "");
     $("voteTeams").innerHTML = msg.teams ? teamStandingsHtml(msg.teams) : "";
     $("voteCount").textContent=msg.votes+"/"+msg.votes_needed+" voted NEXT"+(msg.timeout ? " — auto-advances at "+msg.timeout+"s" : "");
     return; }
   if(msg.type==="vote_update"){ $("voteCount").textContent=msg.votes+"/"+msg.votes_needed+" voted NEXT";
-    if(msg.host_skipped){ $("hostSkipBtn").disabled=true; $("hostSkipBtn").textContent="Host skipped ahead →"; }
+    // v2.4: the ceremony page shows the same NEXT vote — keep its
+    // count in step (the auto-advance seconds are the last ones the
+    // ceremony stage sent; vote_update carries no timeout).
+    if(!$("ceremony").classList.contains("hidden")){
+      $("ceremonyVoteCount").textContent=msg.votes+"/"+msg.votes_needed+" voted NEXT — auto-advances in "+ceremonyTimeout+"s";
+    }
+    if(msg.host_skipped){ $("hostSkipBtn").disabled=true; $("hostSkipBtn").textContent="Host skipped ahead →"; $("ceremonyHostSkipBtn").disabled=true; }
     return; }
   if(msg.type==="question_result"){
     clearInterval(quizTimerInt);
@@ -1021,7 +1166,7 @@ function handle(msg){
     // be fixed instead of re-picked from scratch.
     presSelected=new Set([...presSelected].filter(c=>presHand.includes(c)));
     $("presTurn").innerHTML = me ? "👉 Your turn!" : "Waiting for "+nameHtml(msg.turn_id)+ "…";
-    renderTurnStrip("presTurnOrder", msg.turn_order, msg.turn_id);
+    renderTurnStrip("presTurnOrder", msg.turn_order, msg.turn_id, msg.counts);
     $("presTrick").textContent = msg.trick
       ? "Current trick: "+msg.trick.cards.join(" ") + " ("+msg.trick.size+" × "+msg.trick.cards[0].slice(0,-1)+")"
       : "New trick — lead with any set of the same rank (1–4 cards).";
@@ -1043,8 +1188,9 @@ function handle(msg){
       // is not their "turn" in the trick sense.
       b.onclick=()=>{ if(!(me || (presExchange && presExchange.giver_id===myId))) return; if(presSelected.has(c)) presSelected.delete(c); else presSelected.add(c); b.classList.toggle("sel"); refreshPresUI(); };
       hand.appendChild(b); });
-    $("presCounts").innerHTML = "Cards left: " + Object.entries(msg.counts)
-      .map(([pid,n])=>nameHtml(pid)+" "+n).join(" · ");
+    // v2.4 (item 1): card counts now live on the turn-order strip
+    // above (renderTurnStrip with msg.counts) — the separate
+    // presCounts list is deleted.
     // v2.2: role badges from the server, and finish titles from the
     // server (the old client titles array was wrong — deleted).
     $("presRoles").innerHTML = msg.roles ? Object.entries(msg.roles)
@@ -1080,14 +1226,18 @@ function handle(msg){
     unoState = msg;
     unoColourChoice=null; unoPlayPending=null; $("unoColourPick").classList.add("hidden");
     $("unoTurn").innerHTML = me ? "👉 Your turn!" : "Waiting for "+nameHtml(msg.turn_id)+"…";
-    renderTurnStrip("unoTurnOrder", msg.turn_order || (room && room.turn_order) || null, msg.turn_id);
+    renderTurnStrip("unoTurnOrder", msg.turn_order || (room && room.turn_order) || null, msg.turn_id, msg.counts);
     $("unoTop").textContent = unoLabel(msg.top);
     $("unoTop").style.color = msg.top && msg.top.startsWith("W") ? "#fff" : (UNO_COLOUR_HEX[msg.top?msg.top[0]:"R"]||"#fff");
     $("unoColour").textContent = UNO_COLOUR_NAMES[msg.current_colour]||msg.current_colour;
     $("unoDir").textContent = "· Direction: "+(msg.direction===1?"→ clockwise":"← counter-clockwise");
     $("unoDrawBtn").disabled = !me;
     $("unoDrawBtn").textContent = (msg.pending_draw && msg.pending_draw>0) ? "Draw +"+msg.pending_draw+" (take it)" : "Draw a card";
-    $("unoPending").textContent = (msg.pending_draw && msg.pending_draw>0) ? "+"+msg.pending_draw+" — stack or take" : "";
+    // v2.4 (item 1): the drawn-card notice used to live in the
+    // deleted unoCounts list — it now lives in the UNO status area
+    // (unoPending), next to the pending-draw notice.
+    $("unoPending").innerHTML = (msg.pending_draw && msg.pending_draw>0 ? "+"+msg.pending_draw+" — stack or take" : "") +
+      (msg.drawn ? ((msg.pending_draw&&msg.pending_draw>0?" · ":"")+"You drew <b>"+unoLabel(msg.drawn)+"</b> — tap it to play it, or keep it and end your turn.") : "");
     $("unoEndTurnBtn").classList.toggle("hidden", !(me && msg.drawn));
     // Drop selections for cards no longer in hand. A selection survives
     // only when the same card is still at the same index (e.g. the
@@ -1116,9 +1266,9 @@ function handle(msg){
       };
       hand.appendChild(b); });
     refreshUnoHighlights();
-    $("unoCounts").innerHTML = "Cards left: " + Object.entries(msg.counts)
-      .map(([pid,n])=>nameHtml(pid)+" "+n).join(" · ") +
-      (msg.drawn ? " · You drew <b>"+unoLabel(msg.drawn)+"</b> — tap it to play it, or keep it and end your turn." : "");
+    // v2.4 (item 1): card counts now live on the turn-order strip
+    // above (renderTurnStrip with msg.counts) — the separate
+    // unoCounts list is deleted.
     $("unoPlayBtn").disabled = !me || unoSelectedIdx.size===0;
     return; }
   // ---- v2.2: Memory (number on a <canvas>, no text node in the DOM) ----
@@ -1191,6 +1341,10 @@ function handle(msg){
     $("elimBanner").innerHTML = "💀 "+nameHtml(msg.player_id||msg.nickname)+" is eliminated! "+msg.remaining+" players remain."+
       (msg.group!=null&&msg.group!==undefined?" ("+elimGroupLabel(msg.group)+")":"");
     return; }
+  // ---- v2.4 (item 4): Elimination ceremony — staged, dramatic.
+  // One message per stage, in order: list → drop → (merge | transfer).
+  // Earlier stages stay visible: the list stays, the pile grows.
+  if(msg.type==="elimination_ceremony"){ show("ceremony"); renderCeremony(msg); return; }
   if(msg.type==="elimination_end_vote" || msg.type==="elimination_end_vote_update"){
     $("elimEndVote").classList.remove("hidden");
     $("elimHostRow").classList.toggle("hidden", !isHost());
@@ -1579,6 +1733,11 @@ $("hostReplayLobbyBtn").onclick=()=>send({type:"host_replay", choice:"lobby"});
 $("elimForceAgainBtn").onclick=()=>send({type:"host_replay", choice:"again"});
 $("elimForceLobbyBtn").onclick=()=>send({type:"host_replay", choice:"lobby"});
 $("nextBtn").onclick=()=>{ if(votedNext) return; votedNext=true; $("nextBtn").disabled=true; send({type:"vote_next", index:voteIndex}); };
+// v2.4 (item 4): the ceremony NEXT button sends vote_next with NO
+// index (the server skips its index check when none is sent). One
+// vote per stage — re-armed by each elimination_ceremony message.
+$("ceremonyNextBtn").onclick=()=>{ if(ceremonyVoted) return; ceremonyVoted=true; $("ceremonyNextBtn").disabled=true; send({type:"vote_next"}); };
+$("ceremonyHostSkipBtn").onclick=()=>{ $("ceremonyHostSkipBtn").disabled=true; send({type:"host_skip"}); };
 // ---- v2: new-game buttons ----
 function submitSecretClue(){ const v=$("secretClueInput").value.trim(); if(!v) return; send({type:"secret_clue", clue:v}); $("secretClueArea").classList.add("hidden"); $("secretStatus").textContent="Clue sent — waiting for the others…"; }
 $("secretClueBtn").onclick=submitSecretClue;
