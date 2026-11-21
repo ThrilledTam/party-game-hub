@@ -202,7 +202,9 @@ DEFAULT_SETTINGS = {
     "memory":   {"memorize_seconds": 10, "recall_seconds": 15},
     # v2.1: the between-challenge NEXT vote break uses this timeout
     # (tests override it to a few seconds).
-    "elimination": {"vote_timeout": 60},
+    # v2.3 item 14: Elimination "mode" — "normal" (default) or
+    # "group" (Group Elimination mode).
+    "elimination": {"vote_timeout": 60, "mode": "normal"},
 }
 
 # ---------------------------------------------------------------------------
@@ -346,6 +348,12 @@ class Room:
     champ_history: list = field(default_factory=list)
     president_finish_order: list = field(default_factory=list)
     score_at_game_start: dict = field(default_factory=dict)
+    # v2.3 item 14 (Group Elimination mode): host-set group per
+    # player (0 = Red, 1 = Blue, 2 = Black — 2 is only ever set by
+    # the merge, never by the client) and the current phase of a
+    # Group series ("groups" | "black").
+    elim_groups: dict = field(default_factory=dict)
+    elim_phase: str = "groups"
     # Per-game transient state (reset at each game start)
     current_game: str | None = None
     round_state: dict = field(default_factory=dict)
@@ -369,10 +377,41 @@ class Room:
                 "championship": self.championship,
                 "champ_games": self.champ_games,
                 "champ_history": self.champ_history,
-                "president_roles": president_roles_for(self),
+                # v2.3 item 14 / group protocol: the LOBBY payload
+                # includes president_roles whenever a finish order is
+                # stored, regardless of the selected game ({} when no
+                # finish order exists, so the client shows greyed-out
+                # badge slots). president_roles_for itself is NOT
+                # changed — it still returns {} unless President is
+                # the selected game, which the game itself needs
+                # (all-Citizen roles in match 1).
+                "president_roles": self._lobby_president_roles(),
+                # v2.3 item 14: Group Elimination mode state.
+                "elimination_mode": self.game_settings.get(
+                    "elimination", {}).get("mode", "normal"),
+                "elim_groups": dict(self.elim_groups),
+                "elim_phase": self.elim_phase,
                 "min_players": GAMES.get(
                     self.current_game or self.game, {"min_players": 1}
                 )["min_players"] if self.game != "random" else 1}
+
+    def _lobby_president_roles(self):
+        """v2.3 item 14 / group protocol: lobby-payload President
+        roles — the stored finish order mapped to titles, with NO
+        selected-game gate (unlike president_roles_for, which the
+        game itself still uses). {} when no finish order is stored
+        (match 1 / never played President); the client renders
+        greyed-out badge slots for the {} case."""
+        if not self.president_finish_order:
+            return {}
+        ordered = president_ordered_ids(self)
+        if not ordered:
+            return {}
+        n = len(ordered)
+        titles = PRESIDENT_ROLE_MAP.get(
+            n, ["President"] + ["Citizen"] * max(0, n - 2) + ["Peasant"]
+            if n >= 2 else ["President"])
+        return {pid: titles[i] for i, pid in enumerate(ordered)}
 
     def humans(self):
         return [p for p in self.players if not p.is_bot]
@@ -1069,9 +1108,11 @@ def uno_validate_play(hand, cards, top, current_colour, *,
                       pending_draw=0, pending_type=None, multi_play=False):
     """v2.2 §5: why a (possibly multi-card) UNO play is illegal, in
     plain English — or None if it is legal. Multi-play: all cards
-    the same value, the FIRST must match the top card. Stacking: the
-    play must be the same type as the pending draw (+2 on +2,
-    +4 on +4)."""
+    the same value, and AT LEAST ONE must match the top card (v2.3
+    item 6: the set is legal whichever of its cards the player picked
+    first — the apply step reorders so a top-matching card leads).
+    Stacking: the play must be the same type as the pending draw (+2
+    on +2, +4 on +4)."""
     if not cards:
         return "You haven't selected any cards — pick at least one card to play."
     missing = [c for c in cards if c not in hand]
@@ -1094,8 +1135,8 @@ def uno_validate_play(hand, cards, top, current_colour, *,
                        "+2" if pending_type == "draw2" else "+4",
                        pending_draw))
         return None
-    if not uno_match(cards[0], top, current_colour):
-        return "The first card doesn't match the colour or value on top."
+    if not any(uno_match(c, top, current_colour) for c in cards):
+        return "None of the cards match the colour or value on top."
     return None
 
 
@@ -1149,6 +1190,31 @@ def memory_bot_correct(difficulty: str, digits: int) -> bool:
 # ---------------------------------------------------------------------------
 # Game handlers — one coroutine per game. Add new games here in later phases.
 # ---------------------------------------------------------------------------
+
+def _reaction_points(active):
+    """v2.2 §9 interpolation: best average -> 1000, worst -> 0; a
+    player with no valid time (all false starts) -> 0; all-equal
+    averages -> 1000. Returns {player_id: points}; empty when
+    nobody has a valid time."""
+    avgs = {}
+    for p in active:
+        avgs[p.id] = (round(sum(p.reaction_times) / len(p.reaction_times))
+                      if p.reaction_times else None)
+    valid = [a for a in avgs.values() if a is not None]
+    if not valid:
+        return {}
+    best, worst = min(valid), max(valid)
+    pts = {}
+    for p in active:
+        avg = avgs[p.id]
+        if avg is None:
+            pts[p.id] = 0
+        elif best == worst:
+            pts[p.id] = 1000
+        else:
+            pts[p.id] = round(1000 * (worst - avg) / (worst - best))
+    return pts
+
 
 async def run_reaction_game(room: Room, participants=None, challenge=False):
     """Reaction Test. Server controls the wait/go timing for everyone.
@@ -1255,6 +1321,17 @@ async def run_reaction_game(room: Room, participants=None, challenge=False):
                 # the last round's vote is the end-of-game vote).
                 await _vote_phase(room, "reaction", rnd, total)
         if challenge:
+            # v2.3 item 14: Reaction challenges must assign points —
+            # Group mode picks the worst team / worst player by
+            # p.score, and without this every total is 0 and the pick
+            # is a random tie-break. Same interpolation as a normal
+            # game (best average 1000, worst 0). Plain assign, not
+            # _assign_score: challenge scores are transient (reset
+            # each challenge) and the break shows the challenge
+            # points, like quiz challenges.
+            pts = _reaction_points(active)
+            for p in active:
+                p.score = pts.get(p.id, 0)
             return reaction_rankings(active)
         # v2.2 §9: Reaction now scores — points interpolated by
         # average time between the best average (1000) and the worst
@@ -1787,6 +1864,14 @@ async def run_memory_game(room: Room, participants=None, challenge=False,
                                 "numbers": numbers, "answers": {},
                                 "bot_answers": {}, "start": None,
                                 "phase": "memorize"}
+            # v2.3 item 5: broadcast memory_round_start BEFORE the
+            # per-player memory_show sends — the v2.2 client clears
+            # the canvas on round_start, so sending it after the
+            # shows erased the just-drawn numbers.
+            await broadcast(room, {"type": "memory_round_start",
+                                   "digits": digits, "round": rnd,
+                                   "seconds": memorize,
+                                   "alive": [p.id for p in alive]})
             for p in alive:
                 if p.is_bot:
                     ok = memory_bot_correct(p.difficulty, digits)
@@ -1796,10 +1881,6 @@ async def run_memory_game(room: Room, participants=None, challenge=False,
                     await send(p, {"type": "memory_show", "digits": digits,
                                    "number": numbers[p.id],
                                    "seconds": memorize, "round": rnd})
-            await broadcast(room, {"type": "memory_round_start",
-                                   "digits": digits, "round": rnd,
-                                   "seconds": memorize,
-                                   "alive": [p.id for p in alive]})
             await asyncio.sleep(memorize)
             if room.phase != "playing":
                 return (None, None) if challenge else None
@@ -1961,6 +2042,8 @@ async def run_secret_game(room: Room):
                            "impostors": n_impostors,
                            "round": 1,
                            "alive": [q.id for q in alive],
+                           # v2.3: turn order = alive list in clue order.
+                           "turn_order": [q.id for q in alive],
                            "eliminated": []})
     # 2 impostors with <5 players: ends immediately.
     if n_impostors == 2 and len(players) < 5:
@@ -1978,7 +2061,8 @@ async def run_secret_game(room: Room):
             room, "secret", rankings(room), scores_hidden=True,
             results_extra={"aborted": True, "word": word,
                            "category": category,
-                           "impostors": sorted(impostors)})
+                           "impostors": sorted(impostors),
+                           "word_team_won": False, "winners": []})
         return
     used_clues = set()
     round_no = 0
@@ -2014,6 +2098,9 @@ async def run_secret_game(room: Room):
                     await broadcast(room, {"type": "secret_clue_turn",
                                            "player_id": p.id,
                                            "nickname": p.nickname,
+                                           # v2.3: turn order = alive list
+                                           # in clue order.
+                                           "turn_order": [q.id for q in alive],
                                            "round": round_no})
                     try:
                         await asyncio.wait_for(
@@ -2029,7 +2116,10 @@ async def run_secret_game(room: Room):
                     await broadcast(room, {"type": "secret_clue_shown",
                                            "player_id": p.id,
                                            "nickname": p.nickname,
-                                           "clue": clue, "round": round_no})
+                                           "clue": clue, "round": round_no,
+                                           # v2.3: turn order = alive list
+                                           # in clue order.
+                                           "turn_order": [q.id for q in alive]})
             # --- Vote round: who is the impostor? ---
             room.round_state["votes"] = {}
             await broadcast(room, {"type": "secret_vote_start",
@@ -2221,8 +2311,10 @@ async def run_president_game(room: Room):
     Standard 52-card deck, all cards dealt. Ranks 3 (low) to 2
     (high); suits don't matter. On your turn play a set of 1-4 cards
     of the same rank that beats the current trick (same size, higher
-    rank), or pass. When everyone else passes, the last player to
-    play leads a new trick. First out is President, last is Peasant.
+    rank), or pass. v2.3 item 2: one pass per stack — the leader
+    plays, then each other unfinished player acts exactly once
+    (play or pass); the stack winner (highest play) leads the next
+    stack. First out is President, last is Peasant.
     Points by finish order on a linear 1000-to-0 scale (added to the
     championship score in championship mode).
 
@@ -2259,6 +2351,7 @@ async def run_president_game(room: Room):
     room.round_state = {"participants": {p.id for p in players},
                         "hands": hands, "trick": None, "turn": leader.id,
                         "last_played_by": None, "passed": set(),
+                        "acted": set(),
                         "finished": [], "turn_event": asyncio.Event(),
                         "turn_action": None, "order": [p.id for p in ordered],
                         "roles": dict(roles), "exchange": None}
@@ -2350,6 +2443,15 @@ async def run_president_game(room: Room):
             if pl:
                 _assign_score(room, pl, scores[i])
         titles = president_titles_for_finish(len(players))
+        # v2.3 item 8: send a final president_state after the last
+        # finisher is appended, so clients see the Peasant title
+        # (in-game the last player was never in `finished` before).
+        # Point the turn at the winner — the old turn_id can name a
+        # finished player (3rd finisher + stack-end), which the client
+        # would render as a stale "your turn / waiting for…".
+        if st["finished"]:
+            st["turn"] = st["finished"][0]
+        await send_president_state(room)
         await _end_of_game_flow(
             room, "president", rankings(room),
             results_extra={"finish_order": list(st["finished"]),
@@ -2360,33 +2462,50 @@ async def run_president_game(room: Room):
         pass
 
 
+def _president_maybe_end_stack(room: Room):
+    """v2.3 item 2: a stack ends once every UNFINISHED player has
+    acted exactly once (play or pass) — the per-stack `acted` set.
+    Clear the trick and the per-stack sets; the next turn goes to
+    the stack winner (`last_played_by`, the highest play) via
+    _next_president_turn, or to the next unfinished player after
+    them if the winner finished by playing their last cards."""
+    st = room.round_state
+    unfinished = [p.id for p in room.players
+                  if p.id not in st["finished"]]
+    acted = st.get("acted", set())
+    if unfinished and all(pid in acted for pid in unfinished):
+        st["trick"] = None
+        st["passed"] = set()
+        st["acted"] = set()
+
+
 def _president_apply_play(room: Room, player: Player, cards):
     """Apply a legal President play: remove the cards, set the trick,
-    clear passes, and record a finish if the hand is now empty."""
+    and record a finish if the hand is now empty.
+
+    v2.3 item 2: one pass per stack — this play is the player's one
+    action for the stack (added to `acted`); the stack ends once
+    every unfinished player has acted."""
     st = room.round_state
     for c in cards:
         st["hands"][player.id].remove(c)
     st["trick"] = {"size": len(cards), "rank": pres_rank(cards[0]),
                    "cards": list(cards), "by": player.id}
     st["last_played_by"] = player.id
-    st["passed"] = set()
+    st.setdefault("acted", set()).add(player.id)
     if not st["hands"][player.id]:
         st["finished"].append(player.id)
+    _president_maybe_end_stack(room)
 
 
 def _president_apply_pass(room: Room, player: Player):
-    """Apply a pass. If everyone else has now passed, the last player
-    to play leads a new trick."""
+    """Apply a pass: the player's one action for this stack (added
+    to `acted`). The stack ends once every unfinished player has
+    acted; the last player to play then leads the next stack."""
     st = room.round_state
     st["passed"].add(player.id)
-    in_game = [p for p in room.players if p.id not in st["finished"]]
-    still_to_act = [p for p in in_game
-                    if p.id not in st["passed"] and p.id != st["last_played_by"]]
-    if not still_to_act and st["last_played_by"]:
-        # Trick is over: the last player to play leads again.
-        st["trick"] = None
-        st["passed"] = set()
-        st["turn"] = st["last_played_by"]
+    st.setdefault("acted", set()).add(player.id)
+    _president_maybe_end_stack(room)
 
 
 def _next_president_turn(room: Room, current_id):
@@ -2397,8 +2516,10 @@ def _next_president_turn(room: Room, current_id):
     Peasant last) in match 2+. Leading a new trick (trick is None):
     the last player to play leads — or, if they finished by playing
     their last cards, the next player after them in the rotation.
-    Mid-trick: the next player after the current one, skipping
-    finished and passed players.
+    v2.3 item 2: one pass per stack — mid-trick, the next player
+    after the current one, skipping finished, passed AND already-
+    acted players (each unfinished player acts exactly once per
+    stack; the `acted` set is cleared when the stack ends).
     """
     st = room.round_state
     order = st.get("order") or [p.id for p in room.players]
@@ -2418,9 +2539,10 @@ def _next_president_turn(room: Room, current_id):
     idx = 0
     if current_id and current_id in order:
         idx = order.index(current_id) + 1
+    acted = st.get("acted", set())
     for k in range(len(order)):
         pid = order[(idx + k) % len(order)]
-        if pid in st["finished"] or pid in st["passed"]:
+        if pid in st["finished"] or pid in st["passed"] or pid in acted:
             continue
         return pid
     return None
@@ -2440,6 +2562,8 @@ async def send_uno_state(room: Room):
             continue
         await send(p, {"type": "uno_state",
                        "turn_id": st.get("turn"),
+                       "turn_order": list(st.get("order") or
+                                          [q.id for q in room.players]),
                        "direction": st.get("direction", 1),
                        "top": st.get("discard", [None])[-1],
                        "current_colour": st.get("current_colour"),
@@ -2688,8 +2812,18 @@ def _uno_apply_play_multi(room: Room, player: Player, cards, colour=None):
     ALL effects trigger in order played: two +2s add +4 to the
     pending draw, two skips skip two players, two reverses flip the
     direction twice. A Wild colour is picked ONCE for the whole play.
-    Sets pending_draw / pending_type (stacking) and skip_count."""
+    Sets pending_draw / pending_type (stacking) and skip_count.
+    v2.3 item 6: when there is no pending draw, a top-matching card
+    is moved to the front first (the rest keep their given order),
+    so a multi-play is legal whichever card the player picked first."""
     st = room.round_state
+    if not st.get("pending_draw"):
+        top = st["discard"][-1]
+        current_colour = st.get("current_colour")
+        for i, card in enumerate(cards):
+            if uno_match(card, top, current_colour):
+                cards = [card] + cards[:i] + cards[i + 1:]
+                break
     order = st.get("order") or [p.id for p in room.players]
     colour_set = False
     for card in cards:
@@ -2721,6 +2855,103 @@ def _uno_apply_play(room: Room, player: Player, card: str, colour=None):
     """Apply a single-card UNO play (kept for compatibility; the
     game loop uses _uno_apply_play_multi)."""
     _uno_apply_play_multi(room, player, [card], colour)
+
+
+# ---------------------------------------------------------------------------
+# Group Elimination mode (v2.3 item 14)
+# ---------------------------------------------------------------------------
+
+def _elim_balance_groups(room: Room, players):
+    """v2.3 item 14: group assignment for a Group series start.
+
+    Starts from room.elim_groups (host-set, 0 = Red / 1 = Blue;
+    a stored 2 = Black from a previous merge is treated as
+    unassigned — Black only exists inside a series). Players with
+    no group are assigned at random, always to the currently
+    smaller group, so sizes stay balanced. Judgment call
+    (documented per the group protocol): if one group ends up
+    empty — e.g. the host put everyone in Red — the players are
+    split evenly at random instead. Returns {player_id: 0|1}."""
+    ids = [p.id for p in players]
+    groups = {pid: room.elim_groups[pid] for pid in ids
+              if room.elim_groups.get(pid) in (0, 1)}
+    unassigned = [pid for pid in ids if pid not in groups]
+    random.shuffle(unassigned)
+    for pid in unassigned:
+        c0 = sum(1 for v in groups.values() if v == 0)
+        c1 = sum(1 for v in groups.values() if v == 1)
+        groups[pid] = 0 if c0 <= c1 else 1
+    if groups and all(v == 0 for v in groups.values()) or \
+            groups and all(v == 1 for v in groups.values()):
+        shuffled = list(groups)
+        random.shuffle(shuffled)
+        half = len(shuffled) // 2
+        groups = {pid: (0 if i < half else 1)
+                  for i, pid in enumerate(shuffled)}
+    return groups
+
+
+def _elim_pick_worst_team(group_scores):
+    """v2.3 item 14: worst team of a match from
+    group_scores = {0: [member scores], 1: [member scores]}.
+
+    Worst = lowest TOTAL points. Tie-breaks (judgment calls,
+    documented per the group protocol): totals tied -> the team
+    with the lowest single member score is worst; still tied ->
+    random. An empty group (no alive members) is skipped — it has
+    nobody to eliminate. Deterministic setups (no ties) give a
+    deterministic answer; tests must use those."""
+    non_empty = {g: s for g, s in group_scores.items() if s}
+    if len(non_empty) == 1:
+        return next(iter(non_empty))
+    totals = {g: sum(s) for g, s in non_empty.items()}
+    worst_total = min(totals.values())
+    tied = [g for g, t in totals.items() if t == worst_total]
+    if len(tied) == 1:
+        return tied[0]
+    worst_single = min(min(non_empty[g]) for g in tied)
+    tied = [g for g in tied if min(non_empty[g]) == worst_single]
+    return random.choice(tied)
+
+
+def _elim_pick_worst_player(alive, group=None, groups=None):
+    """v2.3 item 14: worst player among `alive` — lowest p.score.
+    With `group` set, only members of that group (per `groups`)
+    are candidates. Tie-break (judgment call, documented per the
+    group protocol): scores tied -> random among the tied lowest.
+    Tests must use deterministic setups (a unique lowest score)."""
+    candidates = [p for p in alive
+                  if group is None or groups.get(p.id) == group]
+    worst = min(p.score for p in candidates)
+    tied = [p for p in candidates if p.score == worst]
+    return random.choice(tied)
+
+
+def _elim_rebalance_groups(room: Room, alive, groups):
+    """v2.3 item 14: rebalance after an elimination (groups phase
+    only). While the size gap between the two groups is > 1, move
+    a random player from the bigger group to the smaller one.
+    `groups` is the alive-only {player_id: 0|1} map and is mutated
+    in place. Returns the transfers as
+    [{player_id, nickname, from: 0|1, to: 1|0}] (possibly empty)
+    so the break can show them to the players."""
+    transfers = []
+    while True:
+        members0 = [pid for pid, g in groups.items() if g == 0]
+        members1 = [pid for pid, g in groups.items() if g == 1]
+        if abs(len(members0) - len(members1)) <= 1:
+            break
+        if len(members0) > len(members1):
+            bigger, smaller, members = 0, 1, members0
+        else:
+            bigger, smaller, members = 1, 0, members1
+        pid = random.choice(members)
+        groups[pid] = smaller
+        pl = room.get_player(pid)
+        transfers.append({"player_id": pid,
+                          "nickname": pl.nickname if pl else "?",
+                          "from": bigger, "to": smaller})
+    return transfers
 
 
 async def run_challenge(room: Room, game: str, alive):
@@ -2779,7 +3010,7 @@ async def elimination_end_vote(room: Room):
 
 async def _elimination_break(room: Room, challenge_no: int, alive,
                              ranking, eliminated_names, remaining,
-                             finishing_names):
+                             finishing_names, group_info=None):
     """Pacing break between Elimination challenges (v2.1).
 
     Shows the challenge ranking, who was eliminated, how many players
@@ -2791,25 +3022,39 @@ async def _elimination_break(room: Room, challenge_no: int, alive,
     a blur. `ranking` is the challenge's ranking rows
     ({"player_id": ...}); scores shown are each alive player's score
     from that challenge.
+
+    v2.3 item 14: in Group mode `group_info` carries the just-
+    finished match's group data — the break's `scores` rows then
+    carry the player's group in the `team` field (was None), and
+    the break extra gains `group_totals`, `worst_team`,
+    `transfers` and `merged_to_black` (Group only).
     """
     scores = []
     for p in alive:
         scores.append({"player_id": p.id, "nickname": p.nickname,
                        "colour": p.colour, "is_bot": p.is_bot,
-                       "score": p.score, "team": None})
+                       "score": p.score,
+                       "team": (group_info["groups"].get(p.id)
+                                if group_info else None)})
     # The ranking order is the challenge order (best first); the
     # scoreboard sorts by score, so keep the ranking visible too.
     rank_names = []
     for row in ranking:
         pl = room.get_player(row["player_id"])
         rank_names.append(pl.nickname if pl else "?")
+    extra = {"elim_break": True,
+             "eliminated": eliminated_names,
+             "remaining": remaining,
+             "finishing": finishing_names,
+             "ranking": rank_names}
+    if group_info:
+        extra.update({"group_totals": group_info["group_totals"],
+                      "worst_team": group_info["worst_team"],
+                      "transfers": group_info["transfers"],
+                      "merged_to_black": group_info["merged_to_black"]})
     await _vote_phase(room, "elimination", challenge_no, challenge_no,
                       scores=scores, eligible=list(alive),
-                      extra={"elim_break": True,
-                             "eliminated": eliminated_names,
-                             "remaining": remaining,
-                             "finishing": finishing_names,
-                             "ranking": rank_names})
+                      extra=extra)
 
 
 async def run_elimination_game(room: Room):
@@ -2818,15 +3063,28 @@ async def run_elimination_game(room: Room):
     Each challenge is one quick game picked at random from the pool
     (Reaction, Speed Math, Speed Trivia, Memory) among the remaining
     players; the LAST-PLACE player of that challenge is eliminated.
-    The series runs until exactly 3 players remain, then a FINALE
-    challenge eliminates the bottom 2 and crowns the top player the
-    victor. The results screen lists the full finishing order, then
-    a community vote decides Play Again (new series, same players)
-    or Return to Lobby.
+    v2.3 item 15: the series runs until exactly 1 player remains —
+    one elimination per challenge, NO finale. The results screen
+    lists the full finishing order, then a community vote decides
+    Play Again (new series, same players) or Return to Lobby.
 
-    v2.2: Elimination no longer forces FFA — it honors room.mode,
-    team standings are shown, a TEAM is out when its LAST member is
-    out, and eliminated individuals contribute 0 to team totals.
+    v2.3 item 16: start_game forces room.mode = "ffa" for
+    Elimination (Teams auto-switches off), so a series always runs
+    FFA; eliminated players contribute 0 to team totals.
+
+    v2.3 item 14 (Group mode): when
+    room.game_settings["elimination"]["mode"] == "group", the
+    players fight in two teams (Red 0 / Blue 1). After each
+    challenge the team with the LOWEST TOTAL points loses its
+    worst player (lowest p.score in that team); groups are then
+    rebalanced until the size gap is <= 1 (transfers shown in the
+    break). When 5 players remain they merge into the Black Team
+    (group 2, phase "black") and from then on the worst player
+    overall is eliminated per match until 1 remains. Groups
+    persist across Play Again series in the same room (stored in
+    room.elim_groups); at each series start missing groups are
+    auto-balanced. Tie-breaks are in _elim_pick_worst_team /
+    _elim_pick_worst_player.
     """
     all_players = list(room.players)
     try:
@@ -2843,7 +3101,27 @@ async def run_elimination_game(room: Room):
             alive = list(all_players)
             elim_order = []
             challenge_no = 0
-            while len(alive) > 3:
+            # v2.3 item 14: Group series setup — groups from
+            # room.elim_groups, auto-balanced at series start.
+            is_group = room.game_settings.get(
+                "elimination", {}).get("mode") == "group"
+            groups = {}
+            if is_group:
+                groups = _elim_balance_groups(room, alive)
+                room.elim_groups = dict(groups)
+                if len(alive) <= 5:
+                    # Started with 5 or fewer (players left after
+                    # the mode was set): straight into the Black
+                    # phase — there is no groups phase to play.
+                    for pid in groups:
+                        groups[pid] = 2
+                    room.elim_groups = dict(groups)
+                    room.elim_phase = "black"
+                else:
+                    room.elim_phase = "groups"
+            else:
+                room.elim_phase = "groups"
+            while len(alive) > 1:
                 challenge_no += 1
                 pool = [g for g in ELIM_POOL
                         if GAMES[g]["min_players"] <= len(alive)]
@@ -2859,7 +3137,13 @@ async def run_elimination_game(room: Room):
                                        "game_name": GAMES[game]["name"],
                                        "remaining": len(alive),
                                        "alive": [p.nickname for p in alive],
-                                       "finale": False})
+                                       "finale": False,
+                                       # v2.3 item 14: Group wire.
+                                       "elimination_mode":
+                                           "group" if is_group else "normal",
+                                       "elim_phase": room.elim_phase,
+                                       "groups": dict(groups)
+                                           if is_group else {}})
                 # v2.1: challenge intro — 4 seconds to read what game
                 # is coming and who is still in, before it starts.
                 await asyncio.sleep(4)
@@ -2876,73 +3160,89 @@ async def run_elimination_game(room: Room):
                 ranking = await run_challenge(room, game, alive)
                 if ranking is None or room.phase != "playing":
                     return
-                last = ranking[-1]
-                elim_order.append(last["player_id"])
-                alive = [p for p in alive if p.id != last["player_id"]]
-                loser = room.get_player(last["player_id"])
+                # --- pick the eliminated player (v2.3 item 14) ---
+                group_info = None
+                if is_group and room.elim_phase == "black":
+                    # Black phase: worst player OVERALL.
+                    loser_p = _elim_pick_worst_player(alive)
+                    loser_group = 2
+                    worst_team = 2
+                    group_totals = {2: sum(p.score for p in alive)}
+                    transfers = []
+                    merged = False
+                elif is_group:
+                    # Groups phase: worst team by TOTAL points loses
+                    # its worst player (lowest p.score in that team).
+                    # Totals are from the just-finished challenge,
+                    # before this elimination.
+                    group_scores = {
+                        0: [p.score for p in alive
+                            if groups.get(p.id) == 0],
+                        1: [p.score for p in alive
+                            if groups.get(p.id) == 1]}
+                    group_totals = {g: sum(s)
+                                    for g, s in group_scores.items()}
+                    worst_team = _elim_pick_worst_team(group_scores)
+                    loser_p = _elim_pick_worst_player(
+                        alive, group=worst_team, groups=groups)
+                    loser_group = worst_team
+                    transfers = []
+                    merged = False
+                else:
+                    # Normal mode (v2.3 item 15): last place goes out.
+                    last = ranking[-1]
+                    loser_p = room.get_player(last["player_id"])
+                    loser_group = None
+                elim_order.append(loser_p.id)
+                alive = [p for p in alive if p.id != loser_p.id]
+                if is_group:
+                    groups.pop(loser_p.id, None)
                 await broadcast(room, {"type": "elimination_eliminated",
-                                       "player_id": last["player_id"],
-                                       "nickname": loser.nickname if loser else "?",
-                                       "remaining": len(alive)})
+                                       "player_id": loser_p.id,
+                                       "nickname": loser_p.nickname,
+                                       "remaining": len(alive),
+                                       # v2.3 item 14: group of the
+                                       # eliminated player (None in
+                                       # Normal mode).
+                                       "group": loser_group
+                                           if is_group else None})
+                if is_group:
+                    if room.elim_phase == "groups":
+                        if len(alive) == 5:
+                            # Merge: the final 5 become the Black Team.
+                            merged = True
+                            for p in alive:
+                                groups[p.id] = 2
+                            room.elim_phase = "black"
+                        else:
+                            transfers = _elim_rebalance_groups(
+                                room, alive, groups)
+                    # Persist the (possibly moved/merged) groups so
+                    # they survive into the next series in this room;
+                    # eliminated players keep their last group entry.
+                    room.elim_groups.update(groups)
+                    group_info = {"groups": dict(groups),
+                                  "group_totals": group_totals,
+                                  "worst_team": worst_team,
+                                  "transfers": transfers,
+                                  "merged_to_black": merged}
                 # v2.1: pacing break — ranking, who went out, who is
                 # left — with a NEXT vote. Nothing advances until the
                 # vote passes, the host skips, or the timeout hits.
                 await _elimination_break(
                     room, challenge_no, alive, ranking,
-                    [loser.nickname if loser else "?"], len(alive),
+                    [loser_p.nickname], len(alive),
                     [room.get_player(pid).nickname
                      for pid in reversed(elim_order)
-                     if room.get_player(pid)])
+                     if room.get_player(pid)],
+                    group_info=group_info)
                 if room.phase != "playing":
                     return
-            # --- Finale: 3 remain, one last challenge. ---
-            challenge_no += 1
-            pool = [g for g in ELIM_POOL
-                    if GAMES[g]["min_players"] <= len(alive)]
-            game = random.choice(pool)
-            for p in alive:
-                p.score = 0
-                p.reaction_times = []
-                p.false_starts = 0
-            room.current_game = game
-            await broadcast(room, {"type": "elimination_challenge",
-                                   "challenge": challenge_no,
-                                   "game": game,
-                                   "game_name": GAMES[game]["name"],
-                                   "remaining": len(alive),
-                                   "alive": [p.nickname for p in alive],
-                                   "finale": True})
-            # v2.1: finale intro — same 4-second breather as every
-            # other challenge, so the finale doesn't ambush anyone.
-            await asyncio.sleep(4)
-            await broadcast(room, {"type": "game_started", "game": game,
-                                   "settings": room.game_settings[game],
-                                   "mode": "competition", "party_mode": room.mode,
-                                   "team_count": room.team_count,
-                                   "teams": {pid: t for pid, t in room.teams.items()},
-                                   "turn_order": list(room.turn_order),
-                                   "team_scoring": room.team_scoring,
-                                   "championship": room.championship,
-                                   "champ_games": room.champ_games})
-            ranking = await run_challenge(room, game, alive)
-            if ranking is None or room.phase != "playing":
-                return
-            finishing = [ranking[0]["player_id"], ranking[1]["player_id"],
-                         ranking[2]["player_id"]] + list(reversed(elim_order))
-            # v2.1: one last pacing break after the finale challenge,
-            # before the final results — same NEXT vote as the rest.
-            await _elimination_break(
-                room, challenge_no, [room.get_player(finishing[0])],
-                ranking,
-                [room.get_player(pid).nickname
-                 for pid in finishing[1:3] if room.get_player(pid)],
-                1,
-                [room.get_player(pid).nickname
-                 for pid in finishing if room.get_player(pid)])
-            if room.phase != "playing":
-                return
-            place_scores = {finishing[0]: 1000, finishing[1]: 500,
-                            finishing[2]: 250}
+            # v2.3 item 15: no finale — the last remaining player is
+            # the victor; finishing order is winner first, then the
+            # eliminated in reverse elimination order.
+            finishing = [alive[0].id] + list(reversed(elim_order))
+            place_scores = {finishing[0]: 1000}
             for p in all_players:
                 # v2.2 §9/§10: eliminated players contribute 0; in
                 # championship mode the place score ADDS to the
@@ -3032,6 +3332,11 @@ async def start_game(room: Room, player: Player):
                 "assign players to " + ", ".join(TEAM_NAMES[t] for t in empty) +
                 ", or use Randomize teams."})
             return
+    # v2.3 item 16: Elimination auto-switches Teams OFF — force FFA
+    # before the game starts (after the checks above, so a failed
+    # start leaves the lobby mode untouched).
+    if game == "elimination":
+        room.mode = "ffa"
     await _begin_game(room, game)
 
 
@@ -3054,8 +3359,8 @@ async def _begin_game(room: Room, game: str):
     room.current_game = game
     room.phase = "playing"
     mode = "solo" if len(room.players) == 1 else "competition"
-    # v2.2: Elimination no longer forces FFA — party_mode honors
-    # the room mode for every game.
+    # v2.3 item 16: start_game forces room.mode = "ffa" for
+    # Elimination, so party_mode here is "ffa" for that game.
     await broadcast(room, {"type": "game_started", "game": game,
                            "settings": room.game_settings[game],
                            "mode": mode, "party_mode": room.mode,
@@ -3162,6 +3467,42 @@ async def handle_message(room: Room, player: Player, msg: dict):
                 room.champ_history = []
                 room.champ_games = 0
             room.championship = msg["championship"]
+        # v2.3 item 14: Elimination Group mode (host only, lobby).
+        if "elimination_mode" in msg:
+            mode_val = msg["elimination_mode"]
+            if mode_val in ("normal", "group"):
+                if mode_val == "group" and len(room.players) < 6:
+                    await send(player, {"type": "error", "message":
+                        "Group mode needs at least 6 players — "
+                        "add bots or wait for players."})
+                else:
+                    room.game_settings.setdefault(
+                        "elimination", {})["mode"] = mode_val
+                    if mode_val == "group":
+                        room.elim_phase = "groups"
+        if isinstance(msg.get("elim_groups"), dict):
+            # Full map {player_id: 0|1}; values other than 0/1
+            # (including 2 = Black, which only the merge sets) and
+            # unknown player ids are ignored.
+            ids = {p.id for p in room.players}
+            room.elim_groups = {
+                pid: int(v) for pid, v in msg["elim_groups"].items()
+                if pid in ids and isinstance(v, int)
+                and not isinstance(v, bool) and v in (0, 1)}
+        if isinstance(msg.get("teams"), dict):
+            # v2.3 item 14: full Teams map {player_id: 0..team_count-1 |
+            # None} from the tap-to-move columns UI. Merged over the
+            # stored map (players missing from the map keep their team);
+            # values outside the team range and unknown ids are ignored.
+            ids = {p.id for p in room.players}
+            for pid, v in msg["teams"].items():
+                if pid not in ids:
+                    continue
+                if v is None:
+                    room.teams[pid] = None
+                elif isinstance(v, int) and not isinstance(v, bool) \
+                        and 0 <= v < room.team_count:
+                    room.teams[pid] = int(v)
         await broadcast_lobby(room)
 
     elif mtype == "add_bot":
@@ -3787,6 +4128,13 @@ async def ws_endpoint(ws: WebSocket):
                 secret = st.get("secret", {})
                 impostors = st.get("impostors", set())
                 is_imp = player.id in impostors
+                # v2.3: turn order = alive list in clue order (the
+                # room turn order filtered to the alive set).
+                _alive_ids = set(st.get("alive", set()))
+                _turn_order = [pid for pid in (room.turn_order or [])
+                               if pid in _alive_ids]
+                _turn_order += [pid for pid in sorted(_alive_ids)
+                                if pid not in _turn_order]
                 await send(player, {"type": "secret_word",
                                     "word": secret.get(player.id),
                                     "category": st.get("category", ""),
@@ -3796,6 +4144,7 @@ async def ws_endpoint(ws: WebSocket):
                                     "impostors": len(impostors),
                                     "round": st.get("round", 1),
                                     "alive": sorted(st.get("alive", set())),
+                                    "turn_order": _turn_order,
                                     "eliminated": st.get("eliminated", [])})
             elif room.current_game == "president":
                 # v2: re-send the current President state (own hand).
@@ -3830,6 +4179,74 @@ async def ws_endpoint(ws: WebSocket):
                                     "text": st["question"]["text"],
                                     "options": st["question"]["options"],
                                     "time_limit": remaining})
+
+        elif room.phase == "results" and room.current_game:
+            # v2.3 item 11: resync for a player rejoining on the
+            # results screen — the old code only resynced mid-game
+            # ("playing"), so a rejoiner in "results" got no results
+            # message and sat on a stale screen. Re-send `results`
+            # (scores stripped for Secret, as in _end_of_game_flow)
+            # and, once the end-of-game vote has finished, `end_choice`
+            # so they can vote on the replay. President finish order
+            # / titles are recovered from room.president_finish_order
+            # (still stored); Secret's word/outcome lived only in the
+            # finished game loop's locals, so it cannot be recovered
+            # here and is omitted for the rejoiner.
+            results_rows = rankings(room)
+            if room.current_game == "secret":
+                results_rows = [{k: v for k, v in r.items() if k != "score"}
+                                for r in results_rows]
+            resync_msg = {"type": "results", "game": room.current_game,
+                          "mode": room.mode,
+                          "teams": team_standings(room),
+                          "rankings": results_rows,
+                          "team_scoring": room.team_scoring,
+                          "championship": room.championship,
+                          "champ_games": room.champ_games}
+            if room.current_game == "secret":
+                resync_msg["scores_hidden"] = True
+            if room.current_game == "president" \
+                    and room.president_finish_order:
+                _titles = president_titles_for_finish(len(room.players))
+                resync_msg["finish_order"] = list(
+                    room.president_finish_order)
+                resync_msg["titles"] = {
+                    pid: _titles[i]
+                    for i, pid in enumerate(room.president_finish_order)
+                    if i < len(_titles)}
+            await send(player, resync_msg)
+            st = room.round_state
+            if st.get("votes") is not None \
+                    and st.get("replay_votes") is None \
+                    and st.get("end_votes") is None:
+                # End-of-game NEXT vote still in progress: re-send
+                # the vote break so the rejoiner can vote NEXT.
+                await send(player, {"type": "vote_break",
+                                    "index": st.get("vote_index", 1),
+                                    "total": 1, "scores": [],
+                                    "votes": len(st["votes"]),
+                                    "votes_needed": votes_needed_humans(room),
+                                    "timeout": VOTE_TIMEOUT_DEFAULT,
+                                    "mode": room.mode,
+                                    "teams": team_standings(room),
+                                    "end_of_game": True})
+            if st.get("replay_votes") is not None:
+                await send(player, {"type": "end_choice",
+                                    "game": room.current_game,
+                                    "rankings": rankings(room),
+                                    "teams": team_standings(room),
+                                    "team_scoring": room.team_scoring,
+                                    "championship": room.championship,
+                                    "champ_games": room.champ_games,
+                                    "champ_history": room.champ_history})
+            elif room.current_game == "elimination" \
+                    and st.get("end_votes") is not None:
+                votes = st["end_votes"]
+                await send(player, {"type": "elimination_end_vote",
+                                    "votes_again": len(votes["again"]),
+                                    "votes_lobby": len(votes["lobby"]),
+                                    "votes_needed": votes_needed_humans(room),
+                                    "timeout": 60})
 
         while True:
             msg = json.loads(await ws.receive_text())
