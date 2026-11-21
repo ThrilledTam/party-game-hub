@@ -1436,7 +1436,15 @@ async def _vote_phase(room: Room, game: str, idx: int, total: int, *,
     if scores is None:
         scores = [{"player_id": pl.id, "nickname": pl.nickname,
                    "colour": pl.colour, "is_bot": pl.is_bot,
-                   "score": pl.score, "team": room.teams.get(pl.id)}
+                   "score": pl.score,
+                   # v2.5 item 3: Reaction's native running scores
+                   # (see _elim_score_rows) — None for other games.
+                   "avg_ms": (round(sum(pl.reaction_times)
+                                    / len(pl.reaction_times))
+                              if pl.reaction_times else None),
+                   "best_ms": (min(pl.reaction_times)
+                               if pl.reaction_times else None),
+                   "team": room.teams.get(pl.id)}
                   for pl in room.players]
     if eligible is None:
         room.round_state["vote_eligible"] = None
@@ -2988,6 +2996,15 @@ def _elim_score_rows(room: Room, players, teams=None):
         rows.append({"player_id": p.id, "nickname": p.nickname,
                      "colour": p.colour, "is_bot": p.is_bot,
                      "score": p.score,
+                     # v2.5 item 3: Reaction's native running scores —
+                     # the average / best time so far. Only Reaction
+                     # populates reaction_times, so other games get
+                     # None here and are unaffected.
+                     "avg_ms": (round(sum(p.reaction_times)
+                                      / len(p.reaction_times))
+                                if p.reaction_times else None),
+                     "best_ms": (min(p.reaction_times)
+                                 if p.reaction_times else None),
                      "tally": room.elim_tally.get(p.id, 0),
                      "team": (teams.get(p.id) if teams is not None
                               else room.teams.get(p.id))})
@@ -3113,12 +3130,19 @@ async def _elimination_ceremony(room: Room, challenge_no: int, game: str,
     only. 4 seconds per stage, skippable by the NEXT vote / host
     skip (see _ceremony_stage)."""
     if group_info:
-        groups = group_info["groups"]
+        # v2.5 item 4: the ranking rows show the teams as played
+        # (groups_as_played, snapshotted before any merge/rebalance),
+        # not the post-transfer map in group_info["groups"]. The
+        # "groups" wire field below keeps the current map, as before
+        # (the client does not read it in the ceremony).
+        groups_current = group_info["groups"]
+        groups = group_info.get("groups_as_played", groups_current)
         group_totals = group_info["group_totals"]
         worst_team = group_info["worst_team"]
         transfers = group_info["transfers"]
         merged = group_info["merged_to_black"]
     else:
+        groups_current = {}
         groups = {}
         group_totals = {}
         worst_team = None
@@ -3148,6 +3172,14 @@ async def _elimination_ceremony(room: Room, challenge_no: int, game: str,
             "score": pl.score,
             "tally": room.elim_tally.get(pl.id, 0),
             "group": grp})
+    # v2.5 item 1: the pile must contain each eliminated player
+    # exactly once at every stage. elim_order already includes the
+    # current victim, who only joins the pile when they drop — so
+    # the list and drop stages send the pile WITHOUT the victim,
+    # and the merge / transfer stages (reached after the drop) send
+    # the full pile with the victim in it.
+    pile_before_drop = [pid for pid in elim_order
+                        if pid != loser_p.id]
     base = {"type": "elimination_ceremony",
             "challenge": challenge_no, "game": game,
             "elimination_mode": "group" if is_group else "normal",
@@ -3157,8 +3189,8 @@ async def _elimination_ceremony(room: Room, challenge_no: int, game: str,
                            "nickname": loser_p.nickname},
             "remaining": len(alive),
             "alive": [p.id for p in alive],
-            "eliminated_pile": list(elim_order),
-            "groups": dict(groups) if is_group else {},
+            "eliminated_pile": pile_before_drop,
+            "groups": dict(groups_current) if is_group else {},
             "group_totals": group_totals,
             "worst_team": worst_team,
             "merged_to_black": merged,
@@ -3171,12 +3203,14 @@ async def _elimination_ceremony(room: Room, challenge_no: int, game: str,
             return
     if is_group and merged:
         msg = dict(base)
+        msg["eliminated_pile"] = list(elim_order)
         msg["stage"] = "merge"
         await _ceremony_stage(room, msg, eligible=list(alive))
         if room.phase != "playing":
             return
     elif is_group and transfers:
         msg = dict(base)
+        msg["eliminated_pile"] = list(elim_order)
         msg["stage"] = "transfer"
         await _ceremony_stage(room, msg, eligible=list(alive))
 
@@ -3204,7 +3238,12 @@ async def _elimination_break(room: Room, challenge_no: int, alive,
     """
     scores = _elim_score_rows(
         room, alive,
-        teams=(group_info["groups"] if group_info else {}))
+        # v2.5 item 4: the break's score rows show the teams as
+        # played (snapshotted before merge/rebalance), not the
+        # post-transfer map.
+        teams=(group_info.get("groups_as_played",
+                              group_info["groups"])
+               if group_info else {}))
     # The ranking order is the challenge order (best first); the
     # scoreboard sorts by score, so keep the ranking visible too.
     rank_names = []
@@ -3376,6 +3415,13 @@ async def run_elimination_game(room: Room):
                 alive = [p for p in alive if p.id != loser_p.id]
                 if is_group:
                     groups.pop(loser_p.id, None)
+                # v2.5 item 4: snapshot the teams as played, right
+                # after the loser is picked and popped and BEFORE
+                # any merge / rebalance mutation below. The ceremony
+                # ranking rows and the break's score rows read this
+                # snapshot; group_info["groups"] keeps the current
+                # (post-transfer) map.
+                groups_as_played = dict(groups) if is_group else {}
                 # v2.4 item 4: the elimination_eliminated broadcast
                 # is gone from the series flow — the staged ceremony
                 # below replaces it (the client handler stays as a
@@ -3396,6 +3442,7 @@ async def run_elimination_game(room: Room):
                     # eliminated players keep their last group entry.
                     room.elim_groups.update(groups)
                     group_info = {"groups": dict(groups),
+                                  "groups_as_played": groups_as_played,
                                   "group_totals": group_totals,
                                   "worst_team": worst_team,
                                   "transfers": transfers,
@@ -3424,8 +3471,19 @@ async def run_elimination_game(room: Room):
             # v2.3 item 15: no finale — the last remaining player is
             # the victor; finishing order is winner first, then the
             # eliminated in reverse elimination order.
+            # v2.5 item 2: linear series-end standings over that
+            # order — 1st = (challenges played) x 1000, last = 0,
+            # equal steps in between (e.g. 7 players, 6 challenges
+            # -> 6000, 5000, 4000, 3000, 2000, 1000, 0). One
+            # elimination per challenge, so challenge_no == the
+            # number of challenges played in this series.
             finishing = [alive[0].id] + list(reversed(elim_order))
-            place_scores = {finishing[0]: 1000}
+            n_finish = len(finishing)
+            top_score = challenge_no * 1000
+            place_scores = {
+                pid: (top_score * (n_finish - 1 - i) // (n_finish - 1)
+                      if n_finish > 1 else top_score)
+                for i, pid in enumerate(finishing)}
             for p in all_players:
                 # v2.2 §9/§10: eliminated players contribute 0; in
                 # championship mode the place score ADDS to the
