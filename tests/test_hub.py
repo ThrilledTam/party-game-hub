@@ -35,6 +35,14 @@ Starts the real server on port 8001, then over real WebSockets:
     and Reaction challenges assign interpolated points (verified
     in-process with all bots, and live from the round results
     whenever a Reaction challenge comes up)
+  - covers the v2.4 contracts: no presCounts/unoCounts lists in
+    the served HTML, turnStripHtml takes counts and the strip
+    keeps the player colour border with the yellow ring as an
+    outline, president_state/uno_state carry counts matching hand
+    sizes, the Elimination running tally (cumulative per series,
+    reset on Play Again, Memory survivors scored), and the staged
+    elimination ceremony (list -> drop -> merge/transfer, vote-skip
+    and timer advance, Normal mode has no merge/transfer stages)
 
 Run:  .venv/bin/python -m pytest tests/test_hub.py -x -q
   or:  .venv/bin/python tests/test_hub.py
@@ -69,7 +77,7 @@ from server import (GAMES, ELIM_POOL, SECRET_WORDS, VAGUE_CLUES, secret_tally,  
                     build_uno_deck, uno_match, uno_bot_choice,  # noqa: E402
                     uno_best_colour, uno_value, uno_validate_play,  # noqa: E402
                     _uno_handle_draw, _uno_apply_play_multi,  # noqa: E402
-                    memory_bot_correct,  # noqa: E402
+                    memory_bot_correct, run_memory_game,  # noqa: E402
                     _reaction_points, run_reaction_game,  # noqa: E402
                     _elim_balance_groups, _elim_pick_worst_team,  # noqa: E402
                     _elim_pick_worst_player, _elim_rebalance_groups)  # noqa: E402
@@ -619,6 +627,7 @@ async def group_elim_driver(client, my_id, is_host, state):
             "reaction_round_result",
             "memory_show", "memory_recall", "memory_round_result",
             "elimination_challenge", "elimination_eliminated",
+            "elimination_ceremony",
             "vote_break", "results", "elimination_end_vote",
             "lobby"), timeout=180)
         t = msg["type"]
@@ -672,12 +681,52 @@ async def group_elim_driver(client, my_id, is_host, state):
                      "groups": dict(msg.get("groups") or {}),
                      "remaining": msg.get("remaining")})
         elif t == "elimination_eliminated":
+            # v2.4: the ceremony replaces this broadcast in the
+            # series flow; the victim is recorded from the
+            # ceremony's drop stage instead. Kept in the wait list
+            # as a harmless fallback — nothing is recorded here.
+            pass
+        elif t == "elimination_ceremony":
+            # v2.4 item 4: record every stage (host only) and vote
+            # NEXT on each one (no index) so the 4s waits are cut
+            # short; the no-vote timer path is covered by the Normal
+            # series' second series instead. The drop stage is the
+            # elimination signal now; the victim's group (the
+            # pick-time worst team) is recorded below — the same
+            # value the old broadcast carried.
             if is_host:
+                state["ceremony"].append(
+                    {"n": cur, "stage": msg["stage"],
+                     "challenge": msg.get("challenge"),
+                     "elimination_mode": msg.get("elimination_mode"),
+                     "elim_phase": msg.get("elim_phase"),
+                     "ranking": list(msg.get("ranking") or []),
+                     "eliminated": dict(msg.get("eliminated") or {}),
+                     "eliminated_pile": list(
+                         msg.get("eliminated_pile") or []),
+                     "remaining": msg.get("remaining"),
+                     "alive": list(msg.get("alive") or []),
+                     "groups": dict(msg.get("groups") or {}),
+                     "group_totals": dict(msg.get("group_totals") or {}),
+                     "worst_team": msg.get("worst_team"),
+                     "transfers": list(msg.get("transfers") or []),
+                     "merged_to_black": msg.get("merged_to_black")})
+            if msg.get("stage") == "drop" and is_host:
+                _elim = msg.get("eliminated") or {}
+                # The victim's group is the pick-time worst team:
+                # 0/1 in the groups phase (the loser is the worst
+                # player of the worst team), 2 in the Black phase.
+                # (The ceremony's elim_phase is post-merge, so it
+                # reads "black" on the merge challenge itself —
+                # worst_team is the value that survives the merge.)
                 state["eliminated"].append(
-                    {"n": cur, "nickname": msg["nickname"],
-                     "player_id": msg["player_id"],
-                     "group": msg.get("group"),
+                    {"n": cur, "nickname": _elim.get("nickname"),
+                     "player_id": _elim.get("player_id"),
+                     "group": (msg.get("worst_team")
+                               if msg.get("worst_team") is not None
+                               else 2),
                      "remaining": msg.get("remaining")})
+            await client.send({"type": "vote_next"})
         elif t == "vote_break":
             await client.send({"type": "vote_next",
                                "index": msg["index"]})
@@ -754,6 +803,7 @@ async def run_group_series(tag, n_bots, make_groups, *, until_merge=False):
         lambda r: r.get("elimination_mode") == "group"
         and r.get("elim_groups") == groups)
     state = {"challenges": [], "eliminated": [], "breaks": [],
+             "ceremony": [],
              "qresults": [], "mem_rounds": [], "reaction_rounds": [],
              "results": [], "lobby": False, "last_lobby": None}
     tasks = [asyncio.create_task(group_elim_driver(
@@ -780,6 +830,38 @@ async def run_group_series(tag, n_bots, make_groups, *, until_merge=False):
         for c in clients:
             await c.close()
     return state, players
+
+
+def verify_elim_tally(tag, breaks):
+    """v2.4 item 3: every elim_break scores row carries a running
+    `tally`; the tally is the exact accumulation of the challenge
+    scores (tally == previous tally + this challenge's score, per
+    player), the first break of each series starts from 0 (tally ==
+    score), and a new series resets the tally. `breaks` is a list of
+    {"series": int, "n": int, "scores": [rows]} in broadcast order."""
+    seen = {}
+    series_of = {}
+    for b in breaks:
+        s = b["series"]
+        for row in b["scores"]:
+            pid = row["player_id"]
+            check(f"{tag}: break {b['n']} row carries an int tally",
+                  isinstance(row.get("tally"), int), str(row))
+            if series_of.get(pid) != s:
+                # First sighting of this player in this series: the
+                # tally starts from 0, so it equals this challenge's
+                # score (a carried-over tally would show up here).
+                check(f"{tag}: series {s} break {b['n']} tally starts "
+                      "from 0 (tally == score)",
+                      row["tally"] == row["score"], str(row))
+                series_of[pid] = s
+                seen[pid] = row["tally"]
+            else:
+                check(f"{tag}: series {s} break {b['n']} tally "
+                      "accumulates (prev tally + score)",
+                      row["tally"] == seen[pid] + row["score"]
+                      and row["tally"] >= seen[pid], str(row))
+                seen[pid] = row["tally"]
 
 
 def verify_group_series(tag, state, players, *, expect_full):
@@ -987,6 +1069,45 @@ def verify_group_series(tag, state, players, *, expect_full):
               f"lowest={by_id.get(lowest[0])} ({lowest[1]} pts) "
               f"team {worst_team} scores={in_team}")
         verified += 1
+    # --- v2.4 item 4: ceremony stages, in order, per challenge ---
+    # One list + drop per break; merge exactly when the break merged
+    # into Black, transfer exactly when the break rebalanced (the
+    # merge replaces the rebalance, so the two never co-occur).
+    _cer = state.get("ceremony", [])
+    for b in state["breaks"]:
+        n = b["n"]
+        _stages = [c["stage"] for c in _cer if c["n"] == n]
+        _exp = ["list", "drop"]
+        if b["merged_to_black"]:
+            _exp.append("merge")
+        elif b["transfers"]:
+            _exp.append("transfer")
+        check(f"v2.4 item 4 ({tag}): challenge {n} ceremony runs "
+              f"{' / '.join(_exp)} in order",
+              _stages == _exp, str(_stages))
+    # --- v2.4 item 4: ceremony payload shape (drop stage) ---
+    _drops = [c for c in _cer if c["stage"] == "drop"]
+    check(f"v2.4 item 4 ({tag}): every ceremony drop carries the "
+          "ranking, the victim and the eliminated pile",
+          len(_drops) == len(state["breaks"])
+          and all(isinstance(c["ranking"], list) and c["ranking"]
+                  and all("player_id" in r for r in c["ranking"])
+                  and c["eliminated"].get("player_id")
+                  and c["eliminated"].get("nickname")
+                  and c["eliminated"]["player_id"]
+                  in (c["eliminated_pile"] or [])
+                  and c["remaining"] == len(c["alive"] or [])
+                  and c["challenge"] == c["n"]
+                  and c["elimination_mode"] == "group"
+                  for c in _drops),
+          str([{k: c.get(k) for k in ("n", "challenge", "eliminated",
+                                      "remaining", "alive")}
+               for c in _drops]))
+    # --- v2.4 item 3: running tally on the group breaks ---
+    verify_elim_tally(
+        f"v2.4 item 3 ({tag})",
+        [{"series": 0, "n": b["n"], "scores": b["scores"]}
+         for b in state["breaks"]])
     if expect_full:
         check(f"v2.3 item 14 ({tag}): a full series eliminates one "
               "player per challenge until 1 remains",
@@ -1054,6 +1175,49 @@ async def main():
             check("home page serves (HTTP 200, contains title)",
                   r.status_code == 200 and "Party Game Hub" in r.text,
                   f"status={r.status_code}")
+            # --- v2.4 item 1: the separate card-count lists are gone;
+            # the turn-order strip carries the counts instead. The
+            # served HTML must not contain the presCounts/unoCounts
+            # divs (comments mentioning the deleted ids are fine).
+            check("v2.4 item 1: served HTML has no presCounts / "
+                  "unoCounts divs (the separate counts lists are "
+                  "removed)",
+                  'id="presCounts"' not in r.text
+                  and 'id="unoCounts"' not in r.text)
+            # --- v2.4 items 1 + 2: turnStripHtml takes counts and
+            # keeps the player colour border on the current card
+            # (no #f1c40f border override); the yellow ring is a CSS
+            # outline on .turn-card.current instead.
+            _strip = r.text[r.text.find("function turnStripHtml("):
+                            r.text.find("function renderTurnStrip(")]
+            check("v2.4 item 1: turnStripHtml takes counts and shows "
+                  "them on each card",
+                  re.search(r"function turnStripHtml\(order, turnId, "
+                            r"counts\)", _strip) is not None
+                  and "counts[id]" in _strip,
+                  _strip[:120])
+            check("v2.4 item 2: the strip keeps the player colour "
+                  "border on the current card (no #f1c40f override)",
+                  "#f1c40f" not in _strip
+                  and 'border-color:"+p.colour' in _strip,
+                  _strip[:200])
+            _cur_rule = re.search(r"\.turn-card\.current\s*\{([^}]*)\}",
+                                  r.text)
+            check("v2.4 item 2: .turn-card.current uses an outline "
+                  "ring outside the card (outline + offset, no "
+                  "border-color override)",
+                  _cur_rule is not None
+                  and "outline" in _cur_rule.group(1)
+                  and "outline-offset" in _cur_rule.group(1)
+                  and "border-color" not in _cur_rule.group(1),
+                  _cur_rule.group(0) if _cur_rule else None)
+            _card_rule = re.search(r"\.turn-card\s*\{([^}]*)\}", r.text)
+            check("v2.4 item 2: .turn-card animates the ring/scale "
+                  "change (transition on transform/outline-color)",
+                  _card_rule is not None
+                  and "transition" in _card_rule.group(1)
+                  and "transform" in _card_rule.group(1),
+                  _card_rule.group(0) if _card_rule else None)
             check("health endpoint", (await http.get(f"{BASE}/api/health")).json().get("ok") is True)
 
         # --- create room + join 2nd human ---
@@ -2790,6 +2954,15 @@ async def main():
               p_store["first_state"]["turn_order"] == p_manual
               and p_store["first_state"]["turn_id"] == p_manual[0],
               str(p_store["first_state"]))
+        # --- v2.4 item 1: president_state carries counts matching
+        # the hand sizes — 13 cards each at the opening deal (52
+        # total), and the host's own count equals its hand length.
+        _pfs = p_store["first_state"]
+        check("v2.4 item 1: president_state carries counts matching "
+              "hand sizes (13 each at the deal, 52 total)",
+              _pfs.get("counts") == {pid: 13 for pid in p_manual}
+              and _pfs["counts"].get(hp_id) == len(_pfs.get("hand", [])),
+              str(_pfs.get("counts")))
         _finish = pres_res.get("finish_order", [])
         check("v2 President: results carry the finish order",
               len(_finish) == 4 and len(set(_finish)) == 4, str(_finish))
@@ -3247,6 +3420,19 @@ async def main():
               str({k: _ufs.get(k) for k in
                    ("top", "current_colour", "pending_draw",
                     "pending_type", "multi_play")}))
+        # --- v2.4 item 1: uno_state carries counts matching the
+        # hand sizes — 7 cards each at the deal (21 total), or 9
+        # for the first player if the opening card was a Draw 2
+        # (they draw 2 before the first state is sent, stacking
+        # off here), and the host's own count equals its hand.
+        _ucounts = _ufs.get("counts") or {}
+        check("v2.4 item 1: uno_state carries counts matching hand "
+              "sizes (7 each, 9 for an opening Draw 2 draw)",
+              set(_ucounts) == set(u_manual)
+              and all(v in (7, 9) for v in _ucounts.values())
+              and sum(_ucounts.values()) in (21, 23)
+              and _ucounts.get(hu_id) == len(_ufs.get("hand", [])),
+              str(_ucounts))
         _uno_scale = president_scores_for(3)
         check("v2.2 UNO produces results on the finishing-order scale "
               "(winner 1000, 2nd 500, 3rd 0 — no winner bonus)",
@@ -3479,16 +3665,21 @@ async def main():
                        "game_settings": {"elimination": {"vote_timeout": 3}}})
         await he.wait_lobby()
         elim_state = {"results": [], "eliminated": [], "challenges": [],
-                      "lobby": False, "breaks": [], "events": []}
+                      "lobby": False, "breaks": [], "events": [],
+                      "ceremony": [], "tally_breaks": [],
+                      "mem_rounds": []}
 
         async def elim_driver(client, my_id):
             number = None
             my_end_votes = 0
+            cur_game = None
+            cur_game_n = 0  # challenge number within the series
             while True:
                 msg = await wait_any(client, (
                     "question", "reaction_wait", "reaction_go",
-                    "memory_show", "memory_recall",
+                    "memory_show", "memory_recall", "memory_round_result",
                     "elimination_challenge", "elimination_eliminated",
+                    "elimination_ceremony",
                     "vote_break",
                     "results", "elimination_end_vote", "lobby"), timeout=120)
                 t = msg["type"]
@@ -3504,6 +3695,12 @@ async def main():
                             (msg["index"], msg.get("eliminated"),
                              msg.get("remaining"), msg["votes_needed"],
                              msg["timeout"]))
+                        if client is he:
+                            elim_state["tally_breaks"].append(
+                                {"series": my_end_votes, "n": cur_game_n,
+                                 "game": cur_game,
+                                 "t": time.monotonic(),
+                                 "scores": list(msg.get("scores") or [])})
                         if my_end_votes == 0:
                             await client.send({"type": "vote_next",
                                                "index": msg["index"]})
@@ -3525,11 +3722,61 @@ async def main():
                 elif t == "memory_recall":
                     await client.send({"type": "memory_answer",
                                        "answer": number or "0000"})
+                elif t == "memory_round_result":
+                    if client is he:
+                        elim_state["mem_rounds"].append(
+                            {"series": my_end_votes, "n": cur_game_n,
+                             "round": msg["round"],
+                             "survivors": list(msg["survivors"]),
+                             "eliminated": list(msg["eliminated"])})
                 elif t == "elimination_challenge":
+                    cur_game_n += 1
+                    cur_game = msg["game"]
                     elim_state["challenges"].append(
                         (msg["game"], msg.get("finale", False)))
                 elif t == "elimination_eliminated":
-                    elim_state["eliminated"].append(msg["nickname"])
+                    # v2.4: the ceremony replaces this broadcast in
+                    # the series flow; the victim is recorded from
+                    # the ceremony's drop stage instead. Kept in the
+                    # wait list as a harmless fallback — nothing is
+                    # recorded here.
+                    pass
+                elif t == "elimination_ceremony":
+                    # v2.4 item 4: record every stage (host only, with
+                    # arrival times for the skip/timer checks). The
+                    # drop stage is the elimination signal now (both
+                    # drivers record it, like the old broadcast, so
+                    # the count stays 3 per series x 2 series x 2
+                    # drivers). Vote NEXT on each stage (no index) in
+                    # the FIRST series only — the second series votes
+                    # on nothing, so its stages must run the full 4s
+                    # timer (the no-vote advance path).
+                    if client is he:
+                        elim_state["ceremony"].append(
+                            {"series": my_end_votes, "n": cur_game_n,
+                             "stage": msg["stage"],
+                             "t": time.monotonic(),
+                             "challenge": msg.get("challenge"),
+                             "elimination_mode":
+                                 msg.get("elimination_mode"),
+                             "elim_phase": msg.get("elim_phase"),
+                             "ranking": list(msg.get("ranking") or []),
+                             "eliminated": dict(
+                                 msg.get("eliminated") or {}),
+                             "eliminated_pile": list(
+                                 msg.get("eliminated_pile") or []),
+                             "remaining": msg.get("remaining"),
+                             "alive": list(msg.get("alive") or []),
+                             "merged_to_black":
+                                 msg.get("merged_to_black"),
+                             "transfers": list(
+                                 msg.get("transfers") or [])})
+                    if msg.get("stage") == "drop":
+                        _elim = msg.get("eliminated") or {}
+                        elim_state["eliminated"].append(
+                            _elim.get("nickname"))
+                    if my_end_votes == 0:
+                        await client.send({"type": "vote_next"})
                 elif t == "results":
                     # Count each series ONCE (host only): both drivers
                     # see the same broadcast, so appending from both
@@ -3542,6 +3789,8 @@ async def main():
                     # HOST's host_replay override (v2.2) instead of a
                     # community vote.
                     my_end_votes += 1
+                    cur_game_n = 0  # a Play Again starts a new series
+                    cur_game = None
                     if my_end_votes == 1:
                         await client.send({"type": "elimination_vote",
                                            "choice": "again"})
@@ -3622,6 +3871,142 @@ async def main():
         check("v2.1 Elimination: every challenge intro names its game",
               _intro_ok and len(elim_state["challenges"]) >= 2,
               str(elim_state["challenges"]))
+        # --- v2.4 item 4: Elimination ceremony (Normal mode) ---
+        # One ceremony per challenge (6: 3 per series x 2 series),
+        # stages list -> drop only — Normal mode has no merge or
+        # transfer stages.
+        _ecer = elim_state["ceremony"]
+        check("v2.4 item 4: one ceremony per challenge (6), stages "
+              "list -> drop only in Normal mode (no merge/transfer)",
+              len(_ecer) == 12
+              and all(c["stage"] in ("list", "drop") for c in _ecer)
+              and [c["stage"] for c in _ecer] == ["list", "drop"] * 6,
+              str([(c["series"], c["n"], c["stage"]) for c in _ecer]))
+        check("v2.4 item 4: every ceremony stage carries the "
+              "ranking, the victim and the eliminated pile",
+              all(isinstance(c["ranking"], list) and c["ranking"]
+                  and all("player_id" in r for r in c["ranking"])
+                  and c["eliminated"].get("player_id")
+                  and c["eliminated"].get("nickname")
+                  and c["eliminated"]["player_id"]
+                  in (c["eliminated_pile"] or [])
+                  and c["remaining"] == len(c["alive"] or [])
+                  and c["challenge"] == c["n"]
+                  and c["elimination_mode"] == "normal"
+                  for c in _ecer),
+              str([{k: c.get(k) for k in
+                    ("series", "n", "stage", "challenge", "eliminated",
+                     "remaining", "alive")}
+                   for c in _ecer]))
+        _ct = {}
+        _ch = {}  # (series, n) -> whether an alive human could vote
+        for c in _ecer:
+            _ct.setdefault((c["series"], c["n"]), {})[c["stage"]] = c["t"]
+            if c["stage"] == "list":
+                _alive = set(c["alive"] or [])
+                _ch[(c["series"], c["n"])] = any(
+                    not r.get("is_bot") and r["player_id"] in _alive
+                    for r in (c["ranking"] or []))
+        # Series 1 votes NEXT on every stage — but a vote only counts
+        # from a player still alive, and one player goes out per
+        # challenge, so a late series-1 ceremony can have no eligible
+        # human left and must then run the full 4s timer (exactly the
+        # protocol's all-bot case). The skip is asserted only where an
+        # alive human existed to cast it; challenge 1 always has one
+        # (only one player is eliminated per challenge), so the skip
+        # path is always exercised.
+        check("v2.4 item 4: a NEXT vote during a ceremony stage cuts "
+              "the wait short where an alive human could vote "
+              "(series 1), and the timer runs where none could",
+              len(_ct) == 6
+              and _ch.get((0, 1)) is True
+              and all((_ct[(0, n)]["drop"] - _ct[(0, n)]["list"] < 3.0)
+                      if _ch.get((0, n)) else
+                      (_ct[(0, n)]["drop"] - _ct[(0, n)]["list"] >= 3.0)
+                      for n in (1, 2, 3)),
+              str({k: (round(v["drop"] - v["list"], 2), _ch.get(k))
+                   for k, v in sorted(_ct.items()) if k[0] == 0}))
+        _bt = {(b["series"], b["n"]): b["t"]
+               for b in elim_state["tally_breaks"]}
+        check("v2.4 item 4: with no votes the ceremony advances on "
+              "the timer (series 2: list -> drop runs the full ~4s, "
+              "and the elim break still arrives within 25s — no hang)",
+              all(_ct[(1, n)]["drop"] - _ct[(1, n)]["list"] >= 3.0
+                  for n in (1, 2, 3))
+              and all(_bt[(1, n)] - _ct[(1, n)]["list"] < 25.0
+                      for n in (1, 2, 3)),
+              str({k: (round(v["drop"] - v["list"], 2),
+                       round(_bt[k] - v["list"], 2))
+                   for k, v in sorted(_ct.items()) if k[0] == 1}))
+        # --- v2.4 item 3: running tally on the elim breaks ---
+        # One host-recorded elim break per challenge (6 total).
+        check("v2.4 item 3: one host-recorded elim break per "
+              "challenge (3 per series x 2 series)",
+              len(elim_state["tally_breaks"]) == 6
+              and sorted((b["series"], b["n"])
+                         for b in elim_state["tally_breaks"])
+              == [(s, n) for s in (0, 1) for n in (1, 2, 3)],
+              str([(b["series"], b["n"])
+                   for b in elim_state["tally_breaks"]]))
+        verify_elim_tally("v2.4 item 3 (Normal)",
+                          elim_state["tally_breaks"])
+        # --- v2.4 item 3 (live): a Memory challenge scores its
+        # survivors between games (winner 1000, other survivors
+        # non-zero multiples of 100). Opportunistic: the challenge
+        # game is random, so this only runs when a Memory challenge
+        # came up in these two series; the in-process check below
+        # pins the scoring deterministically.
+        # NOTE (integration fix): the non-winners need NOT be equal.
+        # Memory's internal per-round eliminations only rank players
+        # — the series eliminates just the ranking's last place. So
+        # a player eliminated late inside the Memory game stays alive
+        # in the series with fewer rounds survived (e.g. 400) than a
+        # full survivor (500). The exact check below pins each score
+        # to 100 x rounds survived, reconstructed from the rounds.
+        _mem_tb = [b for b in elim_state["tally_breaks"]
+                   if b.get("game") == "memory"]
+        if _mem_tb:
+            for _mb in _mem_tb:
+                _msc = [r["score"] for r in _mb["scores"]]
+                check(f"v2.4 item 3 (live): Memory challenge series "
+                      f"{_mb['series'] + 1} challenge {_mb['n']} "
+                      "scores its survivors between games (winner "
+                      "1000, other survivors non-zero multiples "
+                      "of 100)",
+                      bool(_msc) and all(v > 0 for v in _msc)
+                      and max(_msc) == 1000
+                      and all(v % 100 == 0 for v in _msc if v != 1000),
+                      str(_msc))
+                # Exact 100 x rounds survived for the non-winners,
+                # from the recorded Memory rounds (a tie round lists
+                # no survivors, matching the server's survived count).
+                # Skipped when the break holds only the winner (the
+                # final challenge of a series leaves 1 alive).
+                _mrounds = [m for m in elim_state["mem_rounds"]
+                            if m["series"] == _mb["series"]
+                            and m["n"] == _mb["n"]]
+                _survived = {}
+                for _mr in _mrounds:
+                    for _pid in _mr["survivors"]:
+                        _survived[_pid] = _survived.get(_pid, 0) + 1
+                _nonwin = [r for r in _mb["scores"]
+                           if r["score"] != 1000]
+                if _nonwin:
+                    check(f"v2.4 item 3 (live): Memory challenge series "
+                          f"{_mb['series'] + 1} challenge {_mb['n']} "
+                          "non-winners score exactly 100 x rounds "
+                          "survived",
+                          bool(_mrounds)
+                          and all(r["score"] == 100 * _survived.get(
+                                      r["player_id"], 0) for r in _nonwin),
+                          str([(r["nickname"], r["score"],
+                                _survived.get(r["player_id"], 0))
+                               for r in _nonwin]))
+        else:
+            check("v2.4 item 3 (live): no Memory challenge came up in "
+                  "these two series, so the live survivor check is "
+                  "vacuous (the in-process check pins it)",
+                  True, "no memory challenge in 6 draws")
         await asyncio.wait_for(asyncio.gather(ed1, ed2), timeout=30)
         await he.close(); await re_.close()
 
@@ -4399,6 +4784,61 @@ async def main():
               "matches the assigned scores (best average first)",
               _rscores == sorted(_rscores, reverse=True),
               str(list(zip(_rorder, _rscores))))
+        # --- internal (async): a Memory CHALLENGE scores every
+        # survivor (v2.4 item 3 fix) — before the fix, survivors
+        # other than the winner got 0 (eliminated players kept
+        # 100 x survived, the winner got 1000 at the end), so the
+        # between-game breaks showed everyone at 0. All bots, so
+        # the per-round vote breaks end immediately and no websocket
+        # is needed; fast memorize/recall settings keep the 5-round
+        # cap cheap. 8 Hard bots, two runs: the cap is almost always
+        # hit with several survivors left, and at least one run is
+        # required to end with other survivors to check.
+        _mem_had_others = False
+        for _run in range(2):
+            _mroom = Room(code=f"UNITMEM{_run}")
+            _mroom.phase = "playing"
+            _mroom.game_settings["elimination"]["vote_timeout"] = 1
+            _mbots = [Player(id=f"m{i}", nickname=f"MB{i}",
+                             colour="#ffffff", is_bot=True,
+                             difficulty="Hard") for i in range(8)]
+            _mroom.players = list(_mbots)
+            _mrank, _melim = await run_memory_game(
+                _mroom, participants=list(_mbots), challenge=True,
+                challenge_settings={"memorize_seconds": 1,
+                                    "recall_seconds": 2})
+            check(f"v2.4 item 3 (internal, run {_run + 1}): a Memory "
+                  "challenge returns a full ranking (best first) and "
+                  "an elimination order",
+                  _mrank is not None and len(_mrank) == 8
+                  and _melim is not None, str(_mrank))
+            _msurv = [pid for pid in (_mrank or [])
+                      if pid not in (_melim or [])]
+            _mwinner = _mrank[0] if _mrank else None
+            _mscores = {p.id: p.score for p in _mbots}
+            check(f"v2.4 item 3 (internal, run {_run + 1}): the "
+                  "Memory challenge winner scores 1000",
+                  _mscores.get(_mwinner) == 1000, str(_mscores))
+            _mothers = [pid for pid in _msurv if pid != _mwinner]
+            if _mothers:
+                _mem_had_others = True
+                check(f"v2.4 item 3 (internal, run {_run + 1}): the "
+                      "other survivors score 100 x rounds survived "
+                      "(non-zero, equal, multiples of 100) — not 0",
+                      all(_mscores[pid] > 0
+                          and _mscores[pid] % 100 == 0
+                          for pid in _mothers)
+                      and len({_mscores[pid] for pid in _mothers}) <= 1,
+                      str({pid: _mscores[pid] for pid in _mothers}))
+            check(f"v2.4 item 3 (internal, run {_run + 1}): eliminated "
+                  "Memory players keep 100 x rounds survived "
+                  "(multiples of 100)",
+                  all(_mscores[pid] % 100 == 0 for pid in (_melim or [])),
+                  str({pid: _mscores[pid] for pid in (_melim or [])}))
+        check("v2.4 item 3 (internal): at least one Memory challenge "
+              "run ended with other survivors to check (not a "
+              "single-survivor finish twice)",
+              _mem_had_others)
         # Lobby payload: president_roles is present even when
         # President is NOT the selected game, as long as a finish
         # order is stored ({} when none is stored).
